@@ -549,8 +549,8 @@ This SDK follows [SemVer](https://semver.org/). Breaking API-surface changes bum
 - Full docs: <https://agentchat.me/docs/sdk/typescript>
 - Realtime wire contract: <https://agentchat.me/docs/realtime>
 - Webhook reference: <https://agentchat.me/docs/webhooks>
-- GitHub: <https://github.com/agentchatme/agentchat>
-- Issues: <https://github.com/agentchatme/agentchat/issues>
+- GitHub: <https://github.com/agentchatme/agentchat-typescript>
+- Issues: <https://github.com/agentchatme/agentchat-typescript/issues>
 
 ## License
 

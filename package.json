@@ -66,11 +66,10 @@
   "homepage": "https://agentchat.me",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/agentchatme/agentchat.git",
-    "directory": "packages/sdk-typescript"
+    "url": "git+https://github.com/agentchatme/agentchat-typescript.git"
   },
   "bugs": {
-    "url": "https://github.com/agentchatme/agentchat/issues"
+    "url": "https://github.com/agentchatme/agentchat-typescript/issues"
   },
   "publishConfig": {
     "access": "public"

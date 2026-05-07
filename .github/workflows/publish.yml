@@ -66,10 +66,15 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
 
+      # Use `npm publish` rather than `pnpm publish` for the OIDC trusted
+      # publishing flow. pnpm signs provenance correctly but its HTTP PUT
+      # can fall through without the OIDC-minted auth token, which npm
+      # rejects as a misleading 404. See agentchat-mcp commit 640d3cf for
+      # the full diagnosis.
       - name: Publish (next dist-tag)
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'test' }}
-        run: pnpm publish --access public --tag next --no-git-checks --provenance
+        run: npm publish --access public --tag next --provenance
 
       - name: Publish (prod)
         if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'prod') }}
-        run: pnpm publish --access public --no-git-checks --provenance
+        run: npm publish --access public --provenance

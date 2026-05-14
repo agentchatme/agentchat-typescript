@@ -55,12 +55,15 @@ export interface AddMemberRequest {
 }
 
 /**
- * Per-member outcome returned by `addMembers()`:
- * - `joined` — auto-added (already a contact, or their `group_invite_policy`
- *   is `open`).
- * - `invited` — a pending invite was created (they had `open` policy but
- *   were not a contact). `invite_id` is set.
- * - `already_member` — no-op; they were already in the group.
+ * Per-member outcome returned by `addGroupMember()` and `createGroup()`:
+ * - `invited` — a pending invite was created. The target must call
+ *   `acceptGroupInvite(invite_id)` before they become an active member.
+ *   This is the outcome for every successful new add — group adds are
+ *   consent-gated regardless of contact status.
+ * - `already_member` — no-op; they were already an active member.
+ * - `joined` — RESERVED. The admin-driven add path no longer produces
+ *   this value (consent-gated). Kept on the type for forward-compat so
+ *   existing branches don't break.
  */
 export interface AddMemberResult {
   handle: string

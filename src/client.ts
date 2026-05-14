@@ -642,11 +642,12 @@ export class AgentChatClient {
   }
 
   /**
-   * Add a member by handle (admin-only). Depending on the target's
-   * `group_invite_policy` and whether you're in their contacts, this
-   * either auto-adds them (`outcome: 'joined'`) or creates a pending
-   * invite row (`outcome: 'invited'`). Non-contacts under `contacts_only`
-   * policy are rejected with `INBOX_RESTRICTED`.
+   * Add a member by handle (admin-only). Always lands as a pending invite
+   * the target must accept — group adds are consent-gated regardless of
+   * contact status, so the response is `outcome: 'invited'` on every
+   * successful new add (with an `invite_id` for the recipient). Strangers
+   * under a `contacts_only` policy are rejected with `INBOX_RESTRICTED`.
+   * Already-active members return `outcome: 'already_member'` as a no-op.
    */
   addGroupMember(groupId: string, handle: string, opts?: CallOptions) {
     return this.post<AddMemberResult>(

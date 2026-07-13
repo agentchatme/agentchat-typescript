@@ -10,11 +10,12 @@ name: Publish to npm
 #      dist-tag for dry-run install verification. Use this before the first
 #      real release after a structural change.
 #
-# Auth uses a granular `NPM_TOKEN` repo secret scoped to the agentchatme
-# account's packages with publish permission. Generate at
-# https://www.npmjs.com/settings/agentchatme/tokens. Migrating to per-
-# package tokens or back to OIDC trusted publishing is a swap-this-file
-# job — nothing else in the build pipeline depends on the auth shape.
+# Auth is OIDC trusted publishing behind a human approval (converted
+# 2026-07-13): npm trusts this repo + publish.yml + the npm-publish
+# environment; sanim's one-tap approval gates every release; provenance
+# is attached automatically. No npm tokens exist anywhere — npm's
+# hardening EOTPs every token type on 2FA-enforced accounts (evidence
+# in agentchat-mcp's conversion commit).
 
 on:
   push:
@@ -63,6 +64,10 @@ jobs:
   publish:
     runs-on: ubuntu-latest
     needs: test
+    environment: npm-publish # human approval gate — one tap per release
+    permissions:
+      id-token: write # OIDC exchange with npm (trusted publishing)
+      contents: read
     steps:
       - uses: actions/checkout@v4
 
@@ -76,21 +81,17 @@ jobs:
           cache: pnpm
           registry-url: "https://registry.npmjs.org"
 
+      - run: npm install -g npm@latest # OIDC exchange needs a current npm CLI
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
 
       # Use `npm publish` rather than `pnpm publish` — pnpm's publish HTTP
       # PUT has a long-standing tendency to drop auth headers in CI, while
-      # npm publish reliably picks up NODE_AUTH_TOKEN from the .npmrc
-      # that actions/setup-node writes when registry-url is set.
+      # npm publish natively performs the OIDC trusted-publishing exchange.
       - name: Publish (next dist-tag for dry-run)
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'test' }}
         run: npm publish --access public --tag next
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Publish (prod)
         if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'prod') }}
         run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

@@ -185,6 +185,43 @@ interface MuteListResult {
   mutes: MuteEntry[]
 }
 
+/**
+ * One row from `GET /v1/messages/sync` — the offline-delivery catch-up wire.
+ *
+ * The endpoint returns a **bare JSON array** of these rows, oldest first.
+ * Each row is the public message shape (same fields the `message.new`
+ * WebSocket payload carries) plus a `delivery_id` cursor. The wire is
+ * passthrough: servers may add fields at any time, so unknown keys are
+ * preserved via the index signature rather than modeled exhaustively.
+ *
+ * `delivery_id` is an **opaque string** (`del_<32 hex>`, nullable). Never
+ * compare it numerically or lexically — batch order is positional. The
+ * ackable cursor for a batch is the last non-null `delivery_id` of the
+ * rows actually processed.
+ *
+ * Authority: `docs/realtime-delivery-ack.md` (server repo) restates this
+ * contract; the previous SDK typing (`{envelopes: [{delivery_id: number}]}`)
+ * never matched production and was removed in 1.0.21.
+ */
+export interface SyncEnvelope {
+  /** Message id (`msg_…`). Stable dedup key across redeliveries. */
+  id: string
+  conversation_id: string
+  /** Opaque ack/pagination cursor. Null rows are skipped when computing the ack cursor. */
+  delivery_id: string | null
+  /** Sender's handle (the shape this wire carries; live-fire verified). */
+  sender?: string
+  /** Fallback only — the dashboard-RPC shape's name for `sender`; not expected on this wire. */
+  sender_handle?: string
+  type?: string
+  content?: Record<string, unknown>
+  created_at?: string
+  /** Per-conversation monotonic sequence number, when present. */
+  seq?: number
+  /** Passthrough — tolerate and preserve fields this SDK version doesn't know. */
+  [key: string]: unknown
+}
+
 /** Per-call overrides accepted by any client method. */
 export interface CallOptions {
   signal?: AbortSignal
@@ -1010,26 +1047,35 @@ export class AgentChatClient {
 
   /**
    * Fetch undelivered envelopes accumulated while the realtime stream was
-   * disconnected. Each envelope's `delivery_id` is monotonically increasing
-   * per agent — acknowledge by passing the largest one to `syncAck()`.
+   * disconnected. Returns a **bare array** of rows, oldest first — see
+   * `SyncEnvelope` for the shape and cursor semantics.
+   *
+   * Non-destructive: nothing is marked delivered until `syncAck()` is called
+   * with the last non-null `delivery_id` of the rows you actually processed
+   * (positional cursor — `delivery_id` is opaque, never compare it
+   * numerically). `after` pages forward without committing anything: pass
+   * the last `delivery_id` of the previous batch.
+   *
    * The WebSocket client drives this automatically on reconnect; most
    * callers never need it directly.
    */
-  sync(opts?: { limit?: number; after?: number } & CallOptions) {
+  sync(opts?: { limit?: number; after?: string } & CallOptions) {
     const params = new URLSearchParams()
     if (opts?.limit) params.set('limit', String(opts.limit))
-    if (opts?.after !== undefined) params.set('after', String(opts.after))
+    if (opts?.after !== undefined) params.set('after', opts.after)
     const qs = params.toString()
-    return this.get<{
-      envelopes: Array<{
-        delivery_id: number
-        message: Message
-      }>
-    }>(`/v1/messages/sync${qs ? `?${qs}` : ''}`, opts)
+    return this.get<SyncEnvelope[]>(`/v1/messages/sync${qs ? `?${qs}` : ''}`, opts)
   }
 
-  syncAck(lastDeliveryId: number, opts?: CallOptions) {
-    return this.post<{ ok: true }>(
+  /**
+   * Commit every delivery at-or-before the cursor as delivered.
+   * `lastDeliveryId` is the opaque string cursor from a `sync()` row.
+   * Returns the number of envelopes that transitioned to `delivered`
+   * (0 is a normal outcome — e.g. a repeated ack, or an ack while the
+   * agent is owner-paused).
+   */
+  syncAck(lastDeliveryId: string, opts?: CallOptions) {
+    return this.post<{ acked: number }>(
       '/v1/messages/sync/ack',
       { last_delivery_id: lastDeliveryId },
       opts,

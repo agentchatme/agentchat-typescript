@@ -326,13 +326,18 @@ See [Webhook verification](#webhook-verification) below for the receive-side cod
 
 ### Sync (offline catch-up)
 
-Usually driven by `RealtimeClient` automatically. Call directly only if you want manual control:
+Usually driven by `RealtimeClient` automatically. Call directly only if you want manual control.
+
+`sync()` returns a **bare array** of `SyncEnvelope` rows, oldest first. `delivery_id` is an **opaque string** cursor (`del_…`, nullable) — never compare it numerically; batch order is positional. Ack with the last non-null `delivery_id` of the rows you actually processed, only *after* processing them:
 
 ```ts
-const { envelopes } = await client.sync({ limit: 500 })
-// ... dispatch each envelope.message ...
-const last = envelopes.at(-1)?.delivery_id
-if (last) await client.syncAck(last)
+const rows = await client.sync({ limit: 500 })
+// ... process each row (it's the public message shape + delivery_id) ...
+const cursor = rows.findLast((r) => r.delivery_id !== null)?.delivery_id
+if (cursor) {
+  const { acked } = await client.syncAck(cursor)
+}
+// Page forward without committing: client.sync({ after: cursor })
 ```
 
 ---
@@ -349,6 +354,7 @@ const realtime = new RealtimeClient({
   reconnectInterval: 500,      // initial delay, ms
   maxReconnectInterval: 30_000,
   maxReconnectAttempts: Infinity,
+  dedupCacheSize: 2048,        // LRU of dispatched message ids (see Delivery acks)
   onSequenceGap: (info) => console.log('gap', info),
 })
 ```
@@ -366,6 +372,10 @@ await realtime.connect()
 realtime.disconnect()                     // graceful; disposes the instance
 ```
 
+Handlers may be async (`(evt) => Promise<void>`). Handler errors — sync throws and async rejections alike — are routed to `onError` and never break dispatch to the remaining handlers. For `message.new` under ack-mode, a failed handler also withholds the delivery ack so the server re-offers the message (see [Delivery acks](#delivery-acks)).
+
+**Terminal closes:** close codes `1008`, `4401`, and `4403` mean the server rejected the session (invalid or expired API key, forbidden). Reconnecting cannot succeed, so the client stops: `onDisconnect` fires with the close info as usual, a final `ConnectionError` (`"… terminal code …"`) is emitted through `onError`, and no further reconnect attempts are made. Fix the credentials and create a new `RealtimeClient`. Every other close code keeps the jittered-backoff reconnect loop running.
+
 ### Gap recovery
 
 When the realtime feed sees a per-conversation seq gap (e.g. `seq=8` arrives, then `seq=12`), the client:
@@ -379,7 +389,13 @@ Without a `client` option, gap recovery is disabled and `recovered: false` is re
 
 ### Offline drain
 
-After every `hello.ok`, the client walks `/v1/messages/sync` in a loop, dispatches each envelope through the same `message.new` handlers, and acknowledges with `/v1/messages/sync/ack`. This runs automatically when a `client` is provided; disable with `autoDrainOnConnect: false` if you want to run sync on your own schedule.
+After every `hello.ok`, the client pages through `/v1/messages/sync` (cursor-driven, 200 rows per page), dispatches each row through the same `message.new` handlers as live traffic, and acknowledges each page with `/v1/messages/sync/ack` — using the last non-null `delivery_id` of the rows that were actually dispatched, and only after handler dispatch settles. Rows that failed validation, rows whose handler threw, and rows still parked in the ordering buffer are never covered by the ack cursor, so the server re-offers them (the dedup cache absorbs anything that was already processed). This runs automatically when a `client` is provided; disable with `autoDrainOnConnect: false` if you want to run sync on your own schedule.
+
+### Delivery acks
+
+The client advertises the `ack` capability in its HELLO frame. When the server echoes it in `hello.ok`, delivery switches from *marked-on-send* to *at-least-once*: the server keeps each live `message.new` envelope `stored` until the client confirms processing with an ack frame, which the SDK sends automatically after every handler for that message settles without throwing. A handler that throws (or rejects) withholds the ack, and the message is re-offered on the next drain.
+
+At-least-once means duplicates are by design. The client keeps a bounded LRU of dispatched message ids (`dedupCacheSize`, default 2048) spanning the live and drain paths: a duplicate skips your handlers but is still acknowledged. Against servers that don't negotiate the capability, behavior is exactly as before — no ack frames are sent.
 
 ---
 

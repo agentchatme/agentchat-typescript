@@ -1,9 +1,16 @@
 import type { WsMessage, Message } from './types/index.js'
-import type { AgentChatClient } from './client.js'
+import type { AgentChatClient, SyncEnvelope } from './client.js'
 import { ConnectionError } from './errors.js'
 import { resolveWebSocket } from './ws-resolver.js'
 
-export type MessageHandler = (message: WsMessage) => void
+/**
+ * Handlers may be async. For `message.new`, completion matters: when the
+ * server negotiated delivery acks, the ack is sent only after every handler
+ * settled without throwing — a rejected handler leaves the message unacked
+ * so the server re-offers it (at-least-once; the dedup cache absorbs the
+ * eventual duplicate of anything that DID succeed).
+ */
+export type MessageHandler = (message: WsMessage) => void | Promise<void>
 export type ErrorHandler = (error: Error) => void
 
 /**
@@ -88,6 +95,14 @@ export interface RealtimeOptions {
    */
   autoDrainOnConnect?: boolean
   /**
+   * Capacity of the bounded LRU cache of recently-dispatched message ids,
+   * shared by the live WebSocket path and the offline drain. Delivery is
+   * at-least-once — the same message legitimately arrives twice after a
+   * lost ack or a drain/live overlap — and the cache suppresses the
+   * duplicate dispatch while still acknowledging receipt. Default: 2048.
+   */
+  dedupCacheSize?: number
+  /**
    * Override the WebSocket constructor. Defaults to `globalThis.WebSocket`
    * with a dynamic-import fallback to the `ws` package (for Node 20).
    * Tests use this to inject a mock. Users on a polyfilled environment
@@ -126,6 +141,74 @@ const MAX_BUFFERED_PER_CONVERSATION = 500
 // the gap completely.
 const GAP_FILL_LIMIT = 200
 
+// Page size for the post-reconnect /v1/messages/sync drain. Matches the
+// server default (200, hard-capped at 500 server-side); a response shorter
+// than this is the server saying "caught up".
+const SYNC_DRAIN_PAGE_SIZE = 200
+
+// Default capacity of the message-id dedup cache. See
+// RealtimeOptions.dedupCacheSize.
+const DEFAULT_DEDUP_CACHE_SIZE = 2048
+
+// Close codes that mean "the server rejected this session and retrying with
+// the same credentials cannot succeed": 1008 (policy violation — the server
+// closes invalid/expired API keys with it) and 4401/4403 (explicit
+// auth-rejected codes). Reconnecting on these would hammer the server with
+// doomed handshakes forever, so they are terminal: the client surfaces a
+// final error through onError and stops. The one exception is our own
+// HELLO-ack-timeout close, which reuses 1008 on the wire but is transient —
+// see the `helloTimeoutClose` flag.
+const TERMINAL_CLOSE_CODES = new Set([1008, 4401, 4403])
+
+// Minimal structural validation of one sync row, mirroring the reference
+// wire schema (docs/realtime-delivery-ack.md): id / conversation_id /
+// delivery_id (string|null) are required; optional fields are type-checked
+// only when present; unknown fields pass through untouched. The drain stops
+// at the FIRST invalid row and never acks past it — acking past an unparsed
+// row would mark a message delivered that was never surfaced to handlers.
+function isValidSyncRow(row: unknown): row is SyncEnvelope {
+  if (typeof row !== 'object' || row === null || Array.isArray(row)) return false
+  const r = row as Record<string, unknown>
+  if (typeof r.id !== 'string') return false
+  if (typeof r.conversation_id !== 'string') return false
+  if (typeof r.delivery_id !== 'string' && r.delivery_id !== null) return false
+  for (const key of ['sender', 'sender_handle', 'type', 'created_at'] as const) {
+    if (r[key] !== undefined && typeof r[key] !== 'string') return false
+  }
+  if (
+    r.content !== undefined &&
+    (typeof r.content !== 'object' || r.content === null || Array.isArray(r.content))
+  ) {
+    return false
+  }
+  return true
+}
+
+// Latest ackable cursor from a batch of rows (rows arrive oldest-first).
+// The cursor is POSITIONAL: delivery_id is an opaque string, so "latest"
+// means "last non-null in batch order", never a numeric comparison.
+function lastDeliveryId(rows: SyncEnvelope[]): string | null {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    const id = rows[i]?.delivery_id
+    if (typeof id === 'string' && id.length > 0) return id
+  }
+  return null
+}
+
+function isThenable(value: unknown): value is Promise<unknown> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as { then?: unknown }).then === 'function'
+  )
+}
+
+function toError(reason: unknown, context: string): Error {
+  return reason instanceof Error
+    ? reason
+    : new Error(`${context} handler failed: ${String(reason)}`)
+}
+
 interface OrderState {
   // The next seq we expect to dispatch. Null means we're un-anchored —
   // the next `message.new` with a numeric seq sets this to seq + 1.
@@ -158,6 +241,7 @@ export class RealtimeClient {
     client?: AgentChatClient
     onSequenceGap?: SequenceGapHandler
     autoDrainOnConnect: boolean
+    dedupCacheSize: number
     webSocket?: typeof globalThis.WebSocket
   }
   private handlers = new Map<string, Set<MessageHandler>>()
@@ -168,10 +252,43 @@ export class RealtimeClient {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private helloAckTimer: ReturnType<typeof setTimeout> | null = null
   private authenticated = false
+  // True only when the server echoed the 'ack' capability in hello.ok.
+  // Per-connection: reset on every close and re-negotiated on every HELLO.
+  private ackMode = false
+  // Set immediately before our own close(1008, 'HELLO ack timeout') so the
+  // onclose handler can tell this transient self-close apart from a
+  // server-initiated 1008 (which is terminal — invalid credentials).
+  private helloTimeoutClose = false
+  // Bounded LRU of recently-dispatched message ids (Set iteration order is
+  // insertion order — delete + re-add refreshes recency). Ids are added
+  // only AFTER a successful dispatch: adding earlier would let a failed
+  // dispatch suppress its own redelivery.
+  private dedupSeen = new Set<string>()
+  // Envelopes injected by the REST drain, as opposed to live WS frames.
+  // Drain rows are acknowledged via the REST sync/ack cursor, never via a
+  // WS ack frame; everything else on the message.new pipeline (live frames,
+  // server-pushed reconnect backlog, gap-fill rows) takes the WS ack path
+  // when ack-mode is negotiated.
+  private restDrainOrigin = new WeakSet<WsMessage>()
+  // Per-envelope dispatch settlement for drain rows: resolves true when
+  // every handler settled cleanly (or the row deduped), false when a
+  // handler threw/rejected. The drain awaits these before advancing the
+  // ack cursor. WeakMap so entries die with the envelope objects.
+  private drainSettlements = new WeakMap<WsMessage, Promise<boolean>>()
+  // Coalesces concurrent drains — the server-side ack pointer only moves
+  // forward, so one drain at a time is both sufficient and simpler to
+  // reason about than interleaved read cursors.
+  private drainInFlight = false
   private orderStates = new Map<string, OrderState>()
   private disposed = false
 
   constructor(options: RealtimeOptions) {
+    const dedupCacheSize =
+      typeof options.dedupCacheSize === 'number' &&
+      Number.isFinite(options.dedupCacheSize) &&
+      options.dedupCacheSize >= 1
+        ? Math.floor(options.dedupCacheSize)
+        : DEFAULT_DEDUP_CACHE_SIZE
     this.options = {
       baseUrl: options.baseUrl ?? 'wss://api.agentchat.me',
       reconnect: options.reconnect ?? true,
@@ -182,6 +299,7 @@ export class RealtimeClient {
       client: options.client,
       onSequenceGap: options.onSequenceGap,
       autoDrainOnConnect: options.autoDrainOnConnect ?? Boolean(options.client),
+      dedupCacheSize,
       webSocket: options.webSocket,
     }
   }
@@ -216,10 +334,21 @@ export class RealtimeClient {
     const url = `${this.options.baseUrl}/v1/ws`
     this.ws = new WebSocketCtor(url)
     this.authenticated = false
+    this.ackMode = false
+    this.helloTimeoutClose = false
 
     this.ws.onopen = () => {
       try {
-        this.ws!.send(JSON.stringify({ type: 'hello', api_key: this.options.apiKey }))
+        // Advertise the delivery-ack capability (docs/realtime-delivery-ack.md).
+        // Legacy servers ignore unknown HELLO fields; ack-mode turns on only
+        // if hello.ok echoes the capability back.
+        this.ws!.send(
+          JSON.stringify({
+            type: 'hello',
+            api_key: this.options.apiKey,
+            capabilities: ['ack'],
+          }),
+        )
       } catch (err) {
         this.emitError(err instanceof Error ? err : new ConnectionError('HELLO send failed'))
         return
@@ -227,6 +356,9 @@ export class RealtimeClient {
 
       this.helloAckTimer = setTimeout(() => {
         this.emitError(new ConnectionError('HELLO ack timeout'))
+        // 1008 doubles as a terminal auth code on server-initiated closes;
+        // flag this self-close so onclose keeps the reconnect loop alive.
+        this.helloTimeoutClose = true
         try { this.ws?.close(1008, 'HELLO ack timeout') } catch { /* already closed */ }
       }, HELLO_ACK_TIMEOUT_MS)
     }
@@ -243,6 +375,12 @@ export class RealtimeClient {
       if (!this.authenticated) {
         if ((message as { type?: string }).type === 'hello.ok') {
           this.authenticated = true
+          // Capability negotiation: ack-mode only if the server echoed
+          // 'ack' back. A hello.ok without capabilities is a legacy server
+          // (marks envelopes delivered on send); sending ack frames to it
+          // would just be unknown frames.
+          const caps = (message as { capabilities?: unknown }).capabilities
+          this.ackMode = Array.isArray(caps) && caps.includes('ack')
           this.reconnectAttempts = 0
           if (this.helloAckTimer) {
             clearTimeout(this.helloAckTimer)
@@ -252,7 +390,14 @@ export class RealtimeClient {
             try { handler() } catch { /* user hook must not break flow */ }
           }
           if (this.options.autoDrainOnConnect && this.options.client) {
-            void this.drainOfflineEnvelopes()
+            // Fire-and-forget by design, but never an unhandled rejection:
+            // anything that escapes the drain's internal error handling
+            // still surfaces through the standard error channel.
+            this.drainOfflineEnvelopes().catch((err) => {
+              this.emitError(
+                err instanceof Error ? err : new ConnectionError('sync drain failed'),
+              )
+            })
           }
         }
         return
@@ -278,6 +423,9 @@ export class RealtimeClient {
         this.helloAckTimer = null
       }
       this.authenticated = false
+      this.ackMode = false
+      const selfClosedForHelloTimeout = this.helloTimeoutClose
+      this.helloTimeoutClose = false
 
       for (const handler of this.disconnectHandlers) {
         try {
@@ -294,63 +442,199 @@ export class RealtimeClient {
       // emitted.
       this.resetOrderStates()
 
+      // Terminal auth closes: the server rejected the session outright
+      // (invalid/expired key, forbidden). Retrying with the same
+      // credentials is a doomed loop, so stop here — surface a final
+      // error and leave reconnection off. Our own HELLO-ack-timeout close
+      // reuses 1008 on the wire and is explicitly exempted: a slow
+      // hello.ok is transient and must keep the retry loop alive.
+      if (TERMINAL_CLOSE_CODES.has(event.code) && !selfClosedForHelloTimeout) {
+        this.emitError(
+          new ConnectionError(
+            `WebSocket closed with terminal code ${event.code}${event.reason ? ` (${event.reason})` : ''}; ` +
+              'the server rejected the session and auto-reconnect has stopped. ' +
+              'Check the API key, then create a new RealtimeClient.',
+          ),
+        )
+        return
+      }
+
       this.scheduleReconnect()
     }
   }
 
   /**
    * Drain offline envelopes accumulated while the socket was disconnected.
-   * Fires `message.new` for each, then acknowledges the highest
-   * `delivery_id` so the server can prune its queue. Automatically
-   * invoked on every successful `hello.ok` when `autoDrainOnConnect` is
-   * enabled and a client is configured.
+   * Automatically invoked on every successful `hello.ok` when
+   * `autoDrainOnConnect` is enabled and a client is configured.
    *
-   * Idempotent within a connection cycle — the server-side ack pointer
-   * only moves forward, so concurrent or repeated calls are safe (only
-   * the first pass yields envelopes; subsequent passes see an empty
-   * queue).
+   * `GET /v1/messages/sync` returns a **bare array** of rows, oldest first
+   * (see `SyncEnvelope`). Each page is dispatched through the same ordered
+   * `message.new` pipeline as live frames, then acknowledged via
+   * `POST /v1/messages/sync/ack` with a **positional** cursor — the last
+   * non-null `delivery_id` of the fully-processed prefix. `delivery_id` is
+   * an opaque string and is never compared numerically. Pages are fetched
+   * with the `after` read cursor (non-committing) until a short page.
+   *
+   * Correctness rules, in cursor order:
+   * - A row failing minimal validation stops the drain: the clean prefix
+   *   before it is processed and acked; the cursor never crosses the row.
+   * - A row whose handler threw is not acked — nor is anything after it
+   *   (the ack cursor is at-or-before) — so the server re-offers it; the
+   *   dedup cache suppresses re-dispatch of its acked predecessors.
+   * - A row parked in the out-of-order buffer (awaiting seq gap-fill) is
+   *   not acked until actually dispatched: acks FREEZE at the last settled
+   *   row for the remainder of the drain. Without this, a disconnect that
+   *   clears the ordering buffers (`resetOrderStates`) would silently drop
+   *   an already-acked message — acked-but-undispatched is exactly the
+   *   loss the ack protocol exists to prevent. Reading continues so the
+   *   in-session gap-fill still resolves; the frozen tail is re-offered on
+   *   the next drain and absorbed by the dedup cache.
+   *
+   * Concurrent calls are coalesced (the second returns immediately). The
+   * server-side ack pointer only moves forward, so re-running after a
+   * partial drain is always safe. REST-drained rows are acked via this
+   * cursor, never via WS ack frames.
    */
   async drainOfflineEnvelopes(): Promise<void> {
     const client = this.options.client
     if (!client) return
+    if (this.drainInFlight) return
+    this.drainInFlight = true
+    try {
+      await this.runDrain(client)
+    } finally {
+      this.drainInFlight = false
+    }
+  }
 
-    // Loop until the server reports an empty queue. In practice one page
-    // suffices (the queue is per-agent and the default limit is high),
-    // but very long offline windows may span multiple batches.
-    while (true) {
-      let batch: { envelopes: Array<{ delivery_id: number; message: Message }> }
+  private async runDrain(client: AgentChatClient): Promise<void> {
+    let after: string | undefined
+    let acksFrozen = false
+
+    while (!this.disposed) {
+      let batch: SyncEnvelope[]
       try {
-        batch = await client.sync()
+        batch = await client.sync({ after, limit: SYNC_DRAIN_PAGE_SIZE })
       } catch (err) {
         this.emitError(err instanceof Error ? err : new ConnectionError('sync drain failed'))
         return
       }
-      if (batch.envelopes.length === 0) return
 
-      let highestDeliveryId = -1
-      for (const env of batch.envelopes) {
-        if (env.delivery_id > highestDeliveryId) highestDeliveryId = env.delivery_id
-        // Route through the same pipeline as live envelopes — per-convo
-        // seq ordering, gap detection, dispatch to `message.new` handlers.
-        const wrapped: WsMessage = {
+      // Defensive against the exact class of bug this path once shipped
+      // (SDK/server wire drift): anything but an array is a contract
+      // violation, not an empty queue.
+      if (!Array.isArray(batch)) {
+        this.emitError(
+          new ConnectionError(
+            `sync drain: expected a bare array from /v1/messages/sync, got ${typeof batch}`,
+          ),
+        )
+        return
+      }
+      // disconnect() may have run while the request was in flight — the
+      // handler map is cleared, so dispatching (and then acking) would
+      // mark messages delivered that no handler ever saw.
+      if (this.disposed) return
+      if (batch.length === 0) return
+
+      // Keep only the clean prefix — stop at the FIRST invalid row rather
+      // than skipping it (the ack cursor covers everything at-or-before).
+      const rows: SyncEnvelope[] = []
+      let invalidIndex = -1
+      for (const [index, item] of batch.entries()) {
+        if (!isValidSyncRow(item)) {
+          invalidIndex = index
+          break
+        }
+        rows.push(item)
+      }
+
+      // Inject the prefix into the ordered pipeline. Dispatch STARTS
+      // synchronously and in order; settlement of async handlers is
+      // awaited below, before the ack cursor moves.
+      const envelopes: WsMessage[] = rows.map((row) => {
+        const envelope: WsMessage = {
           type: 'message.new',
-          payload: env.message as unknown as Record<string, unknown>,
+          payload: row as unknown as Record<string, unknown>,
         }
-        this.processOrderedMessage(wrapped)
+        this.restDrainOrigin.add(envelope)
+        return envelope
+      })
+      for (const envelope of envelopes) {
+        this.processOrderedMessage(envelope)
       }
 
-      if (highestDeliveryId >= 0) {
-        try {
-          await client.syncAck(highestDeliveryId)
-        } catch (err) {
-          this.emitError(err instanceof Error ? err : new ConnectionError('sync ack failed'))
-          return
+      if (!acksFrozen) {
+        let ackCursor: string | null = null
+        for (let i = 0; i < rows.length; i++) {
+          const row = rows[i]
+          const envelope = envelopes[i]
+          if (!row || !envelope) break // unreachable; satisfies indexed access
+          const settlement = this.drainSettlements.get(envelope)
+          if (settlement) {
+            const ok = await settlement
+            if (!ok) {
+              // Handler failure — leave this row and everything after it
+              // unacked so the server re-offers them.
+              acksFrozen = true
+              break
+            }
+          } else if (this.isBufferedInOrderState(row)) {
+            // Parked on a seq gap — not dispatched yet. See the stranding
+            // note in the method doc.
+            acksFrozen = true
+            break
+          }
+          // Reaching here means the row is safe to cover with the cursor:
+          // either its dispatch settled cleanly, or the ordered pipeline
+          // dropped it as a below-anchor duplicate (drain/live overlap) —
+          // it will never be dispatched this session, and acking it stops
+          // the server from re-offering it forever.
+          const deliveryId = row.delivery_id
+          if (typeof deliveryId === 'string' && deliveryId.length > 0) {
+            ackCursor = deliveryId
+          }
+        }
+        if (ackCursor !== null) {
+          try {
+            await client.syncAck(ackCursor)
+          } catch (err) {
+            this.emitError(err instanceof Error ? err : new ConnectionError('sync ack failed'))
+            return
+          }
         }
       }
 
-      // If the server returned fewer than a page, we're caught up.
-      if (batch.envelopes.length < 100) return
+      if (invalidIndex >= 0) {
+        this.emitError(
+          new ConnectionError(
+            `sync drain: row ${invalidIndex} failed validation — processed the ` +
+              `${rows.length}-row prefix and stopped; the ack cursor was not advanced past it`,
+          ),
+        )
+        return
+      }
+
+      // A short page means the server is caught up.
+      if (batch.length < SYNC_DRAIN_PAGE_SIZE) return
+
+      // Page forward with the read cursor (non-committing). A page whose
+      // delivery ids are all null offers no way to make progress — stop
+      // rather than spin re-reading the same rows.
+      const nextAfter = lastDeliveryId(rows)
+      if (nextAfter === null) return
+      after = nextAfter
     }
+  }
+
+  // True when a drain row is currently parked in the per-conversation
+  // out-of-order buffer (its dispatch is deferred to the gap-fill
+  // machinery — natural arrival, gap-fill fetch, or forced resolveGap).
+  private isBufferedInOrderState(row: SyncEnvelope): boolean {
+    if (typeof row.seq !== 'number') return false
+    const state = this.orderStates.get(row.conversation_id)
+    return state !== undefined && state.buffer.has(row.seq)
   }
 
   private scheduleReconnect(): void {
@@ -488,11 +772,128 @@ export class RealtimeClient {
   }
 
   private dispatch(message: WsMessage): void {
+    if (this.isMessageNew(message)) {
+      // message.new rides the dedup + delivery-ack pipeline. Handlers are
+      // still invoked synchronously and in order here; only settlement
+      // (async handler completion → ack) is deferred. The returned promise
+      // never rejects.
+      void this.dispatchMessageNew(message)
+      return
+    }
     const handlers = this.handlers.get(message.type)
     if (!handlers) return
     for (const handler of handlers) {
-      handler(message)
+      try {
+        const result = handler(message)
+        if (isThenable(result)) {
+          result.catch((err) => this.emitError(toError(err, message.type)))
+        }
+      } catch (err) {
+        // A throwing handler must not break dispatch to the remaining
+        // handlers (or, upstream, the WebSocket message pump).
+        this.emitError(toError(err, message.type))
+      }
     }
+  }
+
+  /**
+   * Dedup + dispatch + acknowledge one `message.new` envelope. Never
+   * rejects.
+   *
+   * Resolves `true` when the envelope is safe to acknowledge: every
+   * handler settled without throwing (async handlers awaited), or the
+   * message id was already in the dedup cache — prior successful
+   * processing is the proof, so a duplicate skips dispatch but is still
+   * acked. Resolves `false` when any handler threw or rejected: the
+   * message is NOT acked on any path and the server re-offers it.
+   *
+   * Ack routing: live frames (including server-pushed reconnect backlog
+   * and gap-fill rows) send a WS `{type:'ack'}` frame when ack-mode was
+   * negotiated; REST-drain rows are covered by the drain's sync/ack
+   * cursor instead — the drain awaits this settlement before advancing
+   * that cursor.
+   */
+  private dispatchMessageNew(message: WsMessage): Promise<boolean> {
+    const isDrainRow = this.restDrainOrigin.has(message)
+    const messageId = this.extractMessageId(message)
+
+    let settlement: Promise<boolean>
+
+    if (messageId !== null && this.dedupHit(messageId)) {
+      settlement = Promise.resolve(true)
+      if (!isDrainRow) this.sendAckFrame(messageId)
+    } else {
+      const handlers = this.handlers.get('message.new')
+      const pending: Array<Promise<unknown>> = []
+      if (handlers) {
+        for (const handler of handlers) {
+          try {
+            const result = handler(message)
+            if (isThenable(result)) pending.push(result)
+          } catch (err) {
+            pending.push(Promise.reject(err))
+          }
+        }
+      }
+      settlement = Promise.allSettled(pending).then((outcomes) => {
+        let ok = true
+        for (const outcome of outcomes) {
+          if (outcome.status === 'rejected') {
+            ok = false
+            this.emitError(toError(outcome.reason, 'message.new'))
+          }
+        }
+        if (!ok) return false
+        if (messageId !== null) {
+          this.dedupAdd(messageId)
+          if (!isDrainRow) this.sendAckFrame(messageId)
+        }
+        return true
+      })
+    }
+
+    if (isDrainRow) this.drainSettlements.set(message, settlement)
+    return settlement
+  }
+
+  /**
+   * Best-effort delivery ack for one processed message. No-op unless the
+   * server negotiated ack-mode on this connection. Send failures are
+   * swallowed by design: a dying socket leaves the envelope `stored`
+   * server-side, the next drain re-offers it, and the dedup cache absorbs
+   * the duplicate.
+   */
+  private sendAckFrame(messageId: string): void {
+    if (!this.ackMode) return
+    if (!this.ws || this.ws.readyState !== 1 || !this.authenticated) return
+    try {
+      this.ws.send(JSON.stringify({ type: 'ack', message_id: messageId }))
+    } catch { /* socket teardown race — redelivery + dedup cover it */ }
+  }
+
+  // Membership check that also refreshes recency on a hit (Set iteration
+  // order is insertion order, so delete + re-add moves the id to the back
+  // of the eviction queue).
+  private dedupHit(messageId: string): boolean {
+    if (!this.dedupSeen.has(messageId)) return false
+    this.dedupSeen.delete(messageId)
+    this.dedupSeen.add(messageId)
+    return true
+  }
+
+  private dedupAdd(messageId: string): void {
+    this.dedupSeen.delete(messageId)
+    this.dedupSeen.add(messageId)
+    while (this.dedupSeen.size > this.options.dedupCacheSize) {
+      const oldest = this.dedupSeen.values().next().value
+      if (oldest === undefined) break
+      this.dedupSeen.delete(oldest)
+    }
+  }
+
+  private extractMessageId(message: WsMessage): string | null {
+    const id = (message as { payload?: { id?: unknown } }).payload?.id
+    return typeof id === 'string' && id.length > 0 ? id : null
   }
 
   private isMessageNew(message: WsMessage): boolean {

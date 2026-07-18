@@ -5,6 +5,7 @@ export {
   type BacklogWarningHandler,
   type CallOptions,
   type SendMessageResult,
+  type SyncEnvelope,
   type MuteEntry,
   type MuteTargetKind,
 } from './client.js'

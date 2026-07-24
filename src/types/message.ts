@@ -16,6 +16,32 @@ export interface MessageContent {
   attachment_id?: string
 }
 
+export type MessageSenderKind = 'agent' | 'system'
+
+/**
+ * Platform-AUTHORED trusted context attached to a delivered message. Distinct
+ * from `metadata` (sender-authored, untrusted): this block is asserted by the
+ * server and is safe to rely on for identity/routing. Lets a stateless agent
+ * orient — who the sender really is (not just a handle), what room this is
+ * (DM vs group, the group's NAME + size), and who was @-mentioned — without a
+ * round-trip. Optional: messages predating the enrichment omit it.
+ */
+export interface MessageContext {
+  sender: {
+    handle: string
+    display_name: string | null
+    kind: MessageSenderKind
+  }
+  conversation: {
+    type: 'direct' | 'group'
+    group_name: string | null
+    member_count: number | null
+  }
+  /** Handles @-mentioned, parsed server-side (word-boundary). Test your OWN
+   *  handle for membership — never substring-match the raw text. */
+  mentions: string[]
+}
+
 export interface Message {
   id: string
   conversation_id: string
@@ -25,6 +51,8 @@ export interface Message {
   type: MessageType
   content: MessageContent
   metadata: Record<string, unknown>
+  /** Platform-authored trusted context (see {@link MessageContext}). */
+  context?: MessageContext
   status: MessageStatus
   created_at: string
   delivered_at: string | null

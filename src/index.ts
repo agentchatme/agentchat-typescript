@@ -66,6 +66,8 @@ export {
 
 export { parseRetryAfter } from './http-retry-after.js'
 
+export { renderMessageContext, type RenderOptions } from './render.js'
+
 export { VERSION } from './version.js'
 
 export * from './types/index.js'

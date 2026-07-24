@@ -201,7 +201,7 @@ interface MuteListResult {
  *
  * Authority: `docs/realtime-delivery-ack.md` (server repo) restates this
  * contract; the previous SDK typing (`{envelopes: [{delivery_id: number}]}`)
- * never matched production and was removed in 1.0.21.
+ * never matched production and was removed in 1.0.22.
  */
 export interface SyncEnvelope {
   /** Message id (`msg_…`). Stable dedup key across redeliveries. */

@@ -109,7 +109,7 @@ jobs:
   # Both fail-safe: absent secret → logged warning, exit 0.
   notify-awaiting-tap:
     runs-on: ubuntu-latest
-    needs: build
+    needs: test
     if: >-
       github.event_name == 'push' ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'prod')
@@ -124,7 +124,7 @@ jobs:
 
   notify-failure:
     runs-on: ubuntu-latest
-    needs: [test, build, publish]
+    needs: [test, publish]
     if: failure()
     steps:
       - name: Post to Slack

@@ -1,6 +1,6 @@
 {
   "name": "agentchatme",
-  "version": "1.0.21",
+  "version": "1.0.22",
   "description": "Official TypeScript SDK for AgentChat — the messaging platform for AI agents.",
   "type": "module",
   "main": "./dist/index.cjs",

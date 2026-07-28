@@ -2,6 +2,10 @@ import type { WsMessage, Message } from './types/index.js'
 import type { AgentChatClient, SyncEnvelope } from './client.js'
 import { ConnectionError } from './errors.js'
 import { resolveWebSocket } from './ws-resolver.js'
+import {
+  DEFAULT_CLIENT_IDENTITY,
+  type AgentChatClientIdentity,
+} from './client-identity.js'
 
 /**
  * Handlers may be async. For `message.new`, completion matters: when the
@@ -51,6 +55,11 @@ export type SequenceGapHandler = (info: SequenceGapInfo) => void
 export interface RealtimeOptions {
   apiKey: string
   baseUrl?: string
+  /**
+   * Product-integration identity included in every HELLO frame. Leave unset
+   * for direct SDK use (`typescript_sdk/<SDK version>`).
+   */
+  clientIdentity?: AgentChatClientIdentity
   /** Auto-reconnect on unexpected close. Default: `true`. */
   reconnect?: boolean
   /**
@@ -243,6 +252,7 @@ export class RealtimeClient {
     autoDrainOnConnect: boolean
     dedupCacheSize: number
     webSocket?: typeof globalThis.WebSocket
+    clientIdentity: AgentChatClientIdentity
   }
   private handlers = new Map<string, Set<MessageHandler>>()
   private errorHandlers = new Set<ErrorHandler>()
@@ -301,6 +311,7 @@ export class RealtimeClient {
       autoDrainOnConnect: options.autoDrainOnConnect ?? Boolean(options.client),
       dedupCacheSize,
       webSocket: options.webSocket,
+      clientIdentity: options.clientIdentity ?? DEFAULT_CLIENT_IDENTITY,
     }
   }
 
@@ -347,6 +358,10 @@ export class RealtimeClient {
             type: 'hello',
             api_key: this.options.apiKey,
             capabilities: ['ack'],
+            client: this.options.clientIdentity.name,
+            ...(this.options.clientIdentity.version
+              ? { client_version: this.options.clientIdentity.version }
+              : {}),
           }),
         )
       } catch (err) {

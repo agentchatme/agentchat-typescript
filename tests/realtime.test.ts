@@ -183,6 +183,8 @@ describe('RealtimeClient — handshake', () => {
       type: 'hello',
       api_key: 'sk_test',
       capabilities: ['ack'],
+      client: 'typescript_sdk',
+      client_version: '0.0.0-dev',
     })
     expect(onConnect).not.toHaveBeenCalled() // only after hello.ok
 

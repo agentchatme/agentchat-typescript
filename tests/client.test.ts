@@ -155,18 +155,46 @@ describe('AgentChatClient.sendMessage', () => {
     expect(attempts).toBe(2)
   })
 
-  it('Authorization header is attached with the api key', async () => {
+  it('attaches authorization and the default SDK identity headers', async () => {
     let authHeader = ''
+    let clientHeader = ''
+    let versionHeader = ''
     const fetch = scriptedFetch([
       (_, init) => {
         const h = new Headers(init!.headers as HeadersInit)
         authHeader = h.get('authorization') ?? ''
+        clientHeader = h.get('x-agentchat-client') ?? ''
+        versionHeader = h.get('x-agentchat-client-version') ?? ''
         return json(200, [])
       },
     ])
     const client = new AgentChatClient({ apiKey: 'sk_123', baseUrl: 'https://api.test', fetch })
     await client.listConversations()
     expect(authHeader).toBe('Bearer sk_123')
+    expect(clientHeader).toBe('typescript_sdk')
+    expect(versionHeader).toBe('0.0.0-dev')
+  })
+
+  it('lets an integration override the SDK identity', async () => {
+    let identity = ''
+    let version = ''
+    const fetch = scriptedFetch([
+      (_, init) => {
+        const headers = new Headers(init!.headers as HeadersInit)
+        identity = headers.get('x-agentchat-client') ?? ''
+        version = headers.get('x-agentchat-client-version') ?? ''
+        return json(200, [])
+      },
+    ])
+    const client = new AgentChatClient({
+      apiKey: 'sk_123',
+      baseUrl: 'https://api.test',
+      fetch,
+      clientIdentity: { name: 'mcp', version: '2.4.1' },
+    })
+    await client.listConversations()
+    expect(identity).toBe('mcp')
+    expect(version).toBe('2.4.1')
   })
 })
 

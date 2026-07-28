@@ -70,4 +70,9 @@ export { renderMessageContext, type RenderOptions } from './render.js'
 
 export { VERSION } from './version.js'
 
+export {
+  type AgentChatClientIdentity,
+  type AgentChatClientKind,
+} from './client-identity.js'
+
 export * from './types/index.js'

@@ -27,6 +27,10 @@ import {
   type RetryPolicy,
 } from './http.js'
 import { paginate } from './pagination.js'
+import {
+  clientIdentityHeaders,
+  type AgentChatClientIdentity,
+} from './client-identity.js'
 
 const DEFAULT_BASE_URL = 'https://api.agentchat.me'
 
@@ -93,6 +97,12 @@ export interface AgentChatClientOptions {
   apiKey: string
   baseUrl?: string
   /**
+   * Product-integration identity attached to every request. Leave unset for
+   * direct SDK use (`typescript_sdk/<SDK version>`). Wrappers such as
+   * OpenClaw and MCP should supply their own stable identity.
+   */
+  clientIdentity?: AgentChatClientIdentity
+  /**
    * Optional callback fired whenever a send response includes an
    * `X-Backlog-Warning` header. Convenience hook for centralized
    * logging / metrics — the same warning is also returned synchronously
@@ -119,6 +129,7 @@ interface RegisterOptions {
   display_name?: string
   description?: string
   baseUrl?: string
+  clientIdentity?: AgentChatClientIdentity
 }
 
 interface RegisterResult {
@@ -248,6 +259,7 @@ export class AgentChatClient {
       retry: options.retry,
       hooks: options.hooks,
       fetch: options.fetch,
+      defaultHeaders: clientIdentityHeaders(options.clientIdentity),
     })
     this.onBacklogWarning = options.onBacklogWarning
   }
@@ -319,7 +331,10 @@ export class AgentChatClient {
    * returned `pending_id` and the OTP code.
    */
   static async register(options: RegisterOptions): Promise<RegisterResult> {
-    const http = new HttpTransport({ baseUrl: options.baseUrl ?? DEFAULT_BASE_URL })
+    const http = new HttpTransport({
+      baseUrl: options.baseUrl ?? DEFAULT_BASE_URL,
+      defaultHeaders: clientIdentityHeaders(options.clientIdentity),
+    })
     const res = await http.request<RegisterResult>('POST', '/v1/register', {
       body: {
         email: options.email,
@@ -341,15 +356,25 @@ export class AgentChatClient {
   static async verify(
     pendingId: string,
     code: string,
-    options?: { baseUrl?: string },
+    options?: {
+      baseUrl?: string
+      clientIdentity?: AgentChatClientIdentity
+    },
   ): Promise<{ agent: Record<string, unknown>; apiKey: string; client: AgentChatClient }> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
-    const http = new HttpTransport({ baseUrl })
+    const http = new HttpTransport({
+      baseUrl,
+      defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
+    })
     const res = await http.request<VerifyResult>('POST', '/v1/register/verify', {
       body: { pending_id: pendingId, code },
       retry: 'never',
     })
-    const client = new AgentChatClient({ apiKey: res.data.api_key, baseUrl })
+    const client = new AgentChatClient({
+      apiKey: res.data.api_key,
+      baseUrl,
+      clientIdentity: options?.clientIdentity,
+    })
     return { agent: res.data.agent, apiKey: res.data.api_key, client }
   }
 
@@ -361,10 +386,16 @@ export class AgentChatClient {
    */
   static async recover(
     email: string,
-    options?: { baseUrl?: string },
+    options?: {
+      baseUrl?: string
+      clientIdentity?: AgentChatClientIdentity
+    },
   ): Promise<{ pending_id?: string; message: string }> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
-    const http = new HttpTransport({ baseUrl })
+    const http = new HttpTransport({
+      baseUrl,
+      defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
+    })
     const res = await http.request<{ pending_id?: string; message: string }>(
       'POST',
       '/v1/agents/recover',
@@ -376,16 +407,26 @@ export class AgentChatClient {
   static async recoverVerify(
     pendingId: string,
     code: string,
-    options?: { baseUrl?: string },
+    options?: {
+      baseUrl?: string
+      clientIdentity?: AgentChatClientIdentity
+    },
   ): Promise<{ handle: string; apiKey: string; client: AgentChatClient }> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
-    const http = new HttpTransport({ baseUrl })
+    const http = new HttpTransport({
+      baseUrl,
+      defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
+    })
     const res = await http.request<{ handle: string; api_key: string }>(
       'POST',
       '/v1/agents/recover/verify',
       { body: { pending_id: pendingId, code }, retry: 'never' },
     )
-    const client = new AgentChatClient({ apiKey: res.data.api_key, baseUrl })
+    const client = new AgentChatClient({
+      apiKey: res.data.api_key,
+      baseUrl,
+      clientIdentity: options?.clientIdentity,
+    })
     return { handle: res.data.handle, apiKey: res.data.api_key, client }
   }
 

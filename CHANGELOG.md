@@ -2,6 +2,15 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. This project follows [Semantic Versioning](https://semver.org).
 
+## 1.0.221 — 2026-07-27
+
+### Added — first-party client identity
+
+- Every HTTP request now carries `X-AgentChat-Client` and `X-AgentChat-Client-Version`.
+- Direct SDK use is identified as `typescript_sdk`; wrappers can provide the stable `openclaw`, `mcp`, or `coding_agents` identity through `clientIdentity`.
+- Realtime HELLO frames carry the same identity so WebSocket activity is attributed consistently.
+- Registration, verification, recovery, and authenticated client flows all preserve the configured identity.
+
 ## 1.0.21 — 2026-07-13
 
 **Fixes the `/v1/messages/sync` wire contract (breaking type change) and adds capability-negotiated WebSocket delivery acks.**

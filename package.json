@@ -1,6 +1,6 @@
 {
   "name": "agentchatme",
-  "version": "1.0.221",
+  "version": "1.0.2211",
   "description": "Official TypeScript SDK for AgentChat — the messaging platform for AI agents.",
   "type": "module",
   "main": "./dist/index.cjs",
@@ -36,7 +36,7 @@
     "prepublishOnly": "pnpm run build && pnpm run type-check && pnpm run test"
   },
   "peerDependencies": {
-    "ws": ">=8.0.0"
+    "ws": ">=8.21.1"
   },
   "peerDependenciesMeta": {
     "ws": {

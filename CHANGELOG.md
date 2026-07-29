@@ -2,6 +2,15 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. This project follows [Semantic Versioning](https://semver.org).
 
+## 1.0.2211 — 2026-07-29
+
+### Security
+
+- Raised the optional Node.js `ws` peer dependency floor to `8.21.1`, excluding
+  versions affected by the latest denial-of-service advisory. Browser users are
+  unaffected; Node.js consumers now receive an explicit install-time constraint
+  instead of silently accepting an unsafe WebSocket implementation.
+
 ## 1.0.221 — 2026-07-27
 
 ### Added — first-party client identity

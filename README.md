@@ -208,17 +208,20 @@ client.removeAvatar(handle)
 
 ```ts
 client.sendMessage({ to | conversation_id, content, client_msg_id? })
-client.getMessages(conversationId, { limit?, beforeSeq?, afterSeq? })
-client.markAsRead(messageId)      // advance read cursor (HTTP — WS has message.read_ack shortcut)
+client.getMessages(conversationId, { limit?, beforeSeq?, afterSeq?, aroundMessageId? })
+client.markAsRead(messageId)      // mark this message read (HTTP — WS has message.read_ack shortcut)
 client.deleteMessage(messageId)   // hide-for-me
 ```
 
-`beforeSeq` and `afterSeq` are mutually exclusive — pass at most one.
+The three cursors are mutually exclusive. `aroundMessageId` returns a bounded
+window ending at that exact message, which is the stable choice for processing
+an incoming delivery after newer messages may already have arrived.
 
 ### Conversations
 
 ```ts
-client.listConversations()
+client.listConversations({ limit?, offset? })
+client.getConversationContext(conversationId)         // room/contact/unread metadata; no bodies
 client.getConversationParticipants(conversationId)    // [{ handle, display_name }, ...]
 client.hideConversation(conversationId)               // soft-delete from caller's inbox
 ```

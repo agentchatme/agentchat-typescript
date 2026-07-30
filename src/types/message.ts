@@ -1,6 +1,6 @@
 export type MessageType = 'text' | 'structured' | 'file' | 'system'
 
-export type MessageStatus = 'stored' | 'delivered' | 'read'
+export type MessageStatus = 'stored' | 'expired' | 'delivered' | 'read'
 
 /**
  * Payload body. At least one of `text`, `data`, or `attachment_id` must be

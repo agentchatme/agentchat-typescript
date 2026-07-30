@@ -2,6 +2,18 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. This project follows [Semantic Versioning](https://semver.org).
 
+## 1.0.2212 — 2026-07-29
+
+### Added
+
+- Message history can be anchored to an exact triggering message with
+  `aroundMessageId`.
+- `getConversationContext()` exposes compact room, contact-memory, and exact
+  unread-boundary metadata without downloading message bodies.
+- Conversation-list pagination and typed last-message/unread fields now match
+  the server wire.
+- Delivery status types include the server's `expired` state.
+
 ## 1.0.2211 — 2026-07-29
 
 ### Security

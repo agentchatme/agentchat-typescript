@@ -333,6 +333,96 @@ describe('AgentChatClient.getConversationParticipants', () => {
   })
 })
 
+describe('AgentChatClient conversation context', () => {
+  it('anchors message history at an exact triggering message', async () => {
+    let capturedUrl = ''
+    const fetch = scriptedFetch([
+      (input) => {
+        capturedUrl = String(input)
+        return json(200, [])
+      },
+    ])
+    const client = new AgentChatClient({
+      apiKey: 'k',
+      baseUrl: 'https://api.test',
+      fetch,
+    })
+
+    await client.getMessages('conv_xyz', {
+      limit: 30,
+      aroundMessageId: 'msg_focus',
+    })
+
+    const url = new URL(capturedUrl)
+    expect(url.pathname).toBe('/v1/messages/conv_xyz')
+    expect(url.searchParams.get('limit')).toBe('30')
+    expect(url.searchParams.get('around_message_id')).toBe('msg_focus')
+  })
+
+  it('fetches compact room/contact/unread metadata separately from bodies', async () => {
+    let capturedUrl = ''
+    const fetch = scriptedFetch([
+      (input) => {
+        capturedUrl = String(input)
+        return json(200, {
+          conversation_id: 'conv_xyz',
+          type: 'direct',
+          group: null,
+          counterparty: {
+            handle: 'alice',
+            display_name: 'Alice',
+            avatar_url: null,
+          },
+          relationship: {
+            is_contact: true,
+            added_at: '2026-07-01T00:00:00Z',
+            note: 'Deployment owner',
+          },
+          unread: { count: 2, oldest_seq: 4, newest_seq: 5 },
+        })
+      },
+    ])
+    const client = new AgentChatClient({
+      apiKey: 'k',
+      baseUrl: 'https://api.test',
+      fetch,
+    })
+
+    const context = await client.getConversationContext('conv_xyz')
+
+    expect(capturedUrl).toBe(
+      'https://api.test/v1/conversations/conv_xyz/context',
+    )
+    expect(context.relationship?.note).toBe('Deployment owner')
+    expect(context.unread).toEqual({
+      count: 2,
+      oldest_seq: 4,
+      newest_seq: 5,
+    })
+  })
+
+  it('passes inbox limit and offset to the server', async () => {
+    let capturedUrl = ''
+    const fetch = scriptedFetch([
+      (input) => {
+        capturedUrl = String(input)
+        return json(200, [])
+      },
+    ])
+    const client = new AgentChatClient({
+      apiKey: 'k',
+      baseUrl: 'https://api.test',
+      fetch,
+    })
+
+    await client.listConversations({ limit: 26, offset: 25 })
+
+    expect(capturedUrl).toBe(
+      'https://api.test/v1/conversations?limit=26&offset=25',
+    )
+  })
+})
+
 describe('AgentChatClient.setGroupAvatar / removeGroupAvatar', () => {
   it('PUTs raw image bytes to /v1/groups/:id/avatar with honored contentType', async () => {
     let capturedMethod = ''

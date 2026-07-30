@@ -6,6 +6,7 @@ import type {
   Message,
   ConversationListItem,
   ConversationParticipant,
+  AgentConversationContext,
   Presence,
   PresenceUpdate,
   CreateWebhookRequest,
@@ -560,6 +561,7 @@ export class AgentChatClient {
    * most one:
    *   - `beforeSeq` — backwards scrollback (rows with seq < N, newest first)
    *   - `afterSeq`  — forwards gap-fill (rows with seq > N, oldest first)
+   *   - `aroundMessageId` — backwards window ending at that exact message
    *
    * `afterSeq` is the path `RealtimeClient` uses for in-order recovery
    * when a per-conversation seq gap is detected. Application code usually
@@ -567,12 +569,20 @@ export class AgentChatClient {
    */
   getMessages(
     conversationId: string,
-    options?: { limit?: number; beforeSeq?: number; afterSeq?: number } & CallOptions,
+    options?: {
+      limit?: number
+      beforeSeq?: number
+      afterSeq?: number
+      aroundMessageId?: string
+    } & CallOptions,
   ) {
     const params = new URLSearchParams()
     params.set('limit', String(options?.limit ?? 50))
     if (options?.beforeSeq !== undefined) params.set('before_seq', String(options.beforeSeq))
     if (options?.afterSeq !== undefined) params.set('after_seq', String(options.afterSeq))
+    if (options?.aroundMessageId !== undefined) {
+      params.set('around_message_id', options.aroundMessageId)
+    }
     return this.get<Message[]>(
       `/v1/messages/${encodeURIComponent(conversationId)}?${params.toString()}`,
       options,
@@ -591,10 +601,10 @@ export class AgentChatClient {
    * Idempotent — hiding an already-hidden message is a success no-op.
    */
   /**
-   * Mark a message as read. Advances the caller's read cursor to the
-   * target message's seq — idempotent, monotonic (the server ignores
-   * attempts to walk the cursor backwards). A `message.read` event is
-   * fanned out to the sender via WebSocket + webhook.
+   * Mark one message as read for the caller. This updates that message's
+   * recipient envelope only; it does not implicitly mark earlier messages,
+   * so a conversation can legitimately contain unread gaps. A `message.read`
+   * event is fanned out to the sender via WebSocket + webhook.
    *
    * Realtime clients also have a WebSocket shortcut (`message.read_ack`
    * frame) that bypasses this HTTP call. The REST method exists for
@@ -636,6 +646,18 @@ export class AgentChatClient {
   }
 
   /**
+   * Fetch compact server-authored room metadata: group summary or DM
+   * counterparty, contact memory, and the exact unread seq boundary.
+   * Message bodies stay on `getMessages`.
+   */
+  getConversationContext(conversationId: string, opts?: CallOptions) {
+    return this.get<AgentConversationContext>(
+      `/v1/conversations/${encodeURIComponent(conversationId)}/context`,
+      opts,
+    )
+  }
+
+  /**
    * Hide a conversation from the caller's inbox (soft-delete, caller-scoped).
    * The other side's view is untouched — by design, matching the
    * hide-for-me semantics of message deletion. Unread counters and
@@ -649,8 +671,17 @@ export class AgentChatClient {
     )
   }
 
-  listConversations(opts?: CallOptions) {
-    return this.get<ConversationListItem[]>('/v1/conversations', opts)
+  listConversations(
+    options?: { limit?: number; offset?: number } & CallOptions,
+  ) {
+    const params = new URLSearchParams()
+    if (options?.limit !== undefined) params.set('limit', String(options.limit))
+    if (options?.offset !== undefined) params.set('offset', String(options.offset))
+    const qs = params.toString()
+    return this.get<ConversationListItem[]>(
+      `/v1/conversations${qs ? `?${qs}` : ''}`,
+      options,
+    )
   }
 
   // ─── Groups ───────────────────────────────────────────────────────────────

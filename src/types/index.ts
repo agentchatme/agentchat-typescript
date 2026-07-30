@@ -20,6 +20,7 @@ export type {
 } from './message.js'
 
 export type {
+  AgentConversationContext,
   Conversation,
   ConversationListItem,
   ConversationParticipant,

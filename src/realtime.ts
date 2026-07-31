@@ -126,6 +126,35 @@ export interface RealtimeOptions {
 // up and reconnect. Must stay under the server-side HELLO_TIMEOUT_MS (5s).
 const HELLO_ACK_TIMEOUT_MS = 4_000
 
+/**
+ * How long a connection must SURVIVE before we call it healthy and clear
+ * the reconnect backoff.
+ *
+ * "The handshake succeeded" is not the same claim as "this connection
+ * works". Resetting the attempt counter on `hello.ok` alone means a socket
+ * that connects and dies seconds later always retries at the floor delay —
+ * the exponential backoff can then never engage, because it only ever
+ * counts attempts that failed BEFORE the handshake. A client in that state
+ * reconnects forever with no ramp at all: observed in production as 725
+ * connections in four hours from one agent, delivering zero messages,
+ * while sibling agents on the same host held single connections.
+ *
+ * 30s is comfortably longer than any handshake-adjacent failure (the HELLO
+ * ack budget is 4s, the server heartbeat cycle 45s) and short enough that
+ * a healthy client clears its counter well before a second blip.
+ */
+const STABLE_CONNECTION_MS = 30_000
+
+/** Reconnects faster than this count as "rapid" for the instability warning. */
+const RAPID_RECONNECT_MS = 60_000
+
+/**
+ * Consecutive rapid reconnects before we warn the operator. This failure is
+ * invisible from inside the agent — every reconnect succeeds, so nothing
+ * looks broken locally while the connection is unusable in practice.
+ */
+const INSTABILITY_WARN_THRESHOLD = 5
+
 // How long we wait for the missing seqs to arrive naturally (e.g. via the
 // pub/sub fan-out catching up to the drain) before triggering an explicit
 // gap-fill round-trip. Two seconds is well below the perceptual floor for
@@ -259,6 +288,12 @@ export class RealtimeClient {
   private connectHandlers = new Set<ConnectHandler>()
   private disconnectHandlers = new Set<DisconnectHandler>()
   private reconnectAttempts = 0
+  /** Clears reconnectAttempts once this connection proves itself stable. */
+  private stabilityTimer: ReturnType<typeof setTimeout> | null = null
+  /** Consecutive connections that died before STABLE_CONNECTION_MS. Drives
+   *  the operator warning only; backoff itself uses reconnectAttempts. */
+  private rapidReconnects = 0
+  private lastConnectAt: number | null = null
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private helloAckTimer: ReturnType<typeof setTimeout> | null = null
   private authenticated = false
@@ -396,7 +431,11 @@ export class RealtimeClient {
           // would just be unknown frames.
           const caps = (message as { capabilities?: unknown }).capabilities
           this.ackMode = Array.isArray(caps) && caps.includes('ack')
-          this.reconnectAttempts = 0
+          // reconnectAttempts is deliberately NOT reset here. A successful
+          // handshake proves the credential, not the connection — see
+          // STABLE_CONNECTION_MS. The counter clears from the timer below,
+          // and only if we are still connected 30s from now.
+          this.startStabilityTimer()
           if (this.helloAckTimer) {
             clearTimeout(this.helloAckTimer)
             this.helloAckTimer = null
@@ -437,6 +476,11 @@ export class RealtimeClient {
         clearTimeout(this.helloAckTimer)
         this.helloAckTimer = null
       }
+      // Cancel BEFORE clearing `authenticated`: a connection that dies young
+      // must not clear the backoff counter — that is the whole point of the
+      // stability window.
+      this.cancelStabilityTimer()
+      this.noteConnectionEnded()
       this.authenticated = false
       this.ackMode = false
       const selfClosedForHelloTimeout = this.helloTimeoutClose
@@ -652,6 +696,63 @@ export class RealtimeClient {
     return state !== undefined && state.buffer.has(row.seq)
   }
 
+  /**
+   * Clear the reconnect backoff once this connection proves itself.
+   *
+   * Scheduled on `hello.ok`, cancelled on close. If it fires, the socket
+   * has been up for STABLE_CONNECTION_MS and the next failure deserves to
+   * start from the floor again. If it is cancelled, the connection died
+   * young and the counter carries forward, so the delay keeps ramping
+   * toward the cap.
+   */
+  private startStabilityTimer(): void {
+    this.cancelStabilityTimer()
+    this.lastConnectAt = Date.now()
+    this.stabilityTimer = setTimeout(() => {
+      this.stabilityTimer = null
+      if (this.disposed || !this.authenticated) return
+      this.reconnectAttempts = 0
+      this.rapidReconnects = 0
+    }, STABLE_CONNECTION_MS)
+    // Never hold a Node process open just to reset a counter.
+    ;(this.stabilityTimer as { unref?: () => void }).unref?.()
+  }
+
+  private cancelStabilityTimer(): void {
+    if (this.stabilityTimer) {
+      clearTimeout(this.stabilityTimer)
+      this.stabilityTimer = null
+    }
+  }
+
+  /**
+   * Track short-lived connections and warn once they form a pattern.
+   * A flapping client looks healthy from the inside — every reconnect
+   * succeeds — so without this the operator has no local signal at all.
+   */
+  private noteConnectionEnded(): void {
+    const started = this.lastConnectAt
+    this.lastConnectAt = null
+    if (started === null) return
+
+    if (Date.now() - started >= RAPID_RECONNECT_MS) {
+      this.rapidReconnects = 0
+      return
+    }
+
+    this.rapidReconnects++
+    if (this.rapidReconnects === INSTABILITY_WARN_THRESHOLD) {
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[agentchat] realtime connection is unstable: ${this.rapidReconnects} ` +
+          `reconnects each lasting under ${RAPID_RECONNECT_MS / 1000}s. Backing off ` +
+          `(next retry in up to ${this.options.maxReconnectInterval / 1000}s). This ` +
+          `usually means the network path or a local supervisor is dropping the ` +
+          `socket, not an AgentChat outage.`,
+      )
+    }
+  }
+
   private scheduleReconnect(): void {
     if (this.disposed) return
     if (!this.options.reconnect) return
@@ -767,6 +868,7 @@ export class RealtimeClient {
       clearTimeout(this.helloAckTimer)
       this.helloAckTimer = null
     }
+    this.cancelStabilityTimer()
     // Flush any buffered envelopes synchronously so the caller doesn't
     // miss them after disconnect(). No gap-fill — we're tearing down,
     // and an in-flight HTTP request would race the close.

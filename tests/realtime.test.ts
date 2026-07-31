@@ -960,3 +960,86 @@ describe('RealtimeClient — terminal close codes', () => {
     rt.disconnect()
   })
 })
+
+// ─── Reconnect backoff stability window ───────────────────────────────────
+//
+// The bug these cover: resetting the attempt counter on `hello.ok` treats a
+// successful HANDSHAKE as a healthy CONNECTION. A socket that connects then
+// dies seconds later retries at the floor delay forever, because the
+// exponential backoff only counts attempts that failed BEFORE the
+// handshake. Seen in production as 725 reconnects in four hours from one
+// agent with a completely flat interval.
+
+describe('RealtimeClient — reconnect stability window', () => {
+  function makeFlappy() {
+    return new RealtimeClient({
+      apiKey: 'sk_test',
+      webSocket: MockWebSocketCtor,
+      reconnect: true,
+      reconnectInterval: 100,
+      maxReconnectInterval: 10_000,
+    })
+  }
+
+  it('does NOT clear the backoff on hello.ok alone', async () => {
+    const rt = makeFlappy()
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+
+    // Backoff already climbing from earlier failures. Seeded BEFORE the
+    // handshake — the old code reset right here, so this ordering is what
+    // makes the assertion a real regression guard rather than a tautology.
+    ;(rt as unknown as { reconnectAttempts: number }).reconnectAttempts = 4
+    ws.simulateMessage({ type: 'hello.ok' })
+
+    expect(
+      (rt as unknown as { reconnectAttempts: number }).reconnectAttempts,
+    ).toBe(4)
+
+    rt.disconnect()
+  })
+
+  it('clears the backoff only after the connection survives the window', async () => {
+    vi.useFakeTimers()
+    const rt = makeFlappy()
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ;(rt as unknown as { reconnectAttempts: number }).reconnectAttempts = 7
+    ws.simulateMessage({ type: 'hello.ok' })
+
+    // Just before the window elapses — still counted as unproven.
+    vi.advanceTimersByTime(29_000)
+    expect(
+      (rt as unknown as { reconnectAttempts: number }).reconnectAttempts,
+    ).toBe(7)
+
+    vi.advanceTimersByTime(2_000)
+    expect(
+      (rt as unknown as { reconnectAttempts: number }).reconnectAttempts,
+    ).toBe(0)
+
+    rt.disconnect()
+    vi.useRealTimers()
+  })
+
+  it('keeps the counter climbing across repeated short-lived connections', async () => {
+    vi.useFakeTimers()
+    const rt = makeFlappy()
+
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage({ type: 'hello.ok' })
+    // Dies well inside the stability window.
+    vi.advanceTimersByTime(5_000)
+    ws.simulateClose(1006, 'abnormal')
+
+    const after = (rt as unknown as { reconnectAttempts: number }).reconnectAttempts
+    expect(after).toBeGreaterThan(0)
+
+    rt.disconnect()
+    vi.useRealTimers()
+  })
+})

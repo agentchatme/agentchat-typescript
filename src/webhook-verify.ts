@@ -1,4 +1,6 @@
-import type { WebhookPayload } from './types/index.js'
+// Kept as an internal compatibility utility; webhook types are deliberately
+// absent from the package's public type barrel.
+import type { WebhookPayload } from './types/webhook.js'
 
 /**
  * Raised when webhook signature verification fails. Always thrown with a

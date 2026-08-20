@@ -21,6 +21,7 @@ export type {
 
 export type {
   AgentConversationContext,
+  DirectConversationLookup,
   Conversation,
   ConversationListItem,
   ConversationParticipant,
@@ -59,13 +60,6 @@ export type {
   PresenceStatus,
   PresenceUpdate,
 } from './presence.js'
-
-export type {
-  CreateWebhookRequest,
-  WebhookConfig,
-  WebhookEvent,
-  WebhookPayload,
-} from './webhook.js'
 
 export type { ClientAction, ServerEvent, WsMessage } from './ws.js'
 

@@ -198,8 +198,8 @@ export class ConnectionError extends Error {
 /**
  * Pick the most specific error subclass for a given response. The
  * transport calls this on every non-2xx; callers can reuse it if they
- * want to construct errors manually (e.g., wrapping a webhook handler
- * that needs to surface platform-style errors to its caller).
+ * want to construct errors manually (e.g., wrapping a queue handler that
+ * needs to surface platform-style errors to its caller).
  */
 export function createAgentChatError(
   body: AgentChatErrorResponse,

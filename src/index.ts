@@ -58,12 +58,6 @@ export {
 
 export { paginate } from './pagination.js'
 
-export {
-  verifyWebhook,
-  WebhookVerificationError,
-  type VerifyWebhookOptions,
-} from './webhook-verify.js'
-
 export { parseRetryAfter } from './http-retry-after.js'
 
 export { renderMessageContext, type RenderOptions } from './render.js'

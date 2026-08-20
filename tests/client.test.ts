@@ -378,6 +378,11 @@ describe('AgentChatClient conversation context', () => {
             added_at: '2026-07-01T00:00:00Z',
             note: 'Deployment owner',
           },
+          direct_state: {
+            state: 'established',
+            initiated_by_self: false,
+            last_message_at: '2026-07-30T00:00:00Z',
+          },
           unread: { count: 2, oldest_seq: 4, newest_seq: 5 },
         })
       },
@@ -394,10 +399,55 @@ describe('AgentChatClient conversation context', () => {
       'https://api.test/v1/conversations/conv_xyz/context',
     )
     expect(context.relationship?.note).toBe('Deployment owner')
+    expect(context.direct_state?.state).toBe('established')
     expect(context.unread).toEqual({
       count: 2,
       oldest_seq: 4,
       newest_seq: 5,
+    })
+  })
+
+  it('resolves direct continuity by normalized peer handle', async () => {
+    let capturedUrl = ''
+    const fetch = scriptedFetch([
+      (input) => {
+        capturedUrl = String(input)
+        return json(200, {
+          state: 'established',
+          counterparty: { handle: 'alice', display_name: 'Alice' },
+          conversation: {
+            conversation_id: 'conv_existing',
+            type: 'direct',
+            group: null,
+            counterparty: {
+              handle: 'alice',
+              display_name: 'Alice',
+              avatar_url: null,
+            },
+            relationship: null,
+            direct_state: {
+              state: 'established',
+              initiated_by_self: true,
+              last_message_at: '2026-07-30T00:00:00Z',
+            },
+            unread: { count: 0, oldest_seq: null, newest_seq: null },
+          },
+        })
+      },
+    ])
+    const client = new AgentChatClient({
+      apiKey: 'k',
+      baseUrl: 'https://api.test',
+      fetch,
+    })
+
+    const lookup = await client.getDirectConversationContext('@alice')
+    expect(capturedUrl).toBe(
+      'https://api.test/v1/conversations/direct/alice/context',
+    )
+    expect(lookup).toMatchObject({
+      state: 'established',
+      conversation: { conversation_id: 'conv_existing' },
     })
   })
 
@@ -461,29 +511,6 @@ describe('AgentChatClient.setGroupAvatar / removeGroupAvatar', () => {
     expect(capturedMethod).toBe('DELETE')
     expect(capturedUrl).toBe('https://api.test/v1/groups/grp_1/avatar')
     expect(res.ok).toBe(true)
-  })
-})
-
-describe('AgentChatClient.getWebhook', () => {
-  it('GETs /v1/webhooks/:id and returns a WebhookConfig', async () => {
-    let capturedUrl = ''
-    const fetch = scriptedFetch([
-      (input) => {
-        capturedUrl = typeof input === 'string' ? input : input.toString()
-        return json(200, {
-          id: 'wh_1',
-          url: 'https://example.com/hook',
-          events: ['message.new'],
-          active: true,
-          created_at: '2026-01-01T00:00:00Z',
-        })
-      },
-    ])
-    const client = new AgentChatClient({ apiKey: 'k', baseUrl: 'https://api.test', fetch })
-    const res = await client.getWebhook('wh_1')
-    expect(capturedUrl).toBe('https://api.test/v1/webhooks/wh_1')
-    expect(res.url).toBe('https://example.com/hook')
-    expect(res.events).toContain('message.new')
   })
 })
 

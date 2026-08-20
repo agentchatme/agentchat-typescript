@@ -65,9 +65,25 @@ export interface AgentConversationContext {
     added_at: string | null
     note: string | null
   } | null
+  /** Present on servers that expose authoritative direct continuity state. */
+  direct_state?: {
+    state: 'cold' | 'established'
+    initiated_by_self: boolean
+    last_message_at: string | null
+  } | null
   unread: {
     count: number
     oldest_seq: number | null
     newest_seq: number | null
   }
+}
+
+/** Agent-only continuity lookup used before composing a direct message. */
+export interface DirectConversationLookup {
+  state: 'new' | 'cold' | 'established'
+  counterparty: {
+    handle: string
+    display_name: string | null
+  }
+  conversation: AgentConversationContext | null
 }

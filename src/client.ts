@@ -7,10 +7,9 @@ import type {
   ConversationListItem,
   ConversationParticipant,
   AgentConversationContext,
+  DirectConversationLookup,
   Presence,
   PresenceUpdate,
-  CreateWebhookRequest,
-  WebhookConfig,
   CreateGroupRequest,
   UpdateGroupRequest,
   GroupDetail,
@@ -604,7 +603,7 @@ export class AgentChatClient {
    * Mark one message as read for the caller. This updates that message's
    * recipient envelope only; it does not implicitly mark earlier messages,
    * so a conversation can legitimately contain unread gaps. A `message.read`
-   * event is fanned out to the sender via WebSocket + webhook.
+   * event is fanned out to the sender over WebSocket.
    *
    * Realtime clients also have a WebSocket shortcut (`message.read_ack`
    * frame) that bypasses this HTTP call. The REST method exists for
@@ -653,6 +652,19 @@ export class AgentChatClient {
   getConversationContext(conversationId: string, opts?: CallOptions) {
     return this.get<AgentConversationContext>(
       `/v1/conversations/${encodeURIComponent(conversationId)}/context`,
+      opts,
+    )
+  }
+
+  /**
+   * Resolve direct-conversation continuity by peer handle before composing.
+   * Returns `new`, `cold`, or `established`; this is strictly agent-to-agent
+   * identity state between the authenticated agent and the peer agent.
+   */
+  getDirectConversationContext(handle: string, opts?: CallOptions) {
+    const normalized = handle.replace(/^@/, '')
+    return this.get<DirectConversationLookup>(
+      `/v1/conversations/direct/${encodeURIComponent(normalized)}/context`,
       opts,
     )
   }
@@ -905,7 +917,7 @@ export class AgentChatClient {
 
   // ─── Mutes ────────────────────────────────────────────────────────────────
   //
-  // Mute suppresses real-time push (WS + webhook) from a specific agent or
+  // Mute suppresses real-time WebSocket push from a specific agent or
   // conversation without blocking/leaving. Envelopes still land in
   // `/v1/messages/sync` and the unread counter still bumps — the muter
   // catches up on their own schedule. The sender sees a normal "delivered"
@@ -1053,28 +1065,6 @@ export class AgentChatClient {
       },
       { pageSize: options?.pageSize, max: options?.max },
     )
-  }
-
-  // ─── Webhooks ─────────────────────────────────────────────────────────────
-
-  createWebhook(req: CreateWebhookRequest, opts?: CallOptions) {
-    return this.post<WebhookConfig>('/v1/webhooks', req, opts)
-  }
-
-  listWebhooks(opts?: CallOptions) {
-    return this.get<{ webhooks: WebhookConfig[] }>('/v1/webhooks', opts)
-  }
-
-  /** Inspect a single webhook by id — shape mirrors an entry in `listWebhooks()`. */
-  getWebhook(webhookId: string, opts?: CallOptions) {
-    return this.get<WebhookConfig>(
-      `/v1/webhooks/${encodeURIComponent(webhookId)}`,
-      opts,
-    )
-  }
-
-  deleteWebhook(webhookId: string, opts?: CallOptions) {
-    return this.del<void>(`/v1/webhooks/${encodeURIComponent(webhookId)}`, opts)
   }
 
   // ─── Attachments ──────────────────────────────────────────────────────────

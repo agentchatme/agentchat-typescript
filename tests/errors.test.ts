@@ -2,8 +2,11 @@ import { describe, it, expect } from 'vitest'
 import {
   AgentChatError,
   BlockedError,
+  EmailExhaustedError,
+  EmailLimitReachedError,
   ForbiddenError,
   GroupDeletedError,
+  HandleRequiredError,
   NotFoundError,
   RateLimitedError,
   RecipientBackloggedError,
@@ -105,6 +108,87 @@ describe('createAgentChatError', () => {
     expect((err as GroupDeletedError).groupId).toBe('grp_1')
     expect((err as GroupDeletedError).deletedByHandle).toBe('alice')
     expect((err as GroupDeletedError).deletedAt).toBe('2026-01-01T00:00:00Z')
+  })
+
+  it('extracts the live-agent cap on EMAIL_LIMIT_REACHED', () => {
+    const err = createAgentChatError(
+      {
+        code: 'EMAIL_LIMIT_REACHED',
+        message: 'This email already backs 10 active agents.',
+        details: { limit: 10 },
+      },
+      409,
+    )
+    expect(err).toBeInstanceOf(EmailLimitReachedError)
+    expect(err.code).toBe('EMAIL_LIMIT_REACHED')
+    expect(err.status).toBe(409)
+    expect((err as EmailLimitReachedError).limit).toBe(10)
+  })
+
+  it('maps legacy EMAIL_TAKEN → EmailLimitReachedError with limit null', () => {
+    // Pre-policy servers reject the second live agent on an email with
+    // EMAIL_TAKEN and no details: same class, and `limit` is null so the
+    // caller quotes the server message instead of a number.
+    const err = createAgentChatError({ code: 'EMAIL_TAKEN', message: 'taken' }, 409)
+    expect(err).toBeInstanceOf(EmailLimitReachedError)
+    expect(err.code).toBe('EMAIL_TAKEN')
+    expect((err as EmailLimitReachedError).limit).toBeNull()
+    expect(err.message).toBe('taken')
+  })
+
+  it('extracts the lifetime cap on EMAIL_EXHAUSTED', () => {
+    const err = createAgentChatError(
+      {
+        code: 'EMAIL_EXHAUSTED',
+        message: 'This email has reached the maximum of 30 account registrations.',
+        details: { limit: 30 },
+      },
+      409,
+    )
+    expect(err).toBeInstanceOf(EmailExhaustedError)
+    expect(err).not.toBeInstanceOf(EmailLimitReachedError)
+    expect((err as EmailExhaustedError).limit).toBe(30)
+  })
+
+  it('treats a malformed details.limit as absent', () => {
+    for (const limit of ['10', 10.5, true, null, undefined]) {
+      const reached = createAgentChatError(
+        { code: 'EMAIL_LIMIT_REACHED', message: 'x', details: { limit } },
+        409,
+      ) as EmailLimitReachedError
+      const exhausted = createAgentChatError(
+        { code: 'EMAIL_EXHAUSTED', message: 'x', details: { limit } },
+        409,
+      ) as EmailExhaustedError
+      expect(reached.limit).toBeNull()
+      expect(exhausted.limit).toBeNull()
+    }
+  })
+
+  it('extracts the sibling handles on HANDLE_REQUIRED', () => {
+    const err = createAgentChatError(
+      {
+        code: 'HANDLE_REQUIRED',
+        message: 'This email backs more than one agent.',
+        details: { handles: ['alpha-bot', 'beta-bot', 42, null] },
+      },
+      409,
+    )
+    expect(err).toBeInstanceOf(HandleRequiredError)
+    expect(err.code).toBe('HANDLE_REQUIRED')
+    expect(err.status).toBe(409)
+    // Server order (created_at ASC) preserved; non-string entries dropped.
+    expect((err as HandleRequiredError).handles).toEqual(['alpha-bot', 'beta-bot'])
+  })
+
+  it('HANDLE_REQUIRED without usable details has empty handles', () => {
+    const noDetails = createAgentChatError({ code: 'HANDLE_REQUIRED', message: 'x' }, 409)
+    expect((noDetails as HandleRequiredError).handles).toEqual([])
+    const notArray = createAgentChatError(
+      { code: 'HANDLE_REQUIRED', message: 'x', details: { handles: 'alpha-bot' } },
+      409,
+    )
+    expect((notArray as HandleRequiredError).handles).toEqual([])
   })
 
   it('maps INTERNAL_ERROR → ServerError', () => {

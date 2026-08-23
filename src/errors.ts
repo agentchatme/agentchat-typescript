@@ -175,6 +175,85 @@ export class GroupDeletedError extends AgentChatError {
   }
 }
 
+/**
+ * `details.limit` as sent by the email-policy errors. The server emits an
+ * integer; anything else (missing, string, boolean) is treated as absent so
+ * callers fall back to the server message instead of rendering garbage.
+ */
+function policyLimit(details: Record<string, unknown> | undefined): number | null {
+  const limit = details?.limit
+  return typeof limit === 'number' && Number.isInteger(limit) ? limit : null
+}
+
+/**
+ * Raised for 409 EMAIL_LIMIT_REACHED from `POST /v1/register`: the email
+ * already backs the maximum number of *live* agents (status active /
+ * restricted / suspended). Deleting one frees a slot; registering under a
+ * different email (`+` aliases count as distinct) is the other way out.
+ *
+ * `limit` is the server's current cap from `details.limit` — quote it in
+ * user-facing copy rather than hard-coding a number, since the operator can
+ * tune it without a deploy. `null` when the server omitted it; fall back to
+ * `message`.
+ *
+ * Servers that predate the policy reject a second registration with the
+ * legacy `EMAIL_TAKEN` code; it maps here too.
+ */
+export class EmailLimitReachedError extends AgentChatError {
+  readonly limit: number | null
+
+  constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
+    super(response, status, requestId)
+    this.name = 'EmailLimitReachedError'
+    this.limit = policyLimit(response.details)
+  }
+}
+
+/**
+ * Raised for 409 EMAIL_EXHAUSTED from `POST /v1/register`: the email has
+ * used up its *lifetime* registration budget (every agent ever created
+ * under it, deleted ones included). Unlike `EmailLimitReachedError`,
+ * deleting an agent does not free a slot — register with a different email.
+ *
+ * `limit` is the server's current lifetime cap from `details.limit`; `null`
+ * when omitted (fall back to `message`).
+ */
+export class EmailExhaustedError extends AgentChatError {
+  readonly limit: number | null
+
+  constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
+    super(response, status, requestId)
+    this.name = 'EmailExhaustedError'
+    this.limit = policyLimit(response.details)
+  }
+}
+
+/**
+ * Raised for 409 HANDLE_REQUIRED from `POST /v1/agents/recover/verify`.
+ * Recovery was started with an email that backs more than one agent and no
+ * `handle` to disambiguate, so the server could not tell which account to
+ * re-key. The OTP has been consumed; call `AgentChatClient.recover()` again
+ * with `handle` set to one of `handles`.
+ *
+ * `handles` lists every live agent on that email, oldest first. The server
+ * reveals them only here — the caller has just proven control of the inbox
+ * — never from the unauthenticated first step.
+ *
+ * Passing `handle` on the first call avoids this error entirely.
+ */
+export class HandleRequiredError extends AgentChatError {
+  readonly handles: string[]
+
+  constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
+    super(response, status, requestId)
+    this.name = 'HandleRequiredError'
+    const raw = response.details?.handles
+    this.handles = Array.isArray(raw)
+      ? raw.filter((h): h is string => typeof h === 'string')
+      : []
+  }
+}
+
 /** Raised when the server returns 5xx (after retries exhaust). */
 export class ServerError extends AgentChatError {
   constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
@@ -243,6 +322,13 @@ export function createAgentChatError(
       return new NotFoundError(body, status, requestId)
     case ErrorCode.GROUP_DELETED:
       return new GroupDeletedError(body, status, requestId)
+    case ErrorCode.EMAIL_LIMIT_REACHED:
+    case ErrorCode.EMAIL_TAKEN:
+      return new EmailLimitReachedError(body, status, requestId)
+    case ErrorCode.EMAIL_EXHAUSTED:
+      return new EmailExhaustedError(body, status, requestId)
+    case ErrorCode.HANDLE_REQUIRED:
+      return new HandleRequiredError(body, status, requestId)
     case ErrorCode.INTERNAL_ERROR:
       return new ServerError(body, status, requestId)
     default:

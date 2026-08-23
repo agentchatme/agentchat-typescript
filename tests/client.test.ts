@@ -1,5 +1,10 @@
-import { describe, it, expect, vi } from 'vitest'
-import { AgentChatClient } from '../src/client.js'
+import { afterEach, describe, it, expect, vi } from 'vitest'
+import { AgentChatClient, type RecoverResult } from '../src/client.js'
+import {
+  EmailExhaustedError,
+  EmailLimitReachedError,
+  HandleRequiredError,
+} from '../src/errors.js'
 
 function scriptedFetch(
   responses: Array<
@@ -543,5 +548,133 @@ describe('AgentChatClient.getAttachmentDownloadUrl', () => {
     await expect(client.getAttachmentDownloadUrl('att_broken')).rejects.toThrow(
       /did not return a redirect Location/,
     )
+  })
+})
+
+// ─── Static, unauthenticated endpoints ────────────────────────────────────
+//
+// `register()` / `recover()` / `recoverVerify()` build their own transport
+// (no client instance to inject `fetch` into), so these stub the global.
+
+/** Stub `globalThis.fetch`, recording the parsed JSON body of each POST. */
+function stubGlobalFetch(response: Response): { bodies: Array<Record<string, unknown>> } {
+  const bodies: Array<Record<string, unknown>> = []
+  vi.stubGlobal(
+    'fetch',
+    vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      bodies.push(JSON.parse(init!.body as string))
+      return response
+    }),
+  )
+  return { bodies }
+}
+
+describe('AgentChatClient.register (email policy)', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('throws EmailLimitReachedError carrying details.limit on 409 EMAIL_LIMIT_REACHED', async () => {
+    stubGlobalFetch(
+      json(409, {
+        code: 'EMAIL_LIMIT_REACHED',
+        message: 'This email already backs 10 active agents.',
+        details: { limit: 10 },
+      }),
+    )
+    const err = await AgentChatClient.register({
+      email: 'you@example.com',
+      handle: 'my-agent',
+      baseUrl: 'https://api.test',
+    }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(EmailLimitReachedError)
+    expect((err as EmailLimitReachedError).status).toBe(409)
+    expect((err as EmailLimitReachedError).limit).toBe(10)
+  })
+
+  it('throws EmailExhaustedError carrying details.limit on 409 EMAIL_EXHAUSTED', async () => {
+    stubGlobalFetch(
+      json(409, {
+        code: 'EMAIL_EXHAUSTED',
+        message: 'This email has reached the maximum of 30 account registrations.',
+        details: { limit: 30 },
+      }),
+    )
+    const err = await AgentChatClient.register({
+      email: 'you@example.com',
+      handle: 'my-agent',
+      baseUrl: 'https://api.test',
+    }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(EmailExhaustedError)
+    expect((err as EmailExhaustedError).limit).toBe(30)
+  })
+})
+
+describe('AgentChatClient.recover', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  const pending = { pending_id: 'pnd_1', message: 'If an account exists, a code was sent.' }
+
+  it('POSTs handle alongside email to /v1/agents/recover', async () => {
+    const { bodies } = stubGlobalFetch(json(200, pending))
+    const result: RecoverResult = await AgentChatClient.recover('you@example.com', {
+      handle: 'my-agent',
+      baseUrl: 'https://api.test',
+    })
+    expect(bodies).toEqual([{ email: 'you@example.com', handle: 'my-agent' }])
+    expect(result).toEqual(pending)
+    // `pending_id` is typed as always present — the server masks misses
+    // behind the same shape rather than dropping the field.
+    const id: string = result.pending_id
+    expect(id).toBe('pnd_1')
+  })
+
+  it('omits the handle key entirely for a legacy email-only call', async () => {
+    // Must be absent, not `null`: the server schema is optional, not nullable.
+    const { bodies } = stubGlobalFetch(json(200, pending))
+    await AgentChatClient.recover('you@example.com', { baseUrl: 'https://api.test' })
+    expect(bodies).toEqual([{ email: 'you@example.com' }])
+    expect(Object.keys(bodies[0]!)).toEqual(['email'])
+  })
+
+  it('hits the right URL with no options at all', async () => {
+    const fetchMock = vi.fn(async () => json(200, pending))
+    vi.stubGlobal('fetch', fetchMock)
+    await AgentChatClient.recover('you@example.com')
+    const [url, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit]
+    expect(String(url)).toBe('https://api.agentchat.me/v1/agents/recover')
+    expect(init.method).toBe('POST')
+    expect(JSON.parse(init.body as string)).toEqual({ email: 'you@example.com' })
+  })
+})
+
+describe('AgentChatClient.recoverVerify', () => {
+  afterEach(() => vi.unstubAllGlobals())
+
+  it('throws HandleRequiredError listing the sibling handles on 409 HANDLE_REQUIRED', async () => {
+    stubGlobalFetch(
+      json(409, {
+        code: 'HANDLE_REQUIRED',
+        message: 'This email backs more than one agent.',
+        details: { handles: ['alpha-bot', 'beta-bot'] },
+      }),
+    )
+    const err = await AgentChatClient.recoverVerify('pnd_1', '123456', {
+      baseUrl: 'https://api.test',
+    }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(HandleRequiredError)
+    expect((err as HandleRequiredError).status).toBe(409)
+    expect((err as HandleRequiredError).handles).toEqual(['alpha-bot', 'beta-bot'])
+  })
+
+  it('returns handle, apiKey, and a bound client on success', async () => {
+    const { bodies } = stubGlobalFetch(
+      json(200, { handle: 'my-agent', api_key: 'ac_new', message: 'ok' }),
+    )
+    const result = await AgentChatClient.recoverVerify('pnd_1', '123456', {
+      baseUrl: 'https://api.test',
+    })
+    expect(bodies).toEqual([{ pending_id: 'pnd_1', code: '123456' }])
+    expect(result.handle).toBe('my-agent')
+    expect(result.apiKey).toBe('ac_new')
+    expect(result.client).toBeInstanceOf(AgentChatClient)
   })
 })

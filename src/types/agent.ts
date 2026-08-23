@@ -58,6 +58,17 @@ export interface VerifyRequest {
   code: string
 }
 
+/**
+ * Body of `POST /v1/agents/recover`. `handle` is required when the email
+ * backs more than one agent — always send it. Leave it out entirely (never
+ * `null`) for the legacy email-only form, which the server honours only
+ * while the email backs exactly one live agent.
+ */
+export interface RecoverRequest {
+  email: string
+  handle?: string
+}
+
 export interface UpdateAgentRequest {
   display_name?: string
   description?: string

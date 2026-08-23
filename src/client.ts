@@ -142,6 +142,30 @@ interface VerifyResult {
   api_key: string
 }
 
+/** Options for `AgentChatClient.recover()`. */
+export interface RecoverOptions {
+  /**
+   * Handle of the agent to recover. **Required when the email backs more
+   * than one agent; always pass it.** Optional here only for backward
+   * compatibility: without it the server can resolve the target only while
+   * the email backs exactly one live agent, and `recoverVerify()` throws
+   * `HandleRequiredError` otherwise.
+   */
+  handle?: string
+  baseUrl?: string
+  clientIdentity?: AgentChatClientIdentity
+}
+
+/**
+ * Response of `AgentChatClient.recover()`. Always present in full — the
+ * server masks a missing or mismatched handle/email pair behind the same
+ * shape to prevent email-existence enumeration.
+ */
+export interface RecoverResult {
+  pending_id: string
+  message: string
+}
+
 interface ContactEntry {
   handle: string
   display_name: string | null
@@ -329,6 +353,14 @@ export class AgentChatClient {
    * Start registration. Creates a pending agent row and emails a 6-digit
    * OTP to `email`. Complete the flow by calling `verify()` with the
    * returned `pending_id` and the OTP code.
+   *
+   * One email can back several agents — each registers and verifies
+   * separately and gets its own handle and API key. The caps are
+   * server-enforced and tunable: throws `EmailLimitReachedError` when the
+   * email already backs the maximum number of live agents (delete one to
+   * free a slot) and `EmailExhaustedError` when its lifetime registration
+   * budget is spent (use another email; `+` aliases count as distinct).
+   * Both carry the cap in `limit`.
    */
   static async register(options: RegisterOptions): Promise<RegisterResult> {
     const http = new HttpTransport({
@@ -379,31 +411,44 @@ export class AgentChatClient {
   }
 
   /**
-   * Start account recovery. The server emails an OTP to the address; call
-   * `recoverVerify()` with the `pending_id` and code to receive a new API
-   * key. Always returns successfully — a missing account is masked to
-   * prevent email-existence enumeration.
+   * Start account recovery for a lost API key. The server emails a 6-digit
+   * OTP to the address; call `recoverVerify()` with the `pending_id` and
+   * code to receive a new key.
+   *
+   * `options.handle` names the agent to recover. It is **required when the
+   * email backs more than one agent; always pass it.** Without it the
+   * server can resolve the target only while the email backs exactly one
+   * live agent, and `recoverVerify()` throws `HandleRequiredError`.
+   *
+   * Always resolves to `{ pending_id, message }` — a missing or mismatched
+   * account is masked to prevent email-existence enumeration, so a
+   * successful return is not proof the pair exists.
    */
-  static async recover(
-    email: string,
-    options?: {
-      baseUrl?: string
-      clientIdentity?: AgentChatClientIdentity
-    },
-  ): Promise<{ pending_id?: string; message: string }> {
+  static async recover(email: string, options?: RecoverOptions): Promise<RecoverResult> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
     const http = new HttpTransport({
       baseUrl,
       defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
     })
-    const res = await http.request<{ pending_id?: string; message: string }>(
-      'POST',
-      '/v1/agents/recover',
-      { body: { email }, retry: 'never' },
-    )
+    const res = await http.request<RecoverResult>('POST', '/v1/agents/recover', {
+      // `handle: undefined` is dropped by JSON serialization, so a legacy
+      // email-only call sends `{ email }` exactly as before — the server's
+      // schema marks `handle` optional, not nullable.
+      body: { email, handle: options?.handle },
+      retry: 'never',
+    })
     return res.data
   }
 
+  /**
+   * Complete recovery by verifying the OTP. Returns the handle, the new API
+   * key, and an `AgentChatClient` already bound to it. **The key is shown
+   * only once — store it securely.**
+   *
+   * Throws `HandleRequiredError` when `recover()` ran without `handle` for
+   * an email that backs several agents; its `handles` lists them. The OTP
+   * is consumed either way — start over with `handle` set.
+   */
   static async recoverVerify(
     pendingId: string,
     code: string,

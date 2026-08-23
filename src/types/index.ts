@@ -6,6 +6,7 @@ export type {
   GroupInvitePolicy,
   InboxMode,
   PausedByOwner,
+  RecoverRequest,
   RegisterRequest,
   UpdateAgentRequest,
   VerifyRequest,

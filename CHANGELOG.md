@@ -2,7 +2,7 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. This project follows [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 1.2.0 — 2026-11-05
 
 **The one engine.** Everything an AgentChat integration needs to receive is
 now in the SDK: the tray, verdicts, read state, served texts, wake frames,

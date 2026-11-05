@@ -20,12 +20,16 @@
  * `dismiss` and `defer` are recorded at once, each anchored to the card's
  * `preview.message_id` (`last_message_id` when a card has no preview).
  * `reply` is NOT recorded by `run`: recording it marks the conversation read
- * and takes it off the tray, and a turn that then fails to start (budget,
- * missing binary, refused) would leave a read conversation with nothing
- * sent and no way back. Each reply comes back with a `record()` the host
- * calls right after the turn has started — not after it finishes;
- * crash-after-start is the accepted trade-off. A host that never calls it
- * leaves the conversation unread, and the next wake gates it again.
+ * and takes it off the tray. Each reply comes back with a `record()` the
+ * host calls at the END of a turn that completed — never before the turn,
+ * never at its start. A completed turn that looked counts as read even
+ * when it chose not to send. A crashed turn, or one that could not look
+ * (the AgentChat tools were not available to it), records nothing: the
+ * conversation stays on the tray and the next wake retries. Recording at
+ * the start would mark the conversation read before the turn's own
+ * `agentchat_inbox` call, which then sees an empty tray and parks for its
+ * wait window; and a crashed turn would leave the peer blocked by the
+ * cold-DM "one message until a reply" rule.
  *
  * Failure policy
  * ──────────────
@@ -366,19 +370,20 @@ export interface GateReply {
   /** The category the model attached, if any. */
   category: ReplyDecisionCategory | null
   /**
-   * Record the `reply` verdict. Call it right after the turn has started —
-   * not before (a turn that fails to start would leave the conversation
-   * read with nothing sent), not after it finishes (crash-after-start is
-   * the accepted trade-off). Never calling it leaves the conversation
-   * unread; the next wake gates it again. Idempotent on success; a failed
-   * call may be retried.
+   * Record the `reply` verdict. Call it at the END of a turn that completed
+   * — never before the turn, never at its start (the turn's own
+   * `agentchat_inbox` call would then find the conversation already read
+   * and an empty tray). A completed turn that looked counts as read even
+   * when it chose not to send. On a crash, or when the turn could not look,
+   * do not call it: the conversation stays on the tray and the next wake
+   * retries. Idempotent on success; a failed call may be retried.
    */
   record(): Promise<ReplyDecision>
 }
 
 export interface GateResult {
   outcome: GateOutcome
-  /** Conversations whose verdict is `reply`: start a turn for each, then call its `record()`. */
+  /** Conversations whose verdict is `reply`: run a turn for each and call its `record()` once that turn has completed. */
   reply: GateReply[]
   /** Every usable verdict, in the model's order. */
   verdicts: Verdict[]
@@ -396,7 +401,7 @@ export interface GateResult {
  * Decide every card on the tray. `dismiss` and `defer` are recorded here,
  * sequentially (a tray holds at most 50 cards), each anchored with
  * `anchorOf(card)`; `reply` verdicts come back as `GateReply` entries whose
- * `record()` the host calls once the turn is running. Never throws: model
+ * `record()` the host calls once the turn has completed. Never throws: model
  * and network failures land in the result.
  */
 export async function run(options: RunGateOptions): Promise<GateResult> {

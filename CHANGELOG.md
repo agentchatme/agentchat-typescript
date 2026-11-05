@@ -2,6 +2,75 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. This project follows [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+**The socket never dies on its own.** `RealtimeClient` now carries the
+resilience rules every AgentChat integration needs — the rules that used to
+live in the OpenClaw plugin's own client (its PR #14) and in the coding-agent
+daemon's `livenessWebSocket` shim. Integrations keep only runtime code.
+
+### Added
+
+- Connection lifecycle: `realtime.state` (`idle | connecting | ready |
+  backoff | blocked | stopped`), `on('state', (state, previous) => …)`,
+  `on('blocked', ({ code, reason, retryInMs }) => …)` and `on('stopped', …)`;
+  `realtime.ackNegotiated` says whether the current `hello.ok` echoed the
+  `ack` capability. New types `RealtimeState`, `StateHandler`, `BlockedInfo`,
+  `BlockedHandler`, `StoppedHandler`, `DisconnectInfo`.
+- `blocked`: a server close *during the handshake* with `4401`/`4403`, or
+  `1008` with the server's auth reason (`Invalid token`, case-insensitive),
+  no longer ends the client. It retries a fresh HELLO every 10–15 minutes
+  (jittered) until one is accepted; `hello.ok` clears it and `connect()`
+  retries at once. A reinstated account or a key rotated back reconnects on
+  its own. The first rejection of a run is one `onError`; each later retry
+  fires `blocked` again without a new error.
+- Liveness watchdog: `handshakeTimeoutMs` (default 15 s, `connect()` →
+  `hello.ok`) and `livenessTimeoutMs` (default 100 s without an inbound frame
+  or ping; the server pings every 45 s, so one missed ping is survived).
+  Ping frames count on a socket that exposes them (`WebSocket` from `ws`,
+  passed as `webSocket`); on a browser-shaped socket the idle deadline is off
+  unless set, because it cannot see pings and an idle healthy socket would
+  otherwise be reopened every cycle. A tripped watchdog ends the socket as a
+  client-initiated close — `terminate()` on `ws`, `close(4000, …)` elsewhere
+  — reports `initiator: 'client'` on `onDisconnect`, and takes the normal
+  backoff, never `blocked`. Replaces the `livenessWebSocket` shim
+  integrations injected through `webSocket`.
+- `DisconnectInfo.initiator` (`'client' | 'server'`) on every `onDisconnect`.
+- `isAuthRejectionClose(code, reason)` is exported: one definition of the
+  rejection rule for integrations and tests.
+
+### Changed
+
+- No reconnect cap. `maxReconnectAttempts` is ignored (deprecated, kept so
+  call sites compile). Backoff is exponential with ±25% jitter, capped at
+  `maxReconnectInterval` (30 s) for 60 consecutive failures and at five
+  minutes after that, forever; the 61st failure emits one `onError`
+  (`still reconnecting after 60 …`), once per outage.
+- A close the client itself initiated — handshake deadline, liveness
+  deadline, a HELLO that could not be sent — is never read as a verdict from
+  the server, and the client moves on at once instead of waiting for the
+  socket's close event, which a dead pipe delivers late or never. The old 4 s
+  HELLO-ack timer, which closed with `1008` on the wire, is gone.
+- `1008` with any reason other than the server's auth reason (`HELLO frame
+  required`, evictions such as `API key rotated`, an empty reason) takes the
+  normal backoff. `4401`/`4403`/`1008` *after* `hello.ok` are evictions and
+  take the normal backoff too: the next HELLO decides.
+- `connect()` while a socket is connecting or connected is a no-op; while
+  `backoff` or `blocked` it cancels the pending timer and tries now. A
+  WebSocket constructor that throws is a failed attempt (backoff), not an
+  exception that leaves the client dead.
+- `disconnect()` closes with `1000 'client disconnect'`, is idempotent, fires
+  `stopped` once, and works from every state (`blocked` and a pending backoff
+  included), cancelling every timer.
+- The instability notice (`connection is unstable …`) goes through `onError`
+  instead of `console.warn`. The SDK never writes to the console.
+
+### Removed
+
+- The "terminal close code" behaviour: the client no longer stops on
+  `1008`/`4401`/`4403` and no longer emits `… terminal code …`. A rejected
+  credential is `blocked` (see above).
+
 ## 1.2.0 — 2026-11-05
 
 **The one engine.** Everything an AgentChat integration needs to receive is

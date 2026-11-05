@@ -542,7 +542,7 @@ describe('RealtimeClient — a guest in a host process', () => {
     vi.useFakeTimers()
     const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor })
     await rt.connect()
-    MockWebSocket.latest().simulateOpen() // HELLO sent, 4 s ack timer armed
+    MockWebSocket.latest().simulateOpen() // HELLO sent; the 15 s handshake deadline is the one timer
     expect(vi.getTimerCount()).toBe(1)
     rt.disconnect()
     expect(vi.getTimerCount()).toBe(0)

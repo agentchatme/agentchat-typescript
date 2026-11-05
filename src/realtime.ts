@@ -28,8 +28,52 @@ export type ErrorHandler = (error: Error) => void
  */
 export type ConnectHandler = () => void
 
+/** Close information handed to `onDisconnect` on every socket close. */
+export interface DisconnectInfo {
+  code: number
+  reason: string
+  wasClean: boolean
+  /**
+   * Who ended the socket. `'client'` is this client's own watchdog (the
+   * handshake or liveness deadline): such a close says nothing about the
+   * server and always takes the normal reconnect backoff. `'server'` is a
+   * close that arrived on the wire — the server, a proxy, or the network.
+   */
+  initiator: 'client' | 'server'
+}
+
 /** Fired on every socket close, regardless of reason. */
-export type DisconnectHandler = (info: { code: number; reason: string; wasClean: boolean }) => void
+export type DisconnectHandler = (info: DisconnectInfo) => void
+
+/**
+ * Connection lifecycle. `stopped` is the only terminal state and only
+ * `disconnect()` reaches it; every other state leads back to `connecting`
+ * on its own.
+ *
+ * - `idle` — no socket and nothing scheduled: before the first `connect()`,
+ *   or after a close with `reconnect: false`.
+ * - `connecting` — a socket is opening, or its HELLO awaits `hello.ok`.
+ * - `ready` — `hello.ok` received; frames flow.
+ * - `backoff` — the socket closed; the next attempt is scheduled with
+ *   exponential backoff.
+ * - `blocked` — the server rejected the credential during the handshake; a
+ *   fresh attempt is scheduled every 10–15 minutes until one is accepted.
+ * - `stopped` — `disconnect()` was called.
+ */
+export type RealtimeState = 'idle' | 'connecting' | 'ready' | 'backoff' | 'blocked' | 'stopped'
+export type StateHandler = (state: RealtimeState, previous: RealtimeState) => void
+
+/** Why the client is `blocked`, and when it will try again. */
+export interface BlockedInfo {
+  /** Close code the server rejected the handshake with: 4401, 4403 or 1008. */
+  code: number
+  /** The server's close reason, e.g. `Invalid token`. */
+  reason: string
+  /** Milliseconds until the next automatic attempt; `null` when `reconnect` is off. */
+  retryInMs: number | null
+}
+export type BlockedHandler = (info: BlockedInfo) => void
+export type StoppedHandler = () => void
 
 export interface SequenceGapInfo {
   conversationId: string
@@ -67,17 +111,30 @@ export interface RealtimeOptions {
    * for direct SDK use (`typescript_sdk/<SDK version>`).
    */
   clientIdentity?: AgentChatClientIdentity
-  /** Auto-reconnect on unexpected close. Default: `true`. */
+  /**
+   * Reconnect after every close that is not `disconnect()`. Default: `true`.
+   * With `false` the client goes `idle` after a close and waits for the next
+   * `connect()`; it never reconnects or retries on its own.
+   */
   reconnect?: boolean
   /**
-   * Initial reconnect delay in milliseconds. Subsequent reconnects use
-   * exponential backoff with ±25% jitter, capped at
-   * `maxReconnectInterval`. Default: 500ms.
+   * Initial reconnect delay in milliseconds. Each consecutive failure
+   * doubles it, jittered up to 25% below the step, up to
+   * `maxReconnectInterval` (a true ceiling). Default: 500ms.
    */
   reconnectInterval?: number
-  /** Maximum delay between reconnect attempts. Default: 30s. */
+  /**
+   * Cap on the delay between reconnect attempts for the first 60 consecutive
+   * failures. Default: 30s. After 60 consecutive failures the cap widens to
+   * five minutes (or this value, if larger), one error is emitted through
+   * `onError`, and the client keeps trying forever. There is no attempt
+   * limit: only `disconnect()` ends the client.
+   */
   maxReconnectInterval?: number
-  /** Maximum total reconnect attempts before giving up. Default: Infinity. */
+  /**
+   * @deprecated Ignored — the client never gives up on its own; only
+   * `disconnect()` ends it. Kept so existing call sites compile.
+   */
   maxReconnectAttempts?: number
   /**
    * Optional client used for in-order recovery AND for the post-reconnect
@@ -146,13 +203,121 @@ export interface RealtimeOptions {
    * can supply their own implementation — anything that matches the
    * browser WebSocket shape (`onopen/onmessage/onclose/onerror`, `send`,
    * `close`, `readyState`) works.
+   *
+   * On Node the default resolution prefers `WebSocket` from the `ws`
+   * package when it is installed and falls back to the native socket only
+   * without it: `ws` exposes the server's ping frames (`on('ping')`), which
+   * lets the liveness watchdog tell a quiet-but-healthy socket from a dead
+   * one. The browser-shaped socket (including Node's native one) cannot see
+   * pings — see `livenessTimeoutMs`. Pass a constructor only to override.
    */
   webSocket?: typeof globalThis.WebSocket
+  /**
+   * Handshake deadline: milliseconds from `connect()` to `hello.ok`. A
+   * half-open upgrade or a server that never answers HELLO is closed by the
+   * client at this point and reconnected with the normal backoff. The
+   * server's own HELLO timer is 5 s, so this is the safety net for a dead
+   * pipe, not the common path. Default: 15 000.
+   */
+  handshakeTimeoutMs?: number
+  /**
+   * Idle deadline: milliseconds without any inbound frame — or, on a socket
+   * that exposes them, a ping — before the connection is presumed dead,
+   * closed by the client and reconnected. The server pings every 45 s, so
+   * the default (100 000) survives one missed ping and trips on the second.
+   *
+   * Ping frames are visible only on a socket with `on('ping')` (Node `ws`).
+   * A browser-shaped socket cannot see them, so there the idle deadline is
+   * OFF unless set explicitly: only application frames would keep it alive,
+   * and an idle but healthy connection would otherwise be reopened every
+   * cycle. `0` disables it on any socket; the handshake deadline stays.
+   */
+  livenessTimeoutMs?: number
 }
 
-// Time to wait for `hello.ok` after sending the HELLO frame before we give
-// up and reconnect. Must stay under the server-side HELLO_TIMEOUT_MS (5s).
-const HELLO_ACK_TIMEOUT_MS = 4_000
+/** Handshake deadline, `connect()` → `hello.ok`. See `handshakeTimeoutMs`. */
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000
+
+/** Idle deadline on ping-capable sockets: two server ping cycles (45 s) plus slack. */
+const DEFAULT_LIVENESS_TIMEOUT_MS = 100_000
+
+/**
+ * Close code this client uses when its own watchdog ends a socket. In the
+ * private-use range so a browser socket accepts it (browsers allow only 1000
+ * and 3000–4999 from `close()`). On a Node `ws` socket the watchdog
+ * terminates instead, which sends no close frame at all — a dead pipe would
+ * otherwise hold a polite close open for up to 30 s waiting for a reply.
+ */
+const CLIENT_CLOSE_CODE = 4000
+
+/**
+ * After this many consecutive failures the outage is long: one error is
+ * emitted for the operator and the backoff cap widens to
+ * LONG_OUTAGE_MAX_INTERVAL_MS. Retrying continues until the server is back —
+ * a deploy, a DNS outage or a laptop closed overnight is not a reason to
+ * stay dead afterwards.
+ */
+const LONG_OUTAGE_AFTER_ATTEMPTS = 60
+const LONG_OUTAGE_MAX_INTERVAL_MS = 5 * 60_000
+
+/**
+ * Reconnect delays are jittered up to 25% BELOW each step: a fleet that
+ * drops together spreads back out, and the documented caps stay true
+ * ceilings (30 s, then 5 min — never 37.5 s or 6.25 min).
+ */
+const RECONNECT_JITTER_RATIO = 0.25
+
+/**
+ * After the server rejects the credential, retry a fresh HELLO at this
+ * cadence (±20% jitter → 10–15 min). A rejected key is not a dead end: keys
+ * get rotated back, suspended accounts get reinstated, and a server-side
+ * lookup failure during HELLO presents as a reject too.
+ */
+const AUTH_RETRY_INTERVAL_MS = 750_000
+const AUTH_RETRY_JITTER_RATIO = 0.2
+
+// Close codes that mean "the server rejected this credential" when the
+// SERVER sends them during the handshake. 4401/4403 are unambiguous. 1008
+// (policy violation) is not: the server closes a rejected HELLO with
+// 1008 'Invalid token', but also uses 1008 for a handshake that was merely
+// too slow ('HELLO frame required', from its own 5 s timer), and a database
+// failure during auth ends as that same timer close. So 1008 counts as a
+// rejection only with the server's auth reason; any other 1008 takes the
+// normal backoff. A close this client initiated never counts, whatever code
+// it carries. These codes after `hello.ok` (the server evicts a rotated key
+// or a suspended account with 1008 and its own reasons) are an eviction, not
+// a verdict: the next HELLO is the evidence, so they take the normal path.
+const UNAMBIGUOUS_AUTH_CLOSE_CODES: ReadonlySet<number> = new Set([4401, 4403])
+const AMBIGUOUS_AUTH_CLOSE_CODE = 1008
+const SERVER_AUTH_CLOSE_REASONS: readonly string[] = ['invalid token']
+
+/**
+ * True iff a server-originated close with this code and reason, received
+ * before `hello.ok`, means the credential was rejected. Pure; exported so
+ * integrations and tests share one definition.
+ */
+export function isAuthRejectionClose(code: number, reason: string): boolean {
+  if (UNAMBIGUOUS_AUTH_CLOSE_CODES.has(code)) return true
+  if (code !== AMBIGUOUS_AUTH_CLOSE_CODE) return false
+  if (typeof reason !== 'string') return false
+  const lower = reason.toLowerCase()
+  return SERVER_AUTH_CLOSE_REASONS.some((known) => lower.includes(known))
+}
+
+// A Node `ws` socket is an EventEmitter and surfaces ping/pong frames; the
+// browser shape has neither `on` nor the frames.
+type PingCapableSocket = WebSocket & {
+  on(event: 'ping' | 'pong', listener: () => void): unknown
+}
+function isPingCapable(ws: WebSocket): ws is PingCapableSocket {
+  return typeof (ws as { on?: unknown }).on === 'function'
+}
+
+// Never hold a Node process open for a watchdog or a counter reset; the
+// socket itself (or a pending reconnect) is what keeps a daemon alive.
+function unref(timer: ReturnType<typeof setTimeout>): void {
+  ;(timer as { unref?: () => void }).unref?.()
+}
 
 /**
  * How long a connection must SURVIVE before we call it healthy and clear
@@ -167,9 +332,9 @@ const HELLO_ACK_TIMEOUT_MS = 4_000
  * connections in four hours from one agent, delivering zero messages,
  * while sibling agents on the same host held single connections.
  *
- * 30s is comfortably longer than any handshake-adjacent failure (the HELLO
- * ack budget is 4s, the server heartbeat cycle 45s) and short enough that
- * a healthy client clears its counter well before a second blip.
+ * 30s is comfortably longer than any handshake-adjacent failure (the
+ * handshake deadline is 15s, the server heartbeat cycle 45s) and short
+ * enough that a healthy client clears its counter well before a second blip.
  */
 const STABLE_CONNECTION_MS = 30_000
 
@@ -215,16 +380,6 @@ const SYNC_DRAIN_PAGE_SIZE = 200
 // Default capacity of the message-id dedup cache. See
 // RealtimeOptions.dedupCacheSize.
 const DEFAULT_DEDUP_CACHE_SIZE = 2048
-
-// Close codes that mean "the server rejected this session and retrying with
-// the same credentials cannot succeed": 1008 (policy violation — the server
-// closes invalid/expired API keys with it) and 4401/4403 (explicit
-// auth-rejected codes). Reconnecting on these would hammer the server with
-// doomed handshakes forever, so they are terminal: the client surfaces a
-// final error through onError and stops. The one exception is our own
-// HELLO-ack-timeout close, which reuses 1008 on the wire but is transient —
-// see the `helloTimeoutClose` flag.
-const TERMINAL_CLOSE_CODES = new Set([1008, 4401, 4403])
 
 // Minimal structural validation of one sync row, mirroring the reference
 // wire schema (docs/realtime-delivery-ack.md): id / conversation_id /
@@ -303,7 +458,9 @@ export class RealtimeClient {
     reconnect: boolean
     reconnectInterval: number
     maxReconnectInterval: number
-    maxReconnectAttempts: number
+    handshakeTimeoutMs: number
+    /** `null` = decide per socket: on with ping frames, off without. */
+    livenessTimeoutMs: number | null
     client?: AgentChatClient
     onSequenceGap?: SequenceGapHandler
     autoDrainOnConnect: boolean
@@ -316,6 +473,11 @@ export class RealtimeClient {
   private errorHandlers = new Set<ErrorHandler>()
   private connectHandlers = new Set<ConnectHandler>()
   private disconnectHandlers = new Set<DisconnectHandler>()
+  private stateHandlers = new Set<StateHandler>()
+  private blockedHandlers = new Set<BlockedHandler>()
+  private stoppedHandlers = new Set<StoppedHandler>()
+  private _state: RealtimeState = 'idle'
+  /** Consecutive failed attempts; drives the backoff. Cleared by the stability timer only. */
   private reconnectAttempts = 0
   /** Clears reconnectAttempts once this connection proves itself stable. */
   private stabilityTimer: ReturnType<typeof setTimeout> | null = null
@@ -323,16 +485,23 @@ export class RealtimeClient {
    *  the operator warning only; backoff itself uses reconnectAttempts. */
   private rapidReconnects = 0
   private lastConnectAt: number | null = null
+  /** The pending backoff or blocked-retry timer — at most one at a time. */
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
-  private helloAckTimer: ReturnType<typeof setTimeout> | null = null
+  /** Handshake deadline: armed by connect(), cleared by hello.ok or close. */
+  private handshakeTimer: ReturnType<typeof setTimeout> | null = null
+  /** Idle deadline: armed by hello.ok; inbound frames and pings refresh it. */
+  private livenessTimer: ReturnType<typeof setTimeout> | null = null
+  /** Idle deadline in effect for the current socket; 0 = off. */
+  private livenessMs = 0
+  private lastInboundAt = 0
   private authenticated = false
   // True only when the server echoed the 'ack' capability in hello.ok.
   // Per-connection: reset on every close and re-negotiated on every HELLO.
   private ackMode = false
-  // Set immediately before our own close(1008, 'HELLO ack timeout') so the
-  // onclose handler can tell this transient self-close apart from a
-  // server-initiated 1008 (which is terminal — invalid credentials).
-  private helloTimeoutClose = false
+  /** One error per long outage, then silent until a stable connection. */
+  private longOutageAnnounced = false
+  /** One error per run of rejected handshakes, then silent until hello.ok. */
+  private blockedAnnounced = false
   // Bounded LRU of recently-dispatched message ids (Set iteration order is
   // insertion order — delete + re-add refreshes recency). Ids are added
   // only AFTER a successful dispatch: adding earlier would let a failed
@@ -363,12 +532,25 @@ export class RealtimeClient {
       options.dedupCacheSize >= 1
         ? Math.floor(options.dedupCacheSize)
         : DEFAULT_DEDUP_CACHE_SIZE
+    const handshakeTimeoutMs =
+      typeof options.handshakeTimeoutMs === 'number' &&
+      Number.isFinite(options.handshakeTimeoutMs) &&
+      options.handshakeTimeoutMs > 0
+        ? options.handshakeTimeoutMs
+        : DEFAULT_HANDSHAKE_TIMEOUT_MS
+    const livenessTimeoutMs =
+      typeof options.livenessTimeoutMs === 'number' &&
+      Number.isFinite(options.livenessTimeoutMs) &&
+      options.livenessTimeoutMs >= 0
+        ? options.livenessTimeoutMs
+        : null
     this.options = {
       baseUrl: options.baseUrl ?? 'wss://api.agentchat.me',
       reconnect: options.reconnect ?? true,
       reconnectInterval: options.reconnectInterval ?? 500,
       maxReconnectInterval: options.maxReconnectInterval ?? 30_000,
-      maxReconnectAttempts: options.maxReconnectAttempts ?? Number.POSITIVE_INFINITY,
+      handshakeTimeoutMs,
+      livenessTimeoutMs,
       apiKey: options.apiKey,
       client: options.client,
       onSequenceGap: options.onSequenceGap,
@@ -382,43 +564,78 @@ export class RealtimeClient {
 
   /**
    * Open the WebSocket connection and perform the HELLO handshake.
-   * Resolves once the socket is open and the HELLO frame has been sent —
-   * NOT after `hello.ok`. Listen for `onConnect()` to react to a
-   * completed handshake.
+   * Resolves once the socket has been constructed and its handlers bound —
+   * NOT after `hello.ok`. Listen for `onConnect()` or `on('state')` to react
+   * to a completed handshake.
    *
-   * Safe to call on a disposed client only if you expect a fresh run —
-   * reinstate with a new instance instead.
+   * Also the way to retry at once: called while `backoff` or `blocked`, it
+   * cancels the pending timer and opens a socket now. A no-op while a socket
+   * is already connecting or connected. Throws after `disconnect()` — create
+   * a fresh `RealtimeClient` instead. Rejects, without retrying, when no
+   * WebSocket implementation exists (neither `ws` nor a native one): that is
+   * a configuration error and the client stays `idle`.
    */
   async connect(): Promise<void> {
     if (this.disposed) {
       throw new ConnectionError('RealtimeClient has been disposed; create a new instance to reconnect.')
     }
+    if (this.ws) return
+    this.clearReconnectTimer()
 
     let WebSocketCtor: typeof globalThis.WebSocket
     try {
       WebSocketCtor = this.options.webSocket ?? (await resolveWebSocket())
     } catch (err) {
-      const error = err instanceof Error ? err : new ConnectionError('Failed to resolve WebSocket')
-      this.emitError(error)
-      this.scheduleReconnect()
-      throw error
+      // No WebSocket implementation anywhere is a configuration error, not
+      // an outage: nothing a retry could change. Reject so the caller sees
+      // it, and stay idle rather than announce the same error every backoff.
+      this.setState('idle')
+      throw err instanceof Error ? err : new ConnectionError('Failed to resolve WebSocket')
     }
+    // disconnect() or a concurrent connect() may have run during the await.
+    if (this.disposed || this.ws) return
+
+    this.setState('connecting')
 
     // Authenticate via HELLO frame (not URL). Browser WebSocket cannot set
     // custom headers, so this is the only cross-runtime path. The API key
     // never appears in the URL, access logs, or Referer headers.
     const url = `${this.options.baseUrl}/v1/ws`
-    this.ws = new WebSocketCtor(url)
+    let ws: WebSocket
+    try {
+      ws = new WebSocketCtor(url)
+    } catch (err) {
+      // A constructor that throws (bad URL, host refusing to create sockets)
+      // is a failed attempt like any other: it backs off, it does not end
+      // the client.
+      const error = err instanceof Error ? err : new ConnectionError('WebSocket constructor threw')
+      this.emitError(error)
+      this.scheduleReconnect()
+      throw error
+    }
+    this.ws = ws
     this.authenticated = false
     this.ackMode = false
-    this.helloTimeoutClose = false
+    this.livenessMs =
+      this.options.livenessTimeoutMs ?? (isPingCapable(ws) ? DEFAULT_LIVENESS_TIMEOUT_MS : 0)
+    this.armHandshakeDeadline()
 
-    this.ws.onopen = () => {
+    // Every handler checks that it still speaks for the current socket. A
+    // socket the watchdog abandoned (or disconnect() closed) was dealt with
+    // the moment we let go of it; its own late events — a close that arrives
+    // seconds later from a dead pipe, an error from an aborted upgrade —
+    // must not touch the state machine again. The handlers stay attached
+    // (never detached) because a Node `ws` socket with no error listener
+    // turns an error event into an uncaught exception.
+    const current = (): boolean => this.ws === ws
+
+    ws.onopen = () => {
+      if (!current()) return
       try {
         // Advertise the delivery-ack capability (docs/realtime-delivery-ack.md).
         // Legacy servers ignore unknown HELLO fields; ack-mode turns on only
         // if hello.ok echoes the capability back.
-        this.ws!.send(
+        ws.send(
           JSON.stringify({
             type: 'hello',
             api_key: this.options.apiKey,
@@ -431,19 +648,17 @@ export class RealtimeClient {
         )
       } catch (err) {
         this.emitError(err instanceof Error ? err : new ConnectionError('HELLO send failed'))
-        return
+        // A socket that cannot carry the HELLO cannot carry anything; the
+        // handshake deadline would end it anyway, so end it now.
+        this.abandonSocket(CLIENT_CLOSE_CODE, 'client HELLO send failed')
       }
-
-      this.helloAckTimer = setTimeout(() => {
-        this.emitError(new ConnectionError('HELLO ack timeout'))
-        // 1008 doubles as a terminal auth code on server-initiated closes;
-        // flag this self-close so onclose keeps the reconnect loop alive.
-        this.helloTimeoutClose = true
-        try { this.ws?.close(1008, 'HELLO ack timeout') } catch { /* already closed */ }
-      }, HELLO_ACK_TIMEOUT_MS)
     }
 
-    this.ws.onmessage = (event: MessageEvent) => {
+    ws.onmessage = (event: MessageEvent) => {
+      if (!current()) return
+      // Any inbound frame is proof of life, parseable or not.
+      this.touchLiveness()
+
       let message: WsMessage
       try {
         message = JSON.parse(String(event.data)) as WsMessage
@@ -461,15 +676,17 @@ export class RealtimeClient {
           // would just be unknown frames.
           const caps = (message as { capabilities?: unknown }).capabilities
           this.ackMode = Array.isArray(caps) && caps.includes('ack')
+          this.clearHandshakeTimer()
+          // The idle deadline takes over from the handshake deadline.
+          this.touchLiveness()
           // reconnectAttempts is deliberately NOT reset here. A successful
           // handshake proves the credential, not the connection — see
           // STABLE_CONNECTION_MS. The counter clears from the timer below,
           // and only if we are still connected 30s from now.
           this.startStabilityTimer()
-          if (this.helloAckTimer) {
-            clearTimeout(this.helloAckTimer)
-            this.helloAckTimer = null
-          }
+          // The credential was accepted: a later rejection is a new event.
+          this.blockedAnnounced = false
+          this.setState('ready')
           for (const handler of this.connectHandlers) {
             try { handler() } catch { /* user hook must not break flow */ }
           }
@@ -508,67 +725,33 @@ export class RealtimeClient {
       this.dispatch(message)
     }
 
-    this.ws.onerror = () => {
+    ws.onerror = () => {
+      if (!current()) return
       this.emitError(new ConnectionError('WebSocket error'))
     }
 
-    this.ws.onclose = (event: CloseEvent) => {
-      if (this.helloAckTimer) {
-        clearTimeout(this.helloAckTimer)
-        this.helloAckTimer = null
+    ws.onclose = (event: CloseEvent) => {
+      if (!current()) return
+      this.ws = null
+      this.handleClose({
+        code: event.code,
+        // A polyfilled socket may omit the reason; the rejection rule
+        // lowercases it, so it must be a string here.
+        reason: String(event.reason ?? ''),
+        wasClean: event.wasClean,
+        initiator: 'server',
+      })
+    }
+
+    // Node `ws`: the server's ping frames (every 45 s) are proof of life
+    // too. The library answers them on its own; here they only refresh the
+    // idle deadline, which is what lets a quiet socket stay up.
+    if (isPingCapable(ws)) {
+      const alive = (): void => {
+        if (current()) this.touchLiveness()
       }
-      // Cancel BEFORE clearing `authenticated`: a connection that dies young
-      // must not clear the backoff counter — that is the whole point of the
-      // stability window.
-      this.cancelStabilityTimer()
-      this.noteConnectionEnded()
-      this.authenticated = false
-      this.ackMode = false
-      const selfClosedForHelloTimeout = this.helloTimeoutClose
-      this.helloTimeoutClose = false
-
-      for (const handler of this.disconnectHandlers) {
-        try {
-          handler({ code: event.code, reason: event.reason, wasClean: event.wasClean })
-        } catch { /* user hook must not break flow */ }
-      }
-
-      // Ack-on-receipt: every frame parked on a seq gap was acknowledged at
-      // parse, so the server has it `delivered` and will never re-offer it.
-      // Dropping the buffer here would lose it for good — the exact loss the
-      // ack protocol exists to prevent. Hand the parked frames to the
-      // handlers now, in seq order, before the state goes. Default mode
-      // skips this: its parked frames are unacked and come back in order on
-      // the next drain.
-      if (this.options.ackOnReceipt) this.flushParkedFrames('connection_closed')
-
-      // Drop all per-conversation ordering state. Across the connection
-      // break the application is responsible for calling /sync (or
-      // enabling `autoDrainOnConnect`), which re-establishes the cursor
-      // via the next message.new arrival. Leaving stale nextExpectedSeq
-      // values would cause spurious gap detections after reconnect when
-      // a /sync drain delivers higher-seq rows than what live previously
-      // emitted.
-      this.resetOrderStates()
-
-      // Terminal auth closes: the server rejected the session outright
-      // (invalid/expired key, forbidden). Retrying with the same
-      // credentials is a doomed loop, so stop here — surface a final
-      // error and leave reconnection off. Our own HELLO-ack-timeout close
-      // reuses 1008 on the wire and is explicitly exempted: a slow
-      // hello.ok is transient and must keep the retry loop alive.
-      if (TERMINAL_CLOSE_CODES.has(event.code) && !selfClosedForHelloTimeout) {
-        this.emitError(
-          new ConnectionError(
-            `WebSocket closed with terminal code ${event.code}${event.reason ? ` (${event.reason})` : ''}; ` +
-              'the server rejected the session and auto-reconnect has stopped. ' +
-              'Check the API key, then create a new RealtimeClient.',
-          ),
-        )
-        return
-      }
-
-      this.scheduleReconnect()
+      ws.on('ping', alive)
+      ws.on('pong', alive)
     }
   }
 
@@ -764,9 +947,10 @@ export class RealtimeClient {
       if (this.disposed || !this.authenticated) return
       this.reconnectAttempts = 0
       this.rapidReconnects = 0
+      // The outage is over; the next one gets its own announcement.
+      this.longOutageAnnounced = false
     }, STABLE_CONNECTION_MS)
-    // Never hold a Node process open just to reset a counter.
-    ;(this.stabilityTimer as { unref?: () => void }).unref?.()
+    unref(this.stabilityTimer)
   }
 
   private cancelStabilityTimer(): void {
@@ -780,6 +964,8 @@ export class RealtimeClient {
    * Track short-lived connections and warn once they form a pattern.
    * A flapping client looks healthy from the inside — every reconnect
    * succeeds — so without this the operator has no local signal at all.
+   * The notice goes through `onError` like every other signal: an SDK
+   * that runs as a guest inside a host process does not own its console.
    */
   private noteConnectionEnded(): void {
     const started = this.lastConnectAt
@@ -793,50 +979,312 @@ export class RealtimeClient {
 
     this.rapidReconnects++
     if (this.rapidReconnects === INSTABILITY_WARN_THRESHOLD) {
-      // eslint-disable-next-line no-console
-      console.warn(
-        `[agentchat] realtime connection is unstable: ${this.rapidReconnects} ` +
-          `reconnects each lasting under ${RAPID_RECONNECT_MS / 1000}s. Backing off ` +
-          `(next retry in up to ${this.options.maxReconnectInterval / 1000}s). This ` +
-          `usually means the network path or a local supervisor is dropping the ` +
-          `socket, not an AgentChat outage.`,
+      this.emitError(
+        new ConnectionError(
+          `realtime connection is unstable: ${this.rapidReconnects} consecutive ` +
+            `connections each lasting under ${RAPID_RECONNECT_MS / 1000}s. Backing off ` +
+            `(next retry in up to ${this.options.maxReconnectInterval / 1000}s). This ` +
+            `usually means the network path or a local supervisor is dropping the ` +
+            `socket, not an AgentChat outage.`,
+        ),
       )
     }
   }
 
+  // ─── Lifecycle: close funnel, backoff, blocked, watchdogs ───────────────
+  //
+  // Invariant: the client never parks itself. Every close leads to a timer
+  // (backoff or blocked retry) or, with `reconnect: false`, to `idle` where
+  // the application's next connect() picks up. Only disconnect() ends it.
+
+  /**
+   * The single funnel for "this socket is over", whoever ended it. Runs
+   * after `this.ws` has been let go of, so nothing here touches the socket
+   * again. Decides what comes next — backoff, blocked or idle, never nothing.
+   */
+  private handleClose(info: DisconnectInfo): void {
+    const duringHandshake = !this.authenticated
+    this.clearWatchdogs()
+    // Cancel BEFORE clearing `authenticated`: a connection that dies young
+    // must not clear the backoff counter — that is the whole point of the
+    // stability window.
+    this.cancelStabilityTimer()
+    this.noteConnectionEnded()
+    this.authenticated = false
+    this.ackMode = false
+
+    for (const handler of this.disconnectHandlers) {
+      try { handler(info) } catch { /* user hook must not break flow */ }
+    }
+
+    // Ack-on-receipt: every frame parked on a seq gap was acknowledged at
+    // parse, so the server has it `delivered` and will never re-offer it.
+    // Dropping the buffer here would lose it for good — the exact loss the
+    // ack protocol exists to prevent. Hand the parked frames to the
+    // handlers now, in seq order, before the state goes. Default mode
+    // skips this: its parked frames are unacked and come back in order on
+    // the next drain.
+    if (this.options.ackOnReceipt) this.flushParkedFrames('connection_closed')
+
+    // Drop all per-conversation ordering state. Across the connection
+    // break the application is responsible for calling /sync (or
+    // enabling `autoDrainOnConnect`), which re-establishes the cursor
+    // via the next message.new arrival. Leaving stale nextExpectedSeq
+    // values would cause spurious gap detections after reconnect when
+    // a /sync drain delivers higher-seq rows than what live previously
+    // emitted.
+    this.resetOrderStates()
+
+    if (this.disposed) return
+
+    // Only a close the SERVER sent, before hello.ok, with a code and reason
+    // that mean rejection, is a rejection. Our own watchdog closes say
+    // nothing about the server, whatever code they carry; an eviction after
+    // hello.ok takes the normal path and the next HELLO decides.
+    if (
+      info.initiator === 'server' &&
+      duringHandshake &&
+      isAuthRejectionClose(info.code, info.reason)
+    ) {
+      this.enterBlocked(info.code, info.reason)
+      return
+    }
+
+    this.scheduleReconnect()
+  }
+
+  /**
+   * End the current socket on the client's own decision (a watchdog trip,
+   * a HELLO that could not be sent) and move on at once, without waiting for
+   * the socket's close event: on a dead pipe a polite close waits for a
+   * reply that never comes. Terminated where the API allows it (Node `ws`),
+   * closed otherwise; its own late events are ignored because it is no
+   * longer `this.ws`.
+   */
+  private abandonSocket(code: number, reason: string): void {
+    const ws = this.ws
+    if (!ws) return
+    this.ws = null
+    const terminate = (ws as { terminate?: () => void }).terminate
+    try {
+      if (typeof terminate === 'function') terminate.call(ws)
+      else ws.close(code, reason)
+    } catch { /* already closed */ }
+    this.handleClose({ code, reason, wasClean: false, initiator: 'client' })
+  }
+
   private scheduleReconnect(): void {
     if (this.disposed) return
-    if (!this.options.reconnect) return
-    if (this.reconnectAttempts >= this.options.maxReconnectAttempts) return
     if (this.reconnectTimer) return
+    if (!this.options.reconnect) {
+      this.setState('idle')
+      return
+    }
 
     this.reconnectAttempts++
-    const delay = this.computeReconnectDelay(this.reconnectAttempts)
+    const attempt = this.reconnectAttempts
+    if (attempt > LONG_OUTAGE_AFTER_ATTEMPTS && !this.longOutageAnnounced) {
+      // Once per outage: the operator should know the control plane has
+      // been unreachable this long. Retrying goes on at the wider cap.
+      this.longOutageAnnounced = true
+      this.emitError(
+        new ConnectionError(
+          `still reconnecting after ${LONG_OUTAGE_AFTER_ATTEMPTS} consecutive failed attempts; ` +
+            `backing off to at most ${Math.round(this.longOutageCap() / 1000)}s between ` +
+            'attempts and not giving up',
+        ),
+      )
+    }
+
+    const delay = this.computeReconnectDelay(attempt)
+    this.setState('backoff')
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
-      void this.connect().catch((err) => {
-        this.emitError(err instanceof Error ? err : new ConnectionError(String(err)))
-      })
+      this.retryNow()
     }, delay)
   }
 
+  /**
+   * The server rejected the credential. `blocked` is not the end: a fresh
+   * HELLO goes out every AUTH_RETRY_INTERVAL_MS (jittered) until one is
+   * accepted — keys get rotated back and accounts get reinstated, and the
+   * running client has no other way to learn it. The first rejection of a
+   * run is an error; the following ones only fire `blocked`, so an operator
+   * sees one line per incident rather than one every quarter hour.
+   */
+  private enterBlocked(code: number, reason: string): void {
+    const retryInMs = this.options.reconnect
+      ? this.jittered(AUTH_RETRY_INTERVAL_MS, AUTH_RETRY_JITTER_RATIO)
+      : null
+    this.setState('blocked')
+
+    if (!this.blockedAnnounced) {
+      this.blockedAnnounced = true
+      this.emitError(
+        new ConnectionError(
+          `server rejected the credential (close ${code}${reason ? ` ${reason}` : ''}); ` +
+            (retryInMs !== null
+              ? `retrying with a fresh HELLO in about ${Math.round(retryInMs / 60_000)} min ` +
+                'and every 10–15 min after that until it is accepted again'
+              : 'reconnect is off, so call connect() to try again'),
+        ),
+      )
+    }
+
+    const info: BlockedInfo = { code, reason, retryInMs }
+    for (const handler of this.blockedHandlers) {
+      try { handler(info) } catch { /* user hook must not break flow */ }
+    }
+
+    if (retryInMs === null) return
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      this.retryNow()
+    }, retryInMs)
+  }
+
+  /**
+   * The timer-driven attempt. connect() emits and re-arms on its own for
+   * every failure it retries (a throwing constructor, a close); the one
+   * failure it does not retry — no WebSocket implementation at all — left
+   * nothing armed, so it is announced here: the operator should see why the
+   * client went quiet.
+   */
+  private retryNow(): void {
+    void this.connect().catch((err) => {
+      if (this.disposed || this.ws || this.reconnectTimer) return
+      this.emitError(err instanceof Error ? err : new ConnectionError(String(err)))
+    })
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+  }
+
   private computeReconnectDelay(attempt: number): number {
-    const exp = this.options.reconnectInterval * Math.pow(2, Math.min(attempt - 1, 10))
-    const capped = Math.min(exp, this.options.maxReconnectInterval)
-    // ±25% jitter avoids thundering-herd reconnect when a whole fleet
-    // drops at the same moment.
-    const jitter = 0.75 + Math.random() * 0.5
-    return Math.max(0, Math.floor(capped * jitter))
+    const exp = this.options.reconnectInterval * Math.pow(2, Math.min(attempt - 1, 20))
+    // A long outage widens the cap: a down control plane is polled every few
+    // minutes instead of every `maxReconnectInterval`, for as long as it takes.
+    const cap =
+      attempt > LONG_OUTAGE_AFTER_ATTEMPTS ? this.longOutageCap() : this.options.maxReconnectInterval
+    return this.jitteredBelow(Math.min(exp, cap), RECONNECT_JITTER_RATIO)
+  }
+
+  private longOutageCap(): number {
+    return Math.max(this.options.maxReconnectInterval, LONG_OUTAGE_MAX_INTERVAL_MS)
+  }
+
+  /** Symmetric ±ratio jitter around `ms` — for the blocked retry, a range (10–15 min), not a cap. */
+  private jittered(ms: number, ratio: number): number {
+    const factor = 1 - ratio + Math.random() * 2 * ratio
+    return Math.max(0, Math.floor(ms * factor))
+  }
+
+  /** Jitter in [ms × (1 − ratio), ms]: `ms` is a ceiling. Thundering-herd-safe across a fleet. */
+  private jitteredBelow(ms: number, ratio: number): number {
+    const factor = 1 - Math.random() * ratio
+    return Math.max(0, Math.floor(ms * factor))
+  }
+
+  private armHandshakeDeadline(): void {
+    this.clearHandshakeTimer()
+    const ms = this.options.handshakeTimeoutMs
+    this.handshakeTimer = setTimeout(() => {
+      this.handshakeTimer = null
+      this.emitError(new ConnectionError(`handshake timeout: no hello.ok within ${ms}ms`))
+      this.abandonSocket(CLIENT_CLOSE_CODE, 'client handshake timeout')
+    }, ms)
+    unref(this.handshakeTimer)
+  }
+
+  /**
+   * Note proof of life (any inbound frame, or a ping/pong on a socket that
+   * shows them). The timer itself is lazy: it is armed once per connection
+   * and, when it fires early because traffic arrived meanwhile, re-arms for
+   * the remainder — one `Date.now()` per frame instead of a timer churn.
+   */
+  private touchLiveness(): void {
+    this.lastInboundAt = Date.now()
+    if (this.livenessTimer === null) this.armLiveness(this.livenessMs)
+  }
+
+  private armLiveness(ms: number): void {
+    if (this.livenessMs <= 0 || !this.ws || !this.authenticated) return
+    this.livenessTimer = setTimeout(() => {
+      this.livenessTimer = null
+      const quietFor = Date.now() - this.lastInboundAt
+      if (quietFor < this.livenessMs) {
+        this.armLiveness(this.livenessMs - quietFor)
+        return
+      }
+      this.emitError(
+        new ConnectionError(`liveness timeout: nothing received for ${this.livenessMs}ms`),
+      )
+      this.abandonSocket(CLIENT_CLOSE_CODE, 'client liveness timeout')
+    }, Math.max(1, ms))
+    unref(this.livenessTimer)
+  }
+
+  private clearHandshakeTimer(): void {
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer)
+      this.handshakeTimer = null
+    }
+  }
+
+  private clearWatchdogs(): void {
+    this.clearHandshakeTimer()
+    if (this.livenessTimer) {
+      clearTimeout(this.livenessTimer)
+      this.livenessTimer = null
+    }
+  }
+
+  private setState(next: RealtimeState): void {
+    const previous = this._state
+    if (previous === next) return
+    this._state = next
+    for (const handler of this.stateHandlers) {
+      try { handler(next, previous) } catch { /* user hook must not break flow */ }
+    }
   }
 
   /**
    * Subscribe to one event type. `wake` handlers receive a typed
    * `WakeFrame`; the frame carries no message and is never acknowledged.
    * Returns an unsubscribe function.
+   *
+   * Three events are the client's own rather than server frames:
+   * - `state` — every transition of `state` (see `RealtimeState`).
+   * - `blocked` — the server rejected the credential during the handshake;
+   *   carries the close code, reason and the delay to the next attempt.
+   * - `stopped` — `disconnect()` was called; fired once, before handlers
+   *   are released.
    */
   on(event: 'wake', handler: WakeHandler): () => void
+  on(event: 'state', handler: StateHandler): () => void
+  on(event: 'blocked', handler: BlockedHandler): () => void
+  on(event: 'stopped', handler: StoppedHandler): () => void
   on(event: string, handler: MessageHandler): () => void
-  on(event: string, handler: MessageHandler | WakeHandler): () => void {
+  on(
+    event: string,
+    handler: MessageHandler | WakeHandler | StateHandler | BlockedHandler | StoppedHandler,
+  ): () => void {
+    // Lifecycle events live in their own sets: a server frame that happened
+    // to be typed 'state' must never reach them through dispatch.
+    switch (event) {
+      case 'state':
+        return this.subscribe(this.stateHandlers, handler as StateHandler)
+      case 'blocked':
+        return this.subscribe(this.blockedHandlers, handler as BlockedHandler)
+      case 'stopped':
+        return this.subscribe(this.stoppedHandlers, handler as StoppedHandler)
+      default:
+        break
+    }
     let handlers = this.handlers.get(event)
     if (!handlers) {
       handlers = new Set()
@@ -852,6 +1300,20 @@ export class RealtimeClient {
     }
   }
 
+  private subscribe<T>(set: Set<T>, handler: T): () => void {
+    set.add(handler)
+    return () => {
+      set.delete(handler)
+    }
+  }
+
+  /**
+   * Every signal the client has for its operator comes through here:
+   * transport errors, handler failures, the watchdog and backoff notices
+   * (`handshake timeout`, `liveness timeout`, `still reconnecting after
+   * 60 …`, `server rejected the credential …`, `connection is unstable`).
+   * The SDK never writes to the console.
+   */
   onError(handler: ErrorHandler): () => void {
     this.errorHandlers.add(handler)
     return () => this.errorHandlers.delete(handler)
@@ -913,39 +1375,64 @@ export class RealtimeClient {
     return this.authenticated && this.ws?.readyState === 1
   }
 
+  /** Where the connection lifecycle is right now. See `RealtimeState`. */
+  get state(): RealtimeState {
+    return this._state
+  }
+
   /**
-   * Close the socket, disable auto-reconnect, and release all handlers.
-   * After calling this, `connect()` throws — create a fresh
-   * `RealtimeClient` if you want to reopen.
+   * `true` when the current connection's `hello.ok` echoed the `ack`
+   * capability: the server keeps each envelope `stored` until this client
+   * acknowledges it. `false` before `hello.ok`, after a close, and against
+   * a legacy server (which marks envelopes delivered on push).
+   */
+  get ackNegotiated(): boolean {
+    return this.ackMode
+  }
+
+  /**
+   * Close the socket, cancel every timer, and release all handlers. The
+   * only way into `stopped`, and the only way the client ever stops on
+   * purpose: works from any state (`blocked` and a pending backoff
+   * included). `stopped` fires once. After this, `connect()` throws —
+   * create a fresh `RealtimeClient` if you want to reopen.
    */
   disconnect(): void {
+    if (this.disposed) return
     this.disposed = true
     this.options.reconnect = false
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
-      this.reconnectTimer = null
-    }
-    if (this.helloAckTimer) {
-      clearTimeout(this.helloAckTimer)
-      this.helloAckTimer = null
-    }
+    this.clearReconnectTimer()
+    this.clearWatchdogs()
     this.cancelStabilityTimer()
     // Flush any buffered envelopes synchronously so the caller doesn't
     // miss them after disconnect(). No gap-fill — we're tearing down,
     // and an in-flight HTTP request would race the close.
     this.flushParkedFrames('gap_fill_unavailable')
-    try { this.ws?.close() } catch { /* already closed */ }
+    const ws = this.ws
     this.ws = null
+    try { ws?.close(1000, 'client disconnect') } catch { /* already closed */ }
     this.authenticated = false
+    this.ackMode = false
+    this.setState('stopped')
+    for (const handler of this.stoppedHandlers) {
+      try { handler() } catch { /* user hook must not break flow */ }
+    }
     this.handlers.clear()
     this.errorHandlers.clear()
     this.connectHandlers.clear()
     this.disconnectHandlers.clear()
+    this.stateHandlers.clear()
+    this.blockedHandlers.clear()
+    this.stoppedHandlers.clear()
   }
 
   private emitError(error: Error): void {
     for (const handler of this.errorHandlers) {
-      handler(error)
+      // Every notice is emitted right before the step that keeps the client
+      // alive (arming a timer, opening the next socket). A throwing observer
+      // must not take that step with it — that would be the one way into a
+      // parked client.
+      try { handler(error) } catch { /* user hook must not break flow */ }
     }
   }
 

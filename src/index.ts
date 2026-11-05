@@ -18,12 +18,19 @@ export {
 
 export {
   RealtimeClient,
+  isAuthRejectionClose,
   type RealtimeOptions,
+  type RealtimeState,
   type MessageHandler,
   type WakeHandler,
   type ErrorHandler,
   type ConnectHandler,
+  type DisconnectInfo,
   type DisconnectHandler,
+  type StateHandler,
+  type BlockedInfo,
+  type BlockedHandler,
+  type StoppedHandler,
   type SequenceGapInfo,
   type SequenceGapHandler,
 } from './realtime.js'

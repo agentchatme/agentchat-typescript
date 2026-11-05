@@ -542,25 +542,28 @@ describe('RealtimeClient — a guest in a host process', () => {
     vi.useFakeTimers()
     const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor })
     await rt.connect()
-    MockWebSocket.latest().simulateOpen() // HELLO sent, 4 s ack timer armed
+    MockWebSocket.latest().simulateOpen() // HELLO sent; the 15 s handshake deadline is the one timer
     expect(vi.getTimerCount()).toBe(1)
     rt.disconnect()
     expect(vi.getTimerCount()).toBe(0)
   })
 
   it('resolves the WebSocket constructor per connect, never from a process-wide memo', async () => {
-    // Two hosts in one process may provide different implementations; the
-    // second client must get the one in scope when IT connects. A module
-    // memo would hand it the first client's constructor.
+    // On Node the resolver prefers `ws`. Two hosts in one process may
+    // provide different implementations (here: two `ws` module instances);
+    // the second client must get the one in scope when IT connects. A
+    // module memo would hand it the first client's constructor.
     class HostA extends MockWebSocket {}
     class HostB extends MockWebSocket {}
 
-    vi.stubGlobal('WebSocket', HostA)
+    vi.doMock('ws', () => ({ default: HostA }))
+    vi.resetModules()
     const a = new RealtimeClient({ apiKey: 'ka', reconnect: false })
     await a.connect()
     const wsA = MockWebSocket.latest()
 
-    vi.stubGlobal('WebSocket', HostB)
+    vi.doMock('ws', () => ({ default: HostB }))
+    vi.resetModules()
     const b = new RealtimeClient({ apiKey: 'kb', reconnect: false })
     await b.connect()
     const wsB = MockWebSocket.latest()
@@ -579,5 +582,60 @@ describe('RealtimeClient — a guest in a host process', () => {
 
     a.disconnect()
     b.disconnect()
+    vi.doUnmock('ws')
+  })
+
+  it('prefers `ws` over the native socket on Node (ping frames for the liveness watchdog)', async () => {
+    class Native extends MockWebSocket {}
+    class Ws extends MockWebSocket {}
+    vi.stubGlobal('WebSocket', Native)
+    vi.doMock('ws', () => ({ default: Ws }))
+    vi.resetModules()
+    const rt = new RealtimeClient({ apiKey: 'k', reconnect: false })
+    await rt.connect()
+    expect(MockWebSocket.latest()).toBeInstanceOf(Ws)
+    rt.disconnect()
+    vi.doUnmock('ws')
+    vi.unstubAllGlobals()
+  })
+
+  it('falls back to the native socket when `ws` is not installed', async () => {
+    class Native extends MockWebSocket {}
+    vi.stubGlobal('WebSocket', Native)
+    vi.doMock('ws', () => {
+      throw new Error("Cannot find package 'ws'")
+    })
+    vi.resetModules()
+    const rt = new RealtimeClient({ apiKey: 'k', reconnect: false })
+    await rt.connect()
+    expect(MockWebSocket.latest()).toBeInstanceOf(Native)
+    rt.disconnect()
+    vi.doUnmock('ws')
+    vi.unstubAllGlobals()
+  })
+
+  it('no WebSocket implementation anywhere: connect() rejects, the client stays idle, no retry loop', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('WebSocket', undefined)
+    vi.doMock('ws', () => {
+      throw new Error("Cannot find package 'ws'")
+    })
+    vi.resetModules()
+    const rt = new RealtimeClient({ apiKey: 'k', reconnectInterval: 10 })
+    const errors: Error[] = []
+    rt.onError((e) => errors.push(e))
+    const before = MockWebSocket.instances.length
+
+    await expect(rt.connect()).rejects.toThrow(/no WebSocket implementation/)
+    // A configuration error, not an outage: nothing a retry could change.
+    expect(rt.state).toBe('idle')
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(MockWebSocket.instances.length).toBe(before)
+    expect(errors).toEqual([])
+
+    rt.disconnect()
+    vi.doUnmock('ws')
+    vi.unstubAllGlobals()
   })
 })

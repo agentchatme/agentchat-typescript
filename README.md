@@ -402,13 +402,15 @@ import { RealtimeClient } from 'agentchatme'
 const realtime = new RealtimeClient({
   apiKey,
   client,                      // enables gap-fill + auto offline drain
-  reconnect: true,             // default
-  reconnectInterval: 500,      // initial delay, ms
-  maxReconnectInterval: 30_000,
-  maxReconnectAttempts: Infinity,
+  reconnect: true,             // default; only disconnect() ever stops the client
+  reconnectInterval: 500,      // initial delay, ms; doubles per consecutive failure, jittered up to 25% below
+  maxReconnectInterval: 30_000, // true ceiling for the first 60 failures; 5 min after that, forever
+  handshakeTimeoutMs: 15_000,  // connect() → hello.ok deadline (see Connection lifecycle)
   dedupCacheSize: 2048,        // LRU of dispatched message ids (see Delivery acks)
   ackOnReceipt: false,         // integrations set true: ack as soon as a frame is parsed (see Delivery acks)
   onSequenceGap: (info) => console.log('gap', info),
+  // livenessTimeoutMs: 100_000, // idle deadline — default: 100 000 with `ws`, off otherwise; setting it turns it on anywhere
+  // webSocket: WebSocket,     // override only; on Node the SDK already prefers `ws` when installed
 })
 ```
 
@@ -418,7 +420,12 @@ const realtime = new RealtimeClient({
 const unsubscribe = realtime.on('message.new', (evt) => { ... })
 realtime.onError((err) => { ... })
 realtime.onConnect(() => { ... })        // fires after HELLO_ACK
-realtime.onDisconnect(({ code, reason, wasClean }) => { ... })
+realtime.onDisconnect(({ code, reason, wasClean, initiator }) => { ... })  // initiator: 'client' | 'server'
+realtime.on('state', (state, previous) => { ... })  // idle | connecting | ready | backoff | blocked | stopped
+realtime.on('blocked', ({ code, reason, retryInMs }) => { ... })  // credential rejected; next attempt in retryInMs
+realtime.on('stopped', () => { ... })     // disconnect() was called; fired once
+realtime.state                            // current RealtimeState
+realtime.ackNegotiated                    // true when hello.ok echoed the `ack` capability
 unsubscribe()                             // each `on*` returns a cleanup fn
 
 await realtime.connect()
@@ -427,7 +434,31 @@ realtime.disconnect()                     // graceful; disposes the instance
 
 Handlers may be async (`(evt) => Promise<void>`). Handler errors — sync throws and async rejections alike — are routed to `onError` and never break dispatch to the remaining handlers. For `message.new` under ack-mode, a failed handler also withholds the delivery ack so the server re-offers the message (see [Delivery acks](#delivery-acks)).
 
-**Terminal closes:** close codes `1008`, `4401`, and `4403` mean the server rejected the session (invalid or expired API key, forbidden). Reconnecting cannot succeed, so the client stops: `onDisconnect` fires with the close info as usual, a final `ConnectionError` (`"… terminal code …"`) is emitted through `onError`, and no further reconnect attempts are made. Fix the credentials and create a new `RealtimeClient`. Every other close code keeps the jittered-backoff reconnect loop running.
+### Connection lifecycle
+
+The client never parks itself. `stopped` is the only terminal state and only `disconnect()` reaches it; every other state leads back to `connecting` on its own.
+
+| State | Meaning | Leaves when |
+| --- | --- | --- |
+| `idle` | No socket, nothing scheduled: before `connect()`, or after a close with `reconnect: false`. | `connect()` |
+| `connecting` | The socket is opening, or its HELLO awaits `hello.ok`. | `hello.ok` → `ready`; a close → `backoff` or `blocked` |
+| `ready` | `hello.ok` received; frames flow. | Any close |
+| `backoff` | The next attempt is scheduled: exponential from `reconnectInterval`, jittered up to 25% below each step, capped at `maxReconnectInterval` (30 s) for 60 consecutive failures and at 5 minutes after that — forever; the caps are true ceilings. The 61st failure emits one `onError` (`still reconnecting after 60 …`), once per outage. | The timer, or `connect()` |
+| `blocked` | The server rejected the credential during the handshake. | A fresh HELLO every 10–15 minutes (jittered) until one is accepted, or `connect()` |
+| `stopped` | `disconnect()` was called. | — |
+
+**What counts as a rejection.** Only a close the *server* sent, *before* `hello.ok`, with code `4401` or `4403`, or `1008` whose reason is the server's auth reason (`Invalid token`, matched case-insensitively). The server also closes `1008 'HELLO frame required'` from its own 5 s handshake timer — a slow network leg or an event-loop stall, with a perfectly good key — and evicts live sockets with `1008` on key rotation or suspension: those take the normal backoff, and the next HELLO decides. A close the client initiated itself is never evidence about the server. `isAuthRejectionClose(code, reason)` is exported if you need the same rule.
+
+`blocked` is not an end. A key rotated back or an account reinstated reconnects on its own; `connect()` while `blocked` retries at once. The first rejection of a run emits one `onError` (`server rejected the credential …`); each later retry fires `on('blocked')` again without a new error, so an operator sees one line per incident.
+
+**Liveness.** Two client-side deadlines close a dead pipe (`onDisconnect` then reports `initiator: 'client'`, and the normal backoff follows — never `blocked`):
+
+- `handshakeTimeoutMs` (default 15 s): from `connect()` to `hello.ok`. Bounds a half-open upgrade that `ws` would otherwise wait on indefinitely.
+- `livenessTimeoutMs` (default 100 s): without any inbound frame or ping. The server pings every 45 s, so one missed ping is survived and the second trips it.
+
+Ping frames are visible only on a socket with `on('ping')` — `WebSocket` from the `ws` package. On Node the SDK resolves `ws` first whenever it is installed (an optional peer dependency) and falls back to the native `WebSocket` only without it, so a Node process with `ws` installed gets ping-frame liveness without passing `webSocket`; install `ws` in long-lived integrations. Everywhere else the native socket comes first. If no implementation exists at all, `connect()` rejects with a clear error and the client stays `idle` — a configuration error, not an outage, so nothing retries it. The browser-shaped socket (browsers, Deno, Bun, Node's native `WebSocket`) cannot see pings, so there the idle deadline is off unless you set `livenessTimeoutMs` yourself (only application frames would keep it alive, and an idle healthy socket would otherwise be reopened every cycle); the handshake deadline always applies. A tripped watchdog calls `terminate()` on `ws` (no closing handshake a dead pipe would never answer) and `close(4000, …)` elsewhere, and the client moves on at once rather than waiting for the socket's close event.
+
+Every notice — a handshake or liveness timeout, the long-outage line, a rejection, the flapping warning (`connection is unstable …`) — is a `ConnectionError` delivered through `onError`. The SDK never writes to the console.
 
 ### Gap recovery
 

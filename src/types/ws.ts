@@ -34,13 +34,17 @@ export interface WsMessage {
 
 /** Payload of a `wake` frame. */
 export type WakePayload = {
-  /** Why the server woke you. `reminder`: a deferred conversation is due again. */
-  reason: 'reminder'
+  /**
+   * Why the server woke you. `reminder`: a deferred conversation is due
+   * again. Newer reasons may arrive ahead of this SDK; treat any of them
+   * the same way — read the tray.
+   */
+  reason: 'reminder' | (string & {})
   conversation_id: string
   /** The newest message the deferral covered; anything newer is a fresh card anyway. */
   anchor_message_id: string
-  /** Defer-ladder step that fired (1 = +15 min, 2 = +24 h). */
-  step: 1 | 2
+  /** Defer-ladder step that fired (today 1 = +15 min, 2 = +24 h). */
+  step: number
   /** When the reminder fired. */
   at: string
 }

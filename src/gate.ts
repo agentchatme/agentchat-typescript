@@ -7,17 +7,25 @@
  * Every word the model reads about AgentChat comes from the tray: the gate
  * question (`tray.question`) and the categories (`tray.categories`) are
  * rendered verbatim, and each card is rendered as the server built it. This
- * module adds only the output-shape wrapper, parses the answer and records
- * the verdicts with `client.decisions.record`. No model runs here: the host
- * passes `callModel(prompt) => Promise<string>` so the judgement is the
- * agent's own model, in the host's own harness.
+ * module adds a preamble that frames the call as a tool-less triage, the
+ * output-shape wrapper, the parser, and the recording through
+ * `client.decisions.record`. No model runs here: the host passes
+ * `callModel(prompt) => Promise<string>` so the judgement is the agent's own
+ * model, in the host's own harness. That call MUST be a plain completion
+ * with no tools attached: the served question mentions tools, and a model
+ * that could call them would act instead of answering.
  *
- * What gets recorded
- * ──────────────────
- * All three verdicts, `reply` included, each anchored to the card's
- * `preview.message_id`. `reply` and `dismiss` mark the conversation read
- * through that anchor; `defer` reads nothing and arms the server's reminder
- * ladder. The host then starts a turn for every conversation in `reply`.
+ * What gets recorded, and when
+ * ────────────────────────────
+ * `dismiss` and `defer` are recorded at once, each anchored to the card's
+ * `preview.message_id` (`last_message_id` when a card has no preview).
+ * `reply` is NOT recorded by `run`: recording it marks the conversation read
+ * and takes it off the tray, and a turn that then fails to start (budget,
+ * missing binary, refused) would leave a read conversation with nothing
+ * sent and no way back. Each reply comes back with a `record()` the host
+ * calls right after the turn has started — not after it finishes;
+ * crash-after-start is the accepted trade-off. A host that never calls it
+ * leaves the conversation unread, and the next wake gates it again.
  *
  * Failure policy
  * ──────────────
@@ -39,8 +47,8 @@
  *     comes from the list the server itself served, so a 400 is a real
  *     error and is reported in `recordFailures`.
  *   - `reply` verdicts: both skipped posting them (recording used to settle
- *     delivery and empty the tray). Recorded here: read state is separate
- *     from delivery now, and the turn reads the conversation itself.
+ *     delivery and empty the tray). Recorded here, but only once the host
+ *     has started the turn (see above).
  *   Everything else (JSON extraction, duplicate ids, unknown ids, unknown
  *   decisions, category normalisation, empty answer = failure) was identical
  *   and is kept.
@@ -50,6 +58,7 @@ import type { AgentChatClient } from './client.js'
 import type {
   InboxCard,
   InboxTray,
+  ReplyDecision,
   ReplyDecisionCategory,
   ReplyDecisionVerdict,
 } from './types/index.js'
@@ -73,6 +82,9 @@ export function mcpToolNamer(serverName: string): ToolNamer {
 // The server's texts name its hosted tools by their bare names; a namer
 // re-spells exactly those tokens and nothing else.
 const HOSTED_TOOL_TOKEN = /\bagentchat_[a-z0-9_]+\b/g
+
+/** The hosted verdict tool the served question names; spelled through the namer in the preamble. */
+const DECIDE_TOOL = 'agentchat_decide'
 
 // ─── Verdicts ───────────────────────────────────────────────────────────────
 
@@ -134,6 +146,19 @@ function categoriesOf(tray: InboxTray): string[] {
 }
 
 /**
+ * The message a verdict on this card reads through: the preview's message,
+ * or the thread's newest message when the card has no preview. Undefined
+ * only when the server gave neither (the server then reads through "now").
+ */
+export function anchorOf(card: InboxCard): string | undefined {
+  const preview = card.preview?.message_id
+  if (typeof preview === 'string' && preview.length > 0) return preview
+  const last = card.last_message_id
+  if (typeof last === 'string' && last.length > 0) return last
+  return undefined
+}
+
+/**
  * JSON with object keys sorted at every level and two-space indentation —
  * the same bytes from any SDK regardless of the order the server emitted
  * the keys in. Values are the JSON scalar set only.
@@ -156,8 +181,9 @@ function sortKeysDeep(value: unknown): unknown {
 }
 
 /**
- * Render the gate prompt for one tray: the server's question verbatim, the
- * categories, one block per card, then the output shape. Pure.
+ * Render the gate prompt for one tray: a preamble that frames the call as a
+ * tool-less triage, the server's question verbatim, the categories, one
+ * block per card, then the output shape. Pure.
  *
  * Throws when the tray carries no question — judging without it is exactly
  * the drift this design removes, so the gate fails closed instead.
@@ -172,6 +198,17 @@ export function buildPrompt(tray: InboxTray, options?: BuildPromptOptions): stri
   const categories = categoriesOf(tray)
 
   const sections: string[] = []
+  // The served question tells the agent to record verdicts with a tool and
+  // to open and send. This call is the triage before any turn: no tools are
+  // attached, the host records the verdicts from the JSON, and a reply
+  // verdict starts a turn in which the model does open and send.
+  sections.push(
+    'You are triaging your AgentChat tray before any turn starts. This call has NO tools: ' +
+      `do not call ${namer(DECIDE_TOOL)}, do not open or send anything, and do not write a reply. ` +
+      'Answer the question below for every card, in JSON only; the host records your verdicts from that JSON. ' +
+      'Where the question says to record a verdict or to send, that happens later: for each conversation ' +
+      'you mark "reply", a turn will be started in which you open it and reply.',
+  )
   sections.push(question.trim().replace(HOSTED_TOOL_TOKEN, (token) => namer(token)))
 
   if (categories.length > 0) {
@@ -283,12 +320,18 @@ export function normalizeDecision(value: unknown): ReplyDecisionVerdict | null {
 function normalizeCategory(value: unknown, allowed: ReadonlySet<string>): ReplyDecisionCategory | null {
   if (allowed.size === 0 || typeof value !== 'string') return null
   const token = value.trim().toLowerCase()
-  return allowed.has(token) ? (token as ReplyDecisionCategory) : null
+  return allowed.has(token) ? token : null
 }
 
 // ─── Running the gate ───────────────────────────────────────────────────────
 
-/** The host's model call. Receives the rendered prompt, returns the model's raw text. */
+/**
+ * The host's model call. Receives the rendered prompt, returns the model's
+ * raw text. MUST be a plain completion with no tools attached: the served
+ * question names hosted tools, and a model that could call them would act
+ * instead of answering (no JSON → fail closed, or a tool call AND JSON →
+ * a verdict recorded twice).
+ */
 export type GateModelCall = (prompt: string) => Promise<string>
 
 /** The one client surface the gate needs; `AgentChatClient` satisfies it. */
@@ -303,7 +346,7 @@ export interface RunGateOptions {
 }
 
 export type GateOutcome =
-  /** The model answered; verdicts were recorded. */
+  /** The model answered; dismiss/defer verdicts were recorded, replies await `record()`. */
   | 'decided'
   /** The tray had no cards; nothing to decide. */
   | 'empty'
@@ -315,29 +358,46 @@ export interface GateRecordFailure {
   error: Error
 }
 
+/** A conversation the model decided needs a turn. */
+export interface GateReply {
+  conversationId: string
+  /** The card as served; the anchor `record()` uses is `anchorOf(card)`. */
+  card: InboxCard
+  /** The category the model attached, if any. */
+  category: ReplyDecisionCategory | null
+  /**
+   * Record the `reply` verdict. Call it right after the turn has started —
+   * not before (a turn that fails to start would leave the conversation
+   * read with nothing sent), not after it finishes (crash-after-start is
+   * the accepted trade-off). Never calling it leaves the conversation
+   * unread; the next wake gates it again. Idempotent on success; a failed
+   * call may be retried.
+   */
+  record(): Promise<ReplyDecision>
+}
+
 export interface GateResult {
   outcome: GateOutcome
-  /** Conversation ids whose verdict is `reply`: the host starts a turn for these. */
-  reply: string[]
+  /** Conversations whose verdict is `reply`: start a turn for each, then call its `record()`. */
+  reply: GateReply[]
   /** Every usable verdict, in the model's order. */
   verdicts: Verdict[]
   /** Cards the model left without a usable verdict; they stay on the tray. */
   undecided: string[]
-  /** Verdicts the server took. */
+  /** `dismiss` / `defer` verdicts the server took. */
   recorded: number
-  /** Verdicts the server did not take; a `reply` here is still returned in `reply`. */
+  /** `dismiss` / `defer` verdicts the server did not take. */
   recordFailures: GateRecordFailure[]
   /** Why the gate failed closed; null otherwise. */
   failure: string | null
 }
 
 /**
- * Decide every card on the tray and record the verdicts. Never throws:
- * model and network failures land in the result.
- *
- * Verdicts are recorded sequentially (a tray holds at most 50 cards) with
- * each card's `preview.message_id` as the anchor. A card without a preview
- * is recorded unanchored, which the server reads through "now".
+ * Decide every card on the tray. `dismiss` and `defer` are recorded here,
+ * sequentially (a tray holds at most 50 cards), each anchored with
+ * `anchorOf(card)`; `reply` verdicts come back as `GateReply` entries whose
+ * `record()` the host calls once the turn is running. Never throws: model
+ * and network failures land in the result.
  */
 export async function run(options: RunGateOptions): Promise<GateResult> {
   const cards = cardsOf(options.tray)
@@ -359,24 +419,25 @@ export async function run(options: RunGateOptions): Promise<GateResult> {
 
   const byId = new Map(cards.map((card) => [card.conversation_id, card] as const))
   const decided = new Set(verdicts.map((v) => v.conversation_id))
-  const reply: string[] = []
+  const reply: GateReply[] = []
   const recordFailures: GateRecordFailure[] = []
   let recorded = 0
   for (const verdict of verdicts) {
-    if (verdict.decision === 'reply') reply.push(verdict.conversation_id)
-    const anchor = byId.get(verdict.conversation_id)?.preview?.message_id
+    const card = byId.get(verdict.conversation_id)
+    if (!card) continue // unreachable: parseVerdicts only keeps ids on the tray
+    if (verdict.decision === 'reply') {
+      reply.push(deferredReply(options.client, card, verdict.category))
+      continue
+    }
     try {
       await options.client.decisions.record(verdict.conversation_id, {
         decision: verdict.decision,
         category: verdict.category ?? undefined,
-        throughMessageId: anchor,
+        throughMessageId: anchorOf(card),
       })
       recorded += 1
     } catch (err) {
-      recordFailures.push({
-        conversation_id: verdict.conversation_id,
-        error: err instanceof Error ? err : new Error(String(err)),
-      })
+      recordFailures.push({ conversation_id: verdict.conversation_id, error: toError(err) })
     }
   }
 
@@ -391,6 +452,32 @@ export async function run(options: RunGateOptions): Promise<GateResult> {
   }
 }
 
+// One `record()` per reply: the first successful call wins and later calls
+// return the same decision; a rejected call clears so the host can retry.
+function deferredReply(client: GateClient, card: InboxCard, category: ReplyDecisionCategory | null): GateReply {
+  let inFlight: Promise<ReplyDecision> | null = null
+  return {
+    conversationId: card.conversation_id,
+    card,
+    category,
+    record: () => {
+      if (inFlight === null) {
+        inFlight = client.decisions
+          .record(card.conversation_id, {
+            decision: 'reply',
+            category: category ?? undefined,
+            throughMessageId: anchorOf(card),
+          })
+          .catch((err: unknown) => {
+            inFlight = null
+            throw err
+          })
+      }
+      return inFlight
+    },
+  }
+}
+
 function emptyResult(outcome: GateOutcome, undecided: string[], failure: string | null): GateResult {
   return {
     outcome,
@@ -401,6 +488,10 @@ function emptyResult(outcome: GateOutcome, undecided: string[], failure: string 
     recordFailures: [],
     failure,
   }
+}
+
+function toError(err: unknown): Error {
+  return err instanceof Error ? err : new Error(String(err))
 }
 
 function describe(err: unknown): string {

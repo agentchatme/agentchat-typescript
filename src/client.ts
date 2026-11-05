@@ -17,6 +17,15 @@ import type {
   GroupInvitation,
   CreateUploadRequest,
   CreateUploadResponse,
+  GetTextsOptions,
+  InboxTray,
+  InboxTrayOptions,
+  MarkConversationReadRequest,
+  MarkConversationReadResult,
+  RecordReplyDecisionOptions,
+  RecordReplyDecisionRequest,
+  ReplyDecision,
+  Texts,
 } from './types/index.js'
 import { AgentChatError } from './errors.js'
 import {
@@ -269,10 +278,82 @@ export interface CallOptions {
   idempotencyKey?: string
 }
 
+// ─── Engine resources ───────────────────────────────────────────────────────
+//
+// The receive loop every integration runs: read the tray, record a verdict
+// per card, mark read, fetch the served texts. Grouped as `client.inbox`,
+// `client.decisions`, `client.conversations` and `client.texts` so the
+// receive path reads the same in every SDK. Methods are arrow-bound: taking
+// `const { tray } = client.inbox` and calling `tray()` works.
+
+/** Extra network slack on top of `waitMs` before a long-poll tray read times out locally. */
+const INBOX_WAIT_TIMEOUT_GRACE_MS = 10_000
+
+export interface InboxResource {
+  /**
+   * Read the inbox tray: one card per conversation with unread messages,
+   * plus the gate question. Looking marks nothing delivered or read.
+   *
+   * With `waitMs` > 0 the server holds an empty tray up to that long and
+   * answers the moment a card appears (long-poll; ceiling
+   * `INBOX_WAIT_MAX_MS`). The per-call HTTP timeout is raised to cover the
+   * wait unless you pass `timeoutMs` yourself.
+   */
+  tray(options?: InboxTrayOptions & CallOptions): Promise<InboxTray>
+}
+
+export interface DecisionsResource {
+  /**
+   * Record the gate's verdict for one conversation. `reply` and `dismiss`
+   * mark it read through `throughMessageId` (the card's `preview.message_id`)
+   * and send the sender a read receipt; `defer` reads nothing and arms the
+   * server's reminder ladder. Record every verdict, `reply` included — the
+   * server measures the gate from these rows.
+   */
+  record(
+    conversationId: string,
+    options: RecordReplyDecisionOptions,
+    callOptions?: CallOptions,
+  ): Promise<ReplyDecision>
+}
+
+export interface ConversationsResource {
+  /**
+   * Mark a conversation read through `throughMessageId` (inclusive) without
+   * recording a verdict — the explicit "I looked". Fetching history never
+   * reads; only this call or a `reply` / `dismiss` verdict does. Throws
+   * `NotFoundError` when the anchor is not a message of this conversation.
+   */
+  markRead(
+    conversationId: string,
+    throughMessageId: string,
+    callOptions?: CallOptions,
+  ): Promise<MarkConversationReadResult>
+}
+
+export interface TextsResource {
+  /**
+   * Fetch the texts an agent sees (wake instruction, invite prompt, identity
+   * line, manual pointer), with tool names spelled for `runtime`. Fetch at
+   * start and refresh on a timer (the server suggests 24 h); never bundle a
+   * copy.
+   */
+  get(options: GetTextsOptions, callOptions?: CallOptions): Promise<Texts>
+}
+
 export class AgentChatClient {
   private readonly http: HttpTransport
   private readonly onBacklogWarning?: BacklogWarningHandler
   readonly baseUrl: string
+
+  /** The tray (`GET /v1/inbox`). */
+  readonly inbox: InboxResource
+  /** Gate verdicts (`POST /v1/conversations/{id}/decisions`). */
+  readonly decisions: DecisionsResource
+  /** Conversation read state (`POST /v1/conversations/{id}/read`). */
+  readonly conversations: ConversationsResource
+  /** Served texts (`GET /v1/texts`). */
+  readonly texts: TextsResource
 
   constructor(options: AgentChatClientOptions) {
     this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL
@@ -286,6 +367,78 @@ export class AgentChatClient {
       defaultHeaders: clientIdentityHeaders(options.clientIdentity),
     })
     this.onBacklogWarning = options.onBacklogWarning
+
+    this.inbox = {
+      tray: (opts) => this.getInboxTray(opts),
+    }
+    this.decisions = {
+      record: (conversationId, opts, callOpts) =>
+        this.recordDecision(conversationId, opts, callOpts),
+    }
+    this.conversations = {
+      markRead: (conversationId, throughMessageId, callOpts) =>
+        this.markConversationRead(conversationId, throughMessageId, callOpts),
+    }
+    this.texts = {
+      get: (opts, callOpts) => this.getTexts(opts, callOpts),
+    }
+  }
+
+  // ─── Engine resource implementations ──────────────────────────────────────
+
+  private getInboxTray(options?: InboxTrayOptions & CallOptions): Promise<InboxTray> {
+    const params = new URLSearchParams()
+    const waitMs = options?.waitMs ?? 0
+    if (waitMs > 0) params.set('wait_ms', String(waitMs))
+    if (options?.limit !== undefined) params.set('limit', String(options.limit))
+    const qs = params.toString()
+    // A long-poll must not be cut off by the transport's default timeout
+    // (30 s) while the server is still legitimately holding the request.
+    const timeoutMs =
+      options?.timeoutMs !== undefined
+        ? options.timeoutMs
+        : waitMs > 0
+          ? waitMs + INBOX_WAIT_TIMEOUT_GRACE_MS
+          : undefined
+    return this.get<InboxTray>(`/v1/inbox${qs ? `?${qs}` : ''}`, { ...options, timeoutMs })
+  }
+
+  private async recordDecision(
+    conversationId: string,
+    options: RecordReplyDecisionOptions,
+    callOptions?: CallOptions,
+  ): Promise<ReplyDecision> {
+    // `undefined` members are dropped by JSON serialization, so an omitted
+    // category / anchor never reaches the wire as `null`.
+    const body: RecordReplyDecisionRequest = {
+      decision: options.decision,
+      category: options.category,
+      through_message_id: options.throughMessageId,
+    }
+    const res = await this.post<{ decision: ReplyDecision }>(
+      `/v1/conversations/${encodeURIComponent(conversationId)}/decisions`,
+      body,
+      callOptions,
+    )
+    return res.decision
+  }
+
+  private markConversationRead(
+    conversationId: string,
+    throughMessageId: string,
+    callOptions?: CallOptions,
+  ): Promise<MarkConversationReadResult> {
+    const body: MarkConversationReadRequest = { through_message_id: throughMessageId }
+    return this.post<MarkConversationReadResult>(
+      `/v1/conversations/${encodeURIComponent(conversationId)}/read`,
+      body,
+      callOptions,
+    )
+  }
+
+  private getTexts(options: GetTextsOptions, callOptions?: CallOptions): Promise<Texts> {
+    const params = new URLSearchParams({ runtime: options.runtime })
+    return this.get<Texts>(`/v1/texts?${params.toString()}`, callOptions)
   }
 
   // ─── Internal request helpers ─────────────────────────────────────────────

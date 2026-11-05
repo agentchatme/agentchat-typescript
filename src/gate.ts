@@ -1,0 +1,408 @@
+/**
+ * The gate: the agent's own model answers the server's question about the
+ * server's cards, and the verdicts are recorded.
+ *
+ * Code we keep, brain we don't
+ * ────────────────────────────
+ * Every word the model reads about AgentChat comes from the tray: the gate
+ * question (`tray.question`) and the categories (`tray.categories`) are
+ * rendered verbatim, and each card is rendered as the server built it. This
+ * module adds only the output-shape wrapper, parses the answer and records
+ * the verdicts with `client.decisions.record`. No model runs here: the host
+ * passes `callModel(prompt) => Promise<string>` so the judgement is the
+ * agent's own model, in the host's own harness.
+ *
+ * What gets recorded
+ * ──────────────────
+ * All three verdicts, `reply` included, each anchored to the card's
+ * `preview.message_id`. `reply` and `dismiss` mark the conversation read
+ * through that anchor; `defer` reads nothing and arms the server's reminder
+ * ladder. The host then starts a turn for every conversation in `reply`.
+ *
+ * Failure policy
+ * ──────────────
+ * Fail closed: when the model cannot be reached or its answer holds no
+ * usable verdict, nothing is recorded and `reply` is empty. The messages
+ * stay unread and on the tray; the next wake asks again. Hosts that want to
+ * start a turn anyway can do so from `outcome === 'fail_closed'`.
+ *
+ * Where the two gates this replaces differed (Hermes `gate.py`, OpenClaw
+ * `doorbell/gate.ts`), the stricter rule won:
+ *   - Dismiss synonyms: Hermes also took `close` / `closed`; OpenClaw did
+ *     not. Not accepted here — `close` collides with the `closing` category
+ *     and a category echoed into the decision slot must not pass as a verdict.
+ *   - `defer_seconds`: both parsed and posted it. Here it is ignored and
+ *     never sent — the server owns the defer timing.
+ *   - Fail-open flag: both had an environment switch that started a turn on
+ *     gate failure. There is none here; the host decides from the result.
+ *   - Retry without category on a 400: both did. Not here — the category
+ *     comes from the list the server itself served, so a 400 is a real
+ *     error and is reported in `recordFailures`.
+ *   - `reply` verdicts: both skipped posting them (recording used to settle
+ *     delivery and empty the tray). Recorded here: read state is separate
+ *     from delivery now, and the turn reads the conversation itself.
+ *   Everything else (JSON extraction, duplicate ids, unknown ids, unknown
+ *   decisions, category normalisation, empty answer = failure) was identical
+ *   and is kept.
+ */
+
+import type { AgentChatClient } from './client.js'
+import type {
+  InboxCard,
+  InboxTray,
+  ReplyDecisionCategory,
+  ReplyDecisionVerdict,
+} from './types/index.js'
+
+// ─── Tool names ─────────────────────────────────────────────────────────────
+
+/** Spell a hosted tool name the way a runtime exposes it to its model. */
+export type ToolNamer = (tool: string) => string
+
+/** The names as the server writes them. The default. */
+export const BARE_TOOL_NAMER: ToolNamer = (tool) => tool
+
+/**
+ * The convention MCP-hosted coding agents use: `mcp__<server>__<tool>`.
+ * `mcpToolNamer('agentchat')('agentchat_decide')` → `mcp__agentchat__agentchat_decide`.
+ */
+export function mcpToolNamer(serverName: string): ToolNamer {
+  return (tool) => `mcp__${serverName}__${tool}`
+}
+
+// The server's texts name its hosted tools by their bare names; a namer
+// re-spells exactly those tokens and nothing else.
+const HOSTED_TOOL_TOKEN = /\bagentchat_[a-z0-9_]+\b/g
+
+// ─── Verdicts ───────────────────────────────────────────────────────────────
+
+/** One parsed answer for one card. Snake-case: it is data, shared with the conformance fixtures. */
+export interface Verdict {
+  conversation_id: string
+  decision: ReplyDecisionVerdict
+  /** A category from the tray's list, or null when the model gave none or an unknown one. */
+  category: ReplyDecisionCategory | null
+}
+
+// Tolerated spellings. Anything else leaves the card undecided.
+const REPLY_TOKENS: ReadonlySet<string> = new Set(['reply', 'respond', 'answer', 'yes', 'true'])
+const DISMISS_TOKENS: ReadonlySet<string> = new Set([
+  'dismiss',
+  'dismissed',
+  'no_reply',
+  'no-reply',
+  'noreply',
+  'silent',
+  'silence',
+  'skip',
+  'ignore',
+  'no',
+  'false',
+])
+const DEFER_TOKENS: ReadonlySet<string> = new Set(['defer', 'deferred', 'later', 'wait', 'postpone'])
+
+const FENCE_RE = /```(?:json)?\s*([\s\S]+?)```/i
+
+// ─── Building the prompt ────────────────────────────────────────────────────
+
+export interface BuildPromptOptions {
+  /** How this runtime spells the hosted tools named inside the question. Default: as served. */
+  toolNamer?: ToolNamer
+}
+
+/**
+ * The cards exactly as served, minus anything that is not an object with a
+ * conversation id (a defensive filter, never a judgement).
+ */
+export function cardsOf(tray: InboxTray): InboxCard[] {
+  const raw: unknown = tray.conversations
+  if (!Array.isArray(raw)) return []
+  return raw.filter(
+    (card): card is InboxCard =>
+      typeof card === 'object' &&
+      card !== null &&
+      !Array.isArray(card) &&
+      typeof (card as { conversation_id?: unknown }).conversation_id === 'string' &&
+      (card as { conversation_id: string }).conversation_id.length > 0,
+  )
+}
+
+function categoriesOf(tray: InboxTray): string[] {
+  const raw: unknown = tray.categories
+  if (!Array.isArray(raw)) return []
+  return raw.filter((item): item is string => typeof item === 'string' && item.length > 0)
+}
+
+/**
+ * JSON with object keys sorted at every level and two-space indentation —
+ * the same bytes from any SDK regardless of the order the server emitted
+ * the keys in. Values are the JSON scalar set only.
+ */
+export function canonicalJson(value: unknown): string {
+  return JSON.stringify(sortKeysDeep(value), null, 2)
+}
+
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep)
+  if (typeof value === 'object' && value !== null) {
+    const source = value as Record<string, unknown>
+    const out: Record<string, unknown> = {}
+    for (const key of Object.keys(source).sort()) {
+      if (source[key] !== undefined) out[key] = sortKeysDeep(source[key])
+    }
+    return out
+  }
+  return value
+}
+
+/**
+ * Render the gate prompt for one tray: the server's question verbatim, the
+ * categories, one block per card, then the output shape. Pure.
+ *
+ * Throws when the tray carries no question — judging without it is exactly
+ * the drift this design removes, so the gate fails closed instead.
+ */
+export function buildPrompt(tray: InboxTray, options?: BuildPromptOptions): string {
+  const question: unknown = tray.question
+  if (typeof question !== 'string' || question.trim().length === 0) {
+    throw new Error('gate: tray carries no question')
+  }
+  const namer = options?.toolNamer ?? BARE_TOOL_NAMER
+  const cards = cardsOf(tray)
+  const categories = categoriesOf(tray)
+
+  const sections: string[] = []
+  sections.push(question.trim().replace(HOSTED_TOOL_TOKEN, (token) => namer(token)))
+
+  if (categories.length > 0) {
+    sections.push(`Categories: ${categories.join(', ')}`)
+  }
+
+  const you = typeof tray.you === 'string' && tray.you.length > 0 ? `You are ${tray.you}. ` : ''
+  const count = cards.length
+  sections.push(
+    `${you}Your tray, as the server built it: ${count} conversation${count === 1 ? '' : 's'}.`,
+  )
+
+  cards.forEach((card, index) => {
+    sections.push(`Card ${index + 1} of ${count}\n${canonicalJson(card)}`)
+  })
+
+  let shape =
+    '{"decisions": [{"conversation_id": "<conversation_id from a card>", ' +
+    '"decision": "reply" | "dismiss" | "defer"'
+  if (categories.length > 0) {
+    shape += `, "category": "<one of: ${categories.join(', ')}>"`
+  }
+  shape += '}]}'
+  sections.push(
+    'Answer with ONLY a JSON object, no prose and no code fences, in this shape: ' +
+      shape +
+      ' — one entry per card, every card decided.',
+  )
+
+  return sections.join('\n\n')
+}
+
+// ─── Parsing the answer ─────────────────────────────────────────────────────
+
+/**
+ * Parse the model's answer into verdicts for the cards on `tray`.
+ *
+ * Returns `null` when the text holds no JSON at all (nothing parsable: the
+ * caller fails closed). Entries for conversations not on the tray, unknown
+ * decisions and duplicate ids are dropped; those cards count as undecided.
+ * An unknown category becomes `null`; a stray `defer_seconds` is ignored.
+ * Tolerant of code fences, surrounding prose and the synonyms above.
+ */
+export function parseVerdicts(text: string | null | undefined, tray: InboxTray): Verdict[] | null {
+  const raw = extractJson(text)
+  if (raw === null) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return null
+  }
+
+  let items: unknown
+  if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+    const record = parsed as Record<string, unknown>
+    items = record.decisions ?? record.verdicts
+    if (items === undefined && 'conversation_id' in record) items = [record]
+  } else {
+    items = parsed
+  }
+  if (!Array.isArray(items)) return null
+
+  const known = new Set(cardsOf(tray).map((card) => card.conversation_id))
+  const allowed = new Set(categoriesOf(tray).map((c) => c.toLowerCase()))
+  const seen = new Set<string>()
+  const out: Verdict[] = []
+  for (const item of items) {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) continue
+    const entry = item as Record<string, unknown>
+    const id = entry.conversation_id
+    if (typeof id !== 'string' || !known.has(id) || seen.has(id)) continue
+    const decision = normalizeDecision(entry.decision)
+    if (decision === null) continue
+    seen.add(id)
+    out.push({
+      conversation_id: id,
+      decision,
+      category: normalizeCategory(entry.category, allowed),
+    })
+  }
+  return out
+}
+
+function extractJson(text: string | null | undefined): string | null {
+  if (typeof text !== 'string' || text.trim().length === 0) return null
+  let s = text.trim()
+  const fence = FENCE_RE.exec(s)
+  if (fence?.[1]) s = fence[1].trim()
+  const starts = [s.indexOf('{'), s.indexOf('[')].filter((i) => i !== -1)
+  if (starts.length === 0) return null
+  const start = Math.min(...starts)
+  const closer = s[start] === '{' ? '}' : ']'
+  const end = s.lastIndexOf(closer)
+  if (end <= start) return null
+  return s.slice(start, end + 1)
+}
+
+/** Map a model's spelling onto a verdict, or null when it is none of the tolerated ones. */
+export function normalizeDecision(value: unknown): ReplyDecisionVerdict | null {
+  if (typeof value !== 'string') return null
+  const token = value.trim().toLowerCase().replace(/\s+/g, '_')
+  if (REPLY_TOKENS.has(token)) return 'reply'
+  if (DISMISS_TOKENS.has(token)) return 'dismiss'
+  if (DEFER_TOKENS.has(token)) return 'defer'
+  return null
+}
+
+function normalizeCategory(value: unknown, allowed: ReadonlySet<string>): ReplyDecisionCategory | null {
+  if (allowed.size === 0 || typeof value !== 'string') return null
+  const token = value.trim().toLowerCase()
+  return allowed.has(token) ? (token as ReplyDecisionCategory) : null
+}
+
+// ─── Running the gate ───────────────────────────────────────────────────────
+
+/** The host's model call. Receives the rendered prompt, returns the model's raw text. */
+export type GateModelCall = (prompt: string) => Promise<string>
+
+/** The one client surface the gate needs; `AgentChatClient` satisfies it. */
+export type GateClient = Pick<AgentChatClient, 'decisions'>
+
+export interface RunGateOptions {
+  tray: InboxTray
+  callModel: GateModelCall
+  client: GateClient
+  /** How this runtime spells the hosted tools named inside the question. */
+  toolNamer?: ToolNamer
+}
+
+export type GateOutcome =
+  /** The model answered; verdicts were recorded. */
+  | 'decided'
+  /** The tray had no cards; nothing to decide. */
+  | 'empty'
+  /** The model call failed or its answer held no usable verdict; nothing was recorded. */
+  | 'fail_closed'
+
+export interface GateRecordFailure {
+  conversation_id: string
+  error: Error
+}
+
+export interface GateResult {
+  outcome: GateOutcome
+  /** Conversation ids whose verdict is `reply`: the host starts a turn for these. */
+  reply: string[]
+  /** Every usable verdict, in the model's order. */
+  verdicts: Verdict[]
+  /** Cards the model left without a usable verdict; they stay on the tray. */
+  undecided: string[]
+  /** Verdicts the server took. */
+  recorded: number
+  /** Verdicts the server did not take; a `reply` here is still returned in `reply`. */
+  recordFailures: GateRecordFailure[]
+  /** Why the gate failed closed; null otherwise. */
+  failure: string | null
+}
+
+/**
+ * Decide every card on the tray and record the verdicts. Never throws:
+ * model and network failures land in the result.
+ *
+ * Verdicts are recorded sequentially (a tray holds at most 50 cards) with
+ * each card's `preview.message_id` as the anchor. A card without a preview
+ * is recorded unanchored, which the server reads through "now".
+ */
+export async function run(options: RunGateOptions): Promise<GateResult> {
+  const cards = cardsOf(options.tray)
+  const ids = cards.map((card) => card.conversation_id)
+  if (ids.length === 0) return emptyResult('empty', [], null)
+
+  let text: string
+  try {
+    const prompt = buildPrompt(options.tray, { toolNamer: options.toolNamer })
+    text = await options.callModel(prompt)
+  } catch (err) {
+    return emptyResult('fail_closed', ids, `model call failed: ${describe(err)}`)
+  }
+
+  const verdicts = parseVerdicts(text, options.tray)
+  if (verdicts === null || verdicts.length === 0) {
+    return emptyResult('fail_closed', ids, 'no usable verdicts in the answer')
+  }
+
+  const byId = new Map(cards.map((card) => [card.conversation_id, card] as const))
+  const decided = new Set(verdicts.map((v) => v.conversation_id))
+  const reply: string[] = []
+  const recordFailures: GateRecordFailure[] = []
+  let recorded = 0
+  for (const verdict of verdicts) {
+    if (verdict.decision === 'reply') reply.push(verdict.conversation_id)
+    const anchor = byId.get(verdict.conversation_id)?.preview?.message_id
+    try {
+      await options.client.decisions.record(verdict.conversation_id, {
+        decision: verdict.decision,
+        category: verdict.category ?? undefined,
+        throughMessageId: anchor,
+      })
+      recorded += 1
+    } catch (err) {
+      recordFailures.push({
+        conversation_id: verdict.conversation_id,
+        error: err instanceof Error ? err : new Error(String(err)),
+      })
+    }
+  }
+
+  return {
+    outcome: 'decided',
+    reply,
+    verdicts,
+    undecided: ids.filter((id) => !decided.has(id)),
+    recorded,
+    recordFailures,
+    failure: null,
+  }
+}
+
+function emptyResult(outcome: GateOutcome, undecided: string[], failure: string | null): GateResult {
+  return {
+    outcome,
+    reply: [],
+    verdicts: [],
+    undecided,
+    recorded: 0,
+    recordFailures: [],
+    failure,
+  }
+}
+
+function describe(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}

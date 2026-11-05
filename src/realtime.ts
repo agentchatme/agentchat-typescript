@@ -1,4 +1,4 @@
-import type { WsMessage, Message } from './types/index.js'
+import type { WsMessage, Message, WakeFrame } from './types/index.js'
 import type { AgentChatClient, SyncEnvelope } from './client.js'
 import { ConnectionError } from './errors.js'
 import { resolveWebSocket } from './ws-resolver.js'
@@ -12,9 +12,12 @@ import {
  * server negotiated delivery acks, the ack is sent only after every handler
  * settled without throwing — a rejected handler leaves the message unacked
  * so the server re-offers it (at-least-once; the dedup cache absorbs the
- * eventual duplicate of anything that DID succeed).
+ * eventual duplicate of anything that DID succeed). With `ackOnReceipt` the
+ * ack goes out before handlers run and completion no longer gates it.
  */
 export type MessageHandler = (message: WsMessage) => void | Promise<void>
+/** Handler for `wake` frames: a content-free "check AgentChat" signal. */
+export type WakeHandler = (frame: WakeFrame) => void | Promise<void>
 export type ErrorHandler = (error: Error) => void
 
 /**
@@ -111,6 +114,18 @@ export interface RealtimeOptions {
    * duplicate dispatch while still acknowledging receipt. Default: 2048.
    */
   dedupCacheSize?: number
+  /**
+   * Acknowledge each `message.new` the moment its frame is parsed, before
+   * any handler runs. This is the integration setting: "delivered" then
+   * means the agent's machine received the message, and whether the agent
+   * has looked is tracked separately as read state (a verdict or
+   * `client.conversations.markRead`), so an early ack never empties the
+   * tray. Covers live frames, the server's reconnect backlog and gap-fill
+   * rows; the REST offline drain keeps its settle-then-ack cursor. Default
+   * `false`: ack after every handler settled, for app clients whose
+   * handler IS the processing.
+   */
+  ackOnReceipt?: boolean
   /**
    * Override the WebSocket constructor. Defaults to `globalThis.WebSocket`
    * with a dynamic-import fallback to the `ws` package (for Node 20).
@@ -280,6 +295,7 @@ export class RealtimeClient {
     onSequenceGap?: SequenceGapHandler
     autoDrainOnConnect: boolean
     dedupCacheSize: number
+    ackOnReceipt: boolean
     webSocket?: typeof globalThis.WebSocket
     clientIdentity: AgentChatClientIdentity
   }
@@ -345,6 +361,7 @@ export class RealtimeClient {
       onSequenceGap: options.onSequenceGap,
       autoDrainOnConnect: options.autoDrainOnConnect ?? Boolean(options.client),
       dedupCacheSize,
+      ackOnReceipt: options.ackOnReceipt ?? false,
       webSocket: options.webSocket,
       clientIdentity: options.clientIdentity ?? DEFAULT_CLIENT_IDENTITY,
     }
@@ -461,7 +478,18 @@ export class RealtimeClient {
       // other event type (presence, group.deleted, message.read, system
       // messages without a seq) passes straight through.
       if (this.isMessageNew(message)) {
+        // Ack-on-receipt: the frame is parsed, the machine has it. Sent
+        // before ordering so a frame parked on a seq gap is already
+        // delivered; the post-dispatch ack is suppressed for this mode.
+        if (this.options.ackOnReceipt) {
+          const messageId = this.extractMessageId(message)
+          if (messageId !== null) this.sendAckFrame(messageId)
+        }
         this.processOrderedMessage(message)
+        return
+      }
+      if (this.isWake(message)) {
+        this.dispatchWake(message)
         return
       }
       this.dispatch(message)
@@ -778,15 +806,25 @@ export class RealtimeClient {
     return Math.max(0, Math.floor(capped * jitter))
   }
 
-  on(event: string, handler: MessageHandler): () => void {
+  /**
+   * Subscribe to one event type. `wake` handlers receive a typed
+   * `WakeFrame`; the frame carries no message and is never acknowledged.
+   * Returns an unsubscribe function.
+   */
+  on(event: 'wake', handler: WakeHandler): () => void
+  on(event: string, handler: MessageHandler): () => void
+  on(event: string, handler: MessageHandler | WakeHandler): () => void {
     let handlers = this.handlers.get(event)
     if (!handlers) {
       handlers = new Set()
       this.handlers.set(event, handlers)
     }
-    handlers.add(handler)
+    // A validated wake frame is a WsMessage whose payload is a WakePayload;
+    // dispatchWake guarantees the shape before any 'wake' handler runs.
+    const stored = handler as MessageHandler
+    handlers.add(stored)
     return () => {
-      handlers!.delete(handler)
+      handlers!.delete(stored)
       if (handlers!.size === 0) this.handlers.delete(event)
     }
   }
@@ -933,12 +971,16 @@ export class RealtimeClient {
   private dispatchMessageNew(message: WsMessage): Promise<boolean> {
     const isDrainRow = this.restDrainOrigin.has(message)
     const messageId = this.extractMessageId(message)
+    // Drain rows are covered by the REST cursor; ack-on-receipt frames were
+    // acked at parse (or at gap-fill fetch) time. Everything else acks here,
+    // once dispatch has settled.
+    const ackAfterDispatch = !isDrainRow && !this.options.ackOnReceipt
 
     let settlement: Promise<boolean>
 
     if (messageId !== null && this.dedupHit(messageId)) {
       settlement = Promise.resolve(true)
-      if (!isDrainRow) this.sendAckFrame(messageId)
+      if (ackAfterDispatch) this.sendAckFrame(messageId)
     } else {
       const handlers = this.handlers.get('message.new')
       const pending: Array<Promise<unknown>> = []
@@ -963,7 +1005,7 @@ export class RealtimeClient {
         if (!ok) return false
         if (messageId !== null) {
           this.dedupAdd(messageId)
-          if (!isDrainRow) this.sendAckFrame(messageId)
+          if (ackAfterDispatch) this.sendAckFrame(messageId)
         }
         return true
       })
@@ -1015,6 +1057,39 @@ export class RealtimeClient {
 
   private isMessageNew(message: WsMessage): boolean {
     return (message as { type?: string }).type === 'message.new'
+  }
+
+  private isWake(message: WsMessage): boolean {
+    return (message as { type?: string }).type === 'wake'
+  }
+
+  /**
+   * A `wake` frame is a content-free signal: validate the payload shape
+   * (so `wake` handlers can trust the `WakeFrame` type), then dispatch. A
+   * frame the server sent malformed is surfaced through `onError` rather
+   * than handed to handlers as something it is not. Never acked — there is
+   * no message to deliver.
+   */
+  private dispatchWake(message: WsMessage): void {
+    const payload = (message as { payload?: unknown }).payload
+    const reason = this.wakePayloadProblem(payload)
+    if (reason !== null) {
+      this.emitError(new ConnectionError(`wake frame failed validation: ${reason}`))
+      return
+    }
+    this.dispatch(message)
+  }
+
+  private wakePayloadProblem(payload: unknown): string | null {
+    if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) {
+      return 'payload is not an object'
+    }
+    const p = payload as Record<string, unknown>
+    for (const key of ['reason', 'conversation_id', 'anchor_message_id', 'at'] as const) {
+      if (typeof p[key] !== 'string' || p[key] === '') return `${key} is not a non-empty string`
+    }
+    if (typeof p.step !== 'number' || !Number.isInteger(p.step)) return 'step is not an integer'
+    return null
   }
 
   // ─── Per-conversation seq ordering ───────────────────────────────────────
@@ -1170,10 +1245,16 @@ export class RealtimeClient {
       // Skip if already in buffer (the natural arrival beat us to it).
       if (state.buffer.has(rowSeq)) continue
       // Wrap as a message.new envelope for the dispatch path.
-      state.buffer.set(rowSeq, {
+      const envelope: WsMessage = {
         type: 'message.new',
         payload: row as unknown as Record<string, unknown>,
-      })
+      }
+      // Ack-on-receipt: the fetch is this machine's receipt of the row.
+      if (this.options.ackOnReceipt) {
+        const messageId = this.extractMessageId(envelope)
+        if (messageId !== null) this.sendAckFrame(messageId)
+      }
+      state.buffer.set(rowSeq, envelope)
     }
 
     // Drain consecutive starting from expectedSeq. If we still hit a gap

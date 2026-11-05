@@ -62,7 +62,40 @@ export type {
   PresenceUpdate,
 } from './presence.js'
 
-export type { ClientAction, ServerEvent, WsMessage } from './ws.js'
+export type {
+  AckFrame,
+  ClientAction,
+  ServerEvent,
+  WakeFrame,
+  WakePayload,
+  WsMessage,
+} from './ws.js'
+
+export type {
+  InboxCard,
+  InboxCardGroup,
+  InboxCardPreview,
+  InboxCardRelationship,
+  InboxTray,
+  InboxTrayOptions,
+} from './inbox-tray.js'
+export {
+  INBOX_TRAY_DEFAULT_LIMIT,
+  INBOX_TRAY_MAX_LIMIT,
+  INBOX_WAIT_MAX_MS,
+} from './inbox-tray.js'
+
+export type {
+  MarkConversationReadRequest,
+  MarkConversationReadResult,
+  RecordReplyDecisionOptions,
+  RecordReplyDecisionRequest,
+  ReplyDecision,
+  ReplyDecisionCategory,
+  ReplyDecisionVerdict,
+} from './reply-decision.js'
+
+export type { GetTextsOptions, Texts, TextsRuntime } from './texts.js'
 
 export type {
   AttachmentMime,

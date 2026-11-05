@@ -8,21 +8,16 @@
  *   an optional peer dep). We dynamic-import it at first use so Node 22+
  *   consumers never pay the require cost and the SDK remains tree-shakable.
  *
- * The resolved constructor is cached after the first successful call.
+ * Deliberately stateless: the module system already caches the dynamic
+ * import, and a module-level memo would be the one piece of process-wide
+ * state in an SDK that is meant to run as a guest inside a host process.
  */
 
 type WebSocketCtor = typeof globalThis.WebSocket
 
-let cached: WebSocketCtor | null = null
-
 export async function resolveWebSocket(): Promise<WebSocketCtor> {
-  if (cached) return cached
-
   const native = (globalThis as { WebSocket?: WebSocketCtor }).WebSocket
-  if (native) {
-    cached = native
-    return native
-  }
+  if (native) return native
 
   try {
     // Built as an ESM dynamic import. tsup preserves the expression so
@@ -36,7 +31,6 @@ export async function resolveWebSocket(): Promise<WebSocketCtor> {
     if (!ctor) {
       throw new Error('The `ws` package loaded but did not export a WebSocket constructor.')
     }
-    cached = ctor
     return ctor
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err)

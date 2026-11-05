@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { resolve, dirname } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
-import { buildPrompt, mcpToolNamer, run, type GateClient } from '../src/gate.js'
+import { anchorOf, buildPrompt, mcpToolNamer, run, type GateClient } from '../src/gate.js'
 import type { InboxTray, ReplyDecision } from '../src/types/index.js'
 
 const FIXTURES = resolve(dirname(fileURLToPath(import.meta.url)), '../conformance/v1')
@@ -16,18 +16,21 @@ const IDS = {
   gone: 'conv_group0gone0001',
 }
 
-function fakeClient(impl?: (conversationId: string) => Promise<ReplyDecision>) {
+const decisionRow = (conversationId: string, decision: ReplyDecision['decision'] = 'dismiss'): ReplyDecision => ({
+  id: `dec_${conversationId}`,
+  conversation_id: conversationId,
+  decision,
+  category: null,
+  through_message_id: null,
+  defer_until: null,
+  created_at: '2026-11-04T23:00:00.000Z',
+})
+
+function fakeClient(impl?: (conversationId: string, opts: { decision: string }) => Promise<ReplyDecision>) {
   const record = vi.fn(
     impl ??
-      (async (conversationId: string): Promise<ReplyDecision> => ({
-        id: 'dec_1',
-        conversation_id: conversationId,
-        decision: 'dismiss',
-        category: null,
-        through_message_id: null,
-        defer_until: null,
-        created_at: '2026-11-04T23:00:00.000Z',
-      })),
+      (async (conversationId: string, opts: { decision: string }) =>
+        decisionRow(conversationId, opts.decision as ReplyDecision['decision'])),
   )
   const client: GateClient = { decisions: { record } }
   return { client, record }
@@ -36,10 +39,20 @@ function fakeClient(impl?: (conversationId: string) => Promise<ReplyDecision>) {
 const answer = (entries: Array<Record<string, unknown>>) => JSON.stringify({ decisions: entries })
 
 describe('gate.buildPrompt', () => {
-  it('spells hosted tool names per runtime through the namer, nothing else', () => {
+  it('opens with the tool-less triage preamble, then the served question verbatim', () => {
+    const tray = sampleTray()
+    const prompt = buildPrompt(tray)
+    const [preamble, ...rest] = prompt.split('\n\n')
+    expect(preamble).toMatch(/^You are triaging your AgentChat tray before any turn starts\. This call has NO tools/)
+    expect(preamble).toContain('do not call agentchat_decide')
+    expect(preamble).toContain('the host records your verdicts from that JSON')
+    expect(rest.join('\n\n').startsWith(tray.question)).toBe(true)
+  })
+
+  it('spells hosted tool names per runtime through the namer, in the preamble and the question alike', () => {
     const tray = sampleTray()
     const prompt = buildPrompt(tray, { toolNamer: mcpToolNamer('agentchat') })
-    expect(prompt).toContain('mcp__agentchat__agentchat_decide')
+    expect(prompt.match(/mcp__agentchat__agentchat_decide/g)).toHaveLength(2)
     expect(prompt).not.toMatch(/(^|[^_])agentchat_decide/)
     // The rest of the question is untouched.
     expect(prompt).toContain('On this network silence is a valid reply.')
@@ -72,8 +85,18 @@ describe('gate.buildPrompt', () => {
   })
 })
 
+describe('gate.anchorOf', () => {
+  it('prefers the preview message, falls back to last_message_id, else undefined', () => {
+    const card = sampleTray().conversations[0]!
+    expect(anchorOf(card)).toBe('msg_nova0first00001a')
+    expect(anchorOf({ ...card, preview: null, last_message_id: 'msg_last0000000001' })).toBe('msg_last0000000001')
+    expect(anchorOf({ ...card, preview: null, last_message_id: null })).toBeUndefined()
+    expect(anchorOf({ ...card, preview: null })).toBeUndefined()
+  })
+})
+
 describe('gate.run', () => {
-  it('records all three verdicts with each card anchor and returns the reply set', async () => {
+  it('records dismiss and defer at once with each card anchor; replies wait for record()', async () => {
     const tray = sampleTray()
     const { client, record } = fakeClient()
     const callModel = vi.fn(async () =>
@@ -89,21 +112,57 @@ describe('gate.run', () => {
 
     expect(callModel).toHaveBeenCalledWith(buildPrompt(tray))
     expect(result.outcome).toBe('decided')
-    expect(result.reply).toEqual([IDS.direct])
     expect(result.undecided).toEqual([])
-    expect(result.recorded).toBe(4)
+    expect(result.recorded).toBe(3)
     expect(result.recordFailures).toEqual([])
-    expect(record).toHaveBeenCalledTimes(4)
-    expect(record).toHaveBeenNthCalledWith(1, IDS.direct, {
-      decision: 'reply',
-      category: 'open_request',
-      throughMessageId: 'msg_nova0first00001a',
+    expect(record).toHaveBeenCalledTimes(3)
+    expect(record).toHaveBeenNthCalledWith(1, IDS.crew, {
+      decision: 'dismiss',
+      category: 'acknowledgement',
+      throughMessageId: 'msg_crew0thanks0001b',
     })
-    expect(record).toHaveBeenNthCalledWith(3, IDS.ops, {
+    expect(record).toHaveBeenNthCalledWith(2, IDS.ops, {
       decision: 'defer',
       category: 'goal_followup',
       throughMessageId: 'msg_ops0mention001c',
     })
+    expect(record.mock.calls.some(([id]) => id === IDS.direct)).toBe(false)
+
+    // The reply: nothing recorded until the host says the turn has started.
+    expect(result.reply.map((r) => r.conversationId)).toEqual([IDS.direct])
+    const reply = result.reply[0]!
+    expect(reply.card).toEqual(tray.conversations[0])
+    expect(reply.category).toBe('open_request')
+
+    const recordedReply = await reply.record()
+    expect(recordedReply.decision).toBe('reply')
+    expect(record).toHaveBeenLastCalledWith(IDS.direct, {
+      decision: 'reply',
+      category: 'open_request',
+      throughMessageId: 'msg_nova0first00001a',
+    })
+  })
+
+  it('record() on a reply is idempotent on success and retryable after failure', async () => {
+    let fail = true
+    const { client, record } = fakeClient(async (conversationId, opts) => {
+      if (fail) throw new Error('503')
+      return decisionRow(conversationId, opts.decision as ReplyDecision['decision'])
+    })
+    const result = await run({
+      tray: sampleTray(),
+      callModel: async () => answer([{ conversation_id: IDS.direct, decision: 'reply' }]),
+      client,
+    })
+    const reply = result.reply[0]!
+    await expect(reply.record()).rejects.toThrow(/503/)
+    fail = false
+    const first = reply.record()
+    const second = reply.record()
+    expect(second).toBe(first)
+    await expect(first).resolves.toMatchObject({ decision: 'reply' })
+    await expect(reply.record()).resolves.toMatchObject({ decision: 'reply' })
+    expect(record).toHaveBeenCalledTimes(2) // one failed, one succeeded
   })
 
   it('passes the namer through to the prompt', async () => {
@@ -178,46 +237,49 @@ describe('gate.run', () => {
     expect(record).toHaveBeenCalledTimes(1)
   })
 
-  it('keeps a reply in the reply set when recording it fails, and reports the failure', async () => {
-    const { client, record } = fakeClient(async (conversationId) => {
-      if (conversationId === IDS.direct) throw new Error('503 from server')
-      return {
-        id: 'dec_2',
-        conversation_id: conversationId,
-        decision: 'dismiss',
-        category: null,
-        through_message_id: null,
-        defer_until: null,
-        created_at: '2026-11-04T23:00:00.000Z',
-      }
+  it('reports an immediate verdict the server refused and keeps going', async () => {
+    const { client, record } = fakeClient(async (conversationId, opts) => {
+      if (conversationId === IDS.crew) throw new Error('503 from server')
+      return decisionRow(conversationId, opts.decision as ReplyDecision['decision'])
     })
     const result = await run({
       tray: sampleTray(),
       callModel: async () =>
         answer([
-          { conversation_id: IDS.direct, decision: 'reply' },
           { conversation_id: IDS.crew, decision: 'dismiss' },
+          { conversation_id: IDS.gone, decision: 'dismiss' },
         ]),
       client,
     })
-    expect(result.reply).toEqual([IDS.direct])
+    expect(result.outcome).toBe('decided')
     expect(result.recorded).toBe(1)
     expect(result.recordFailures).toHaveLength(1)
-    expect(result.recordFailures[0]?.conversation_id).toBe(IDS.direct)
+    expect(result.recordFailures[0]?.conversation_id).toBe(IDS.crew)
     expect(result.recordFailures[0]?.error.message).toMatch(/503/)
     expect(record).toHaveBeenCalledTimes(2)
   })
 
-  it('omits the category when the model gave none, and the anchor when the card has no preview', async () => {
+  it('omits the category when the model gave none, and anchors on last_message_id when the card has no preview', async () => {
     const tray = sampleTray()
-    tray.conversations[1]!.preview = null
+    tray.conversations[3] = { ...tray.conversations[3]!, preview: null, last_message_id: 'msg_gone0deleted01d' }
+    tray.conversations[1] = { ...tray.conversations[1]!, preview: null }
     const { client, record } = fakeClient()
     await run({
       tray,
-      callModel: async () => answer([{ conversation_id: IDS.crew, decision: 'dismiss', category: 'urgent' }]),
+      callModel: async () =>
+        answer([
+          { conversation_id: IDS.gone, decision: 'dismiss', category: 'urgent' },
+          { conversation_id: IDS.crew, decision: 'dismiss' },
+        ]),
       client,
     })
-    expect(record).toHaveBeenCalledWith(IDS.crew, {
+    expect(record).toHaveBeenNthCalledWith(1, IDS.gone, {
+      decision: 'dismiss',
+      category: undefined,
+      throughMessageId: 'msg_gone0deleted01d',
+    })
+    // Neither preview nor last_message_id: recorded unanchored.
+    expect(record).toHaveBeenNthCalledWith(2, IDS.crew, {
       decision: 'dismiss',
       category: undefined,
       throughMessageId: undefined,

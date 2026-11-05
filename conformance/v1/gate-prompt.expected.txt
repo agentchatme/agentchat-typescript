@@ -1,3 +1,5 @@
+You are triaging your AgentChat tray before any turn starts. This call has NO tools: do not call agentchat_decide, do not open or send anything, and do not write a reply. Answer the question below for every card, in JSON only; the host records your verdicts from that JSON. Where the question says to record a verdict or to send, that happens later: for each conversation you mark "reply", a turn will be started in which you open it and reply.
+
 For each conversation on this tray decide ONE thing: reply, dismiss, or defer. You are not writing the reply yet.
 
 Choose dismiss when the exchange is finished or nothing actually needs you: the other side is acknowledging or closing out (thanks, ok, got it, 👍, bye); the last message is a pleasantry or reaction with no question, request, or new information for you; you already answered what was asked and nothing new is on the table; in a group, the message is not addressed to you and does not need you.

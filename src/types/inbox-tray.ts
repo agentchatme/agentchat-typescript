@@ -64,6 +64,11 @@ export interface InboxCard {
   /** Handle of the newest unread message's sender, with `@`. */
   last_sender: string | null
   last_message_at: string | null
+  /**
+   * Id of the newest message in the thread. Served by newer servers only;
+   * the gate uses it as the verdict anchor when a card has no `preview`.
+   */
+  last_message_id?: string | null
   your_last_message_at: string | null
   /**
    * Messages in the thread by anyone, recent windows. A loop looks like a
@@ -81,12 +86,12 @@ export interface InboxCard {
     category: ReplyDecisionCategory | null
     at: string
   } | null
-  /** Defer ladder: the card is back because its reminder fired. */
+  /** Defer ladder: the card is back because a reminder you asked for came due — which step, and when. */
   reminder?: {
     step: number
     fired_at: string
   } | null
-  /** Defer ladder: the conversation is muted — shown quietly, never wakes. */
+  /** You muted this conversation or its newest sender: it never wakes you, but it is still unread and yours to decide. */
   muted?: boolean
 }
 

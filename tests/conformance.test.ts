@@ -74,8 +74,10 @@ describe('conformance — gate prompt', () => {
     expect(buildPrompt(tray) + '\n').toBe(raw('gate-prompt.expected.txt'))
   })
 
-  it('carries the server question verbatim', () => {
-    expect(buildPrompt(tray).startsWith(tray.question)).toBe(true)
+  it('carries the server question verbatim, after the tool-less preamble', () => {
+    const prompt = buildPrompt(tray)
+    expect(prompt).toContain(`\n\n${tray.question}\n\n`)
+    expect(prompt.indexOf(tray.question)).toBeGreaterThan(0)
   })
 })
 

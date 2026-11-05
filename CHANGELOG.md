@@ -33,12 +33,19 @@ code. The server contract is additive; nothing existing changes.
   `AckFrame`, `WakeHandler`.
 - `RealtimeClient` option `ackOnReceipt` — ack a `message.new` as soon as
   its frame is parsed, before handlers (the integration setting). Default
-  unchanged: ack after every handler settled.
+  unchanged: ack after every handler settled. Because an acked frame is
+  never re-offered, frames parked on a seq gap are handed to the handlers
+  when the socket closes (`onSequenceGap` reason `connection_closed`):
+  no loss, at the price of strict ordering across a drop.
 - `gate` namespace: `gate.buildPrompt(tray, { toolNamer? })`,
   `gate.parseVerdicts(text, tray)`, `gate.run({ tray, callModel, client, toolNamer? })`,
-  plus `gate.mcpToolNamer(serverName)` and `gate.canonicalJson`. No model
-  runs inside the SDK; `callModel` is injected. Fails closed: a failed or
-  unusable answer records nothing.
+  plus `gate.mcpToolNamer(serverName)`, `gate.anchorOf(card)` and
+  `gate.canonicalJson`. No model runs inside the SDK; `callModel` is
+  injected and must be a tool-less completion (the prompt opens with a
+  preamble saying so). `dismiss` / `defer` are recorded at once; each
+  `reply` comes back as `{ conversationId, card, category, record() }` and
+  is recorded only when the host calls `record()` after the turn has
+  started. Fails closed: a failed or unusable answer records nothing.
 - `conformance/v1/` — the shared cases every AgentChat SDK must pass
   (sample tray, expected gate prompt, verdict-parse cases, wake and ack
   frames); identical files ship in the Python SDK.

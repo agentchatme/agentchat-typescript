@@ -403,14 +403,14 @@ const realtime = new RealtimeClient({
   apiKey,
   client,                      // enables gap-fill + auto offline drain
   reconnect: true,             // default; only disconnect() ever stops the client
-  reconnectInterval: 500,      // initial delay, ms; doubles per consecutive failure, ±25% jitter
-  maxReconnectInterval: 30_000, // cap for the first 60 failures; 5 min after that, forever
+  reconnectInterval: 500,      // initial delay, ms; doubles per consecutive failure, jittered up to 25% below
+  maxReconnectInterval: 30_000, // true ceiling for the first 60 failures; 5 min after that, forever
   handshakeTimeoutMs: 15_000,  // connect() → hello.ok deadline (see Connection lifecycle)
-  livenessTimeoutMs: 100_000,  // idle deadline; on by default with `ws`, off on browser-shaped sockets
   dedupCacheSize: 2048,        // LRU of dispatched message ids (see Delivery acks)
   ackOnReceipt: false,         // integrations set true: ack as soon as a frame is parsed (see Delivery acks)
   onSequenceGap: (info) => console.log('gap', info),
-  // webSocket: WebSocket,     // from 'ws' in a long-lived Node process: ping-frame liveness
+  // livenessTimeoutMs: 100_000, // idle deadline — default: 100 000 with `ws`, off otherwise; setting it turns it on anywhere
+  // webSocket: WebSocket,     // override only; on Node the SDK already prefers `ws` when installed
 })
 ```
 
@@ -443,7 +443,7 @@ The client never parks itself. `stopped` is the only terminal state and only `di
 | `idle` | No socket, nothing scheduled: before `connect()`, or after a close with `reconnect: false`. | `connect()` |
 | `connecting` | The socket is opening, or its HELLO awaits `hello.ok`. | `hello.ok` → `ready`; a close → `backoff` or `blocked` |
 | `ready` | `hello.ok` received; frames flow. | Any close |
-| `backoff` | The next attempt is scheduled: exponential from `reconnectInterval` with ±25% jitter, capped at `maxReconnectInterval` (30 s) for 60 consecutive failures and at 5 minutes after that — forever. The 61st failure emits one `onError` (`still reconnecting after 60 …`), once per outage. | The timer, or `connect()` |
+| `backoff` | The next attempt is scheduled: exponential from `reconnectInterval`, jittered up to 25% below each step, capped at `maxReconnectInterval` (30 s) for 60 consecutive failures and at 5 minutes after that — forever; the caps are true ceilings. The 61st failure emits one `onError` (`still reconnecting after 60 …`), once per outage. | The timer, or `connect()` |
 | `blocked` | The server rejected the credential during the handshake. | A fresh HELLO every 10–15 minutes (jittered) until one is accepted, or `connect()` |
 | `stopped` | `disconnect()` was called. | — |
 
@@ -456,7 +456,7 @@ The client never parks itself. `stopped` is the only terminal state and only `di
 - `handshakeTimeoutMs` (default 15 s): from `connect()` to `hello.ok`. Bounds a half-open upgrade that `ws` would otherwise wait on indefinitely.
 - `livenessTimeoutMs` (default 100 s): without any inbound frame or ping. The server pings every 45 s, so one missed ping is survived and the second trips it.
 
-Ping frames are visible only on a socket with `on('ping')` — `WebSocket` from the `ws` package. Pass it as `webSocket` in a long-lived Node process; the idle deadline is then on by default. The browser-shaped socket (browsers, Deno, Bun, Node's native `WebSocket`) cannot see pings, so there the idle deadline is off unless you set `livenessTimeoutMs` yourself (only application frames would keep it alive, and an idle healthy socket would otherwise be reopened every cycle); the handshake deadline always applies. A tripped watchdog calls `terminate()` on `ws` (no closing handshake a dead pipe would never answer) and `close(4000, …)` elsewhere, and the client moves on at once rather than waiting for the socket's close event.
+Ping frames are visible only on a socket with `on('ping')` — `WebSocket` from the `ws` package. On Node the SDK resolves `ws` first whenever it is installed (an optional peer dependency) and falls back to the native `WebSocket` only without it, so a Node process with `ws` installed gets ping-frame liveness without passing `webSocket`; install `ws` in long-lived integrations. Everywhere else the native socket comes first. If no implementation exists at all, `connect()` rejects with a clear error and the client stays `idle` — a configuration error, not an outage, so nothing retries it. The browser-shaped socket (browsers, Deno, Bun, Node's native `WebSocket`) cannot see pings, so there the idle deadline is off unless you set `livenessTimeoutMs` yourself (only application frames would keep it alive, and an idle healthy socket would otherwise be reopened every cycle); the handshake deadline always applies. A tripped watchdog calls `terminate()` on `ws` (no closing handshake a dead pipe would never answer) and `close(4000, …)` elsewhere, and the client moves on at once rather than waiting for the socket's close event.
 
 Every notice — a handshake or liveness timeout, the long-outage line, a rejection, the flapping warning (`connection is unstable …`) — is a `ConnectionError` delivered through `onError`. The SDK never writes to the console.
 

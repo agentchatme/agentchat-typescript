@@ -1181,7 +1181,7 @@ describe('RealtimeClient — close classification (never a dead end)', () => {
 describe('RealtimeClient — no reconnect cap', () => {
   it('61+ consecutive failures: still reconnecting at the 5-minute cap, exactly one error', async () => {
     vi.useFakeTimers()
-    const random = vi.spyOn(Math, 'random').mockReturnValue(0.5) // jitter factor exactly 1
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0) // no jitter: delays sit exactly on the step
     const rt = new RealtimeClient({
       apiKey: 'k',
       webSocket: MockWebSocketCtor,
@@ -1542,6 +1542,146 @@ describe('RealtimeClient — state and capabilities', () => {
     expect(count(p.errors, /connection is unstable/)).toBe(1)
     expect(warn).not.toHaveBeenCalled()
     warn.mockRestore()
+    rt.disconnect()
+  })
+})
+
+describe('RealtimeClient — review hardening', () => {
+  // An observer that throws. Every notice is emitted right before the step
+  // that keeps the client alive (arming a timer, opening the next socket);
+  // the emitter isolates the throw so that step still runs.
+  const boom = (): void => {
+    throw new Error('observer exploded')
+  }
+
+  it('a throwing onError never parks the client: handshake deadline', async () => {
+    vi.useFakeTimers()
+    const rt = makeClient()
+    rt.onError(boom)
+    const p = probe(rt) // registered after boom: proves the loop went on
+    await rt.connect()
+    MockWebSocket.latest().simulateOpen()
+    await vi.advanceTimersByTimeAsync(15_000)
+    expect(rt.state).toBe('backoff')
+    expect(vi.getTimerCount()).toBeGreaterThan(0)
+    expect(count(p.errors, /handshake timeout/)).toBe(1)
+    await vi.advanceTimersByTimeAsync(100)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    rt.disconnect()
+  })
+
+  it('a throwing onError never parks the client: liveness deadline', async () => {
+    vi.useFakeTimers()
+    const rt = makeClient({ webSocket: MockNodeWebSocketCtor })
+    rt.onError(boom)
+    await rt.connect()
+    handshake(MockWebSocket.latest())
+    await vi.advanceTimersByTimeAsync(100_000)
+    expect(rt.state).toBe('backoff')
+    await vi.advanceTimersByTimeAsync(100)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    rt.disconnect()
+  })
+
+  it('a throwing onError never parks the client: long-outage notice', async () => {
+    vi.useFakeTimers()
+    const random = vi.spyOn(Math, 'random').mockReturnValue(0) // delays sit exactly on the step
+    const rt = makeClient({ reconnectInterval: 1, maxReconnectInterval: 1 })
+    rt.onError(boom)
+    await rt.connect()
+    for (let i = 1; i <= 61; i++) {
+      MockWebSocket.latest().simulateClose(1006, 'refused', false)
+      expect(rt.state).toBe('backoff')
+      await vi.advanceTimersByTimeAsync(i > 60 ? 300_000 : 1)
+      expect(MockWebSocket.instances).toHaveLength(i + 1)
+    }
+    random.mockRestore()
+    rt.disconnect()
+  })
+
+  it('a throwing onError never parks the client: blocked', async () => {
+    vi.useFakeTimers()
+    const rt = makeClient()
+    rt.onError(boom)
+    const p = probe(rt)
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateClose(1008, 'Invalid token', false)
+    expect(rt.state).toBe('blocked')
+    expect(p.blocked).toHaveLength(1)
+    expect(vi.getTimerCount()).toBe(1)
+    await vi.advanceTimersByTimeAsync(p.blocked[0]!.retryInMs!)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    rt.disconnect()
+  })
+
+  it('a throwing onError never parks the client: HELLO send failure', async () => {
+    vi.useFakeTimers()
+    class SendFails extends MockWebSocket {
+      send(data: string) {
+        if (MockWebSocket.instances.indexOf(this) === 0) throw new Error('EPIPE')
+        super.send(data)
+      }
+    }
+    const rt = makeClient({ webSocket: SendFails as unknown as typeof globalThis.WebSocket })
+    rt.onError(boom)
+    const p = probe(rt)
+    await rt.connect()
+    const first = MockWebSocket.latest()
+    first.simulateOpen()
+    expect(first.closed).toEqual({ code: 4000, reason: 'client HELLO send failed' })
+    expect(rt.state).toBe('backoff')
+    expect(p.disconnects[0]).toMatchObject({ initiator: 'client' })
+    await vi.advanceTimersByTimeAsync(100)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    handshake(MockWebSocket.latest())
+    expect(rt.state).toBe('ready')
+    rt.disconnect()
+  })
+
+  it('a 1008 with no reason (a polyfilled socket) is a transient close, not a crash', async () => {
+    vi.useFakeTimers()
+    const rt = makeClient()
+    const p = probe(rt)
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    // Straight to the handler: the mock's simulateClose would default the
+    // missing reason, which is exactly what a polyfilled socket does not do.
+    ws.readyState = 3
+    ws.onclose!({ type: 'close', code: 1008, reason: undefined, wasClean: false } as unknown as Event)
+    expect(rt.state).toBe('backoff')
+    expect(p.disconnects).toEqual([{ code: 1008, reason: '', wasClean: false, initiator: 'server' }])
+    await vi.advanceTimersByTimeAsync(100)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(isAuthRejectionClose(1008, undefined as unknown as string)).toBe(false)
+    rt.disconnect()
+  })
+
+  it('reconnect jitter stays at or below the documented caps', async () => {
+    vi.useFakeTimers()
+    // Most jitter: 25% below the step. Attempt 1: step 1 000 → 750.
+    const random = vi.spyOn(Math, 'random').mockReturnValue(1)
+    const rt = makeClient({ reconnectInterval: 1_000, maxReconnectInterval: 30_000 })
+    await rt.connect()
+    MockWebSocket.latest().simulateClose(1006, 'x', false)
+    await vi.advanceTimersByTimeAsync(749)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(MockWebSocket.instances).toHaveLength(2)
+
+    // Least jitter: exactly the step — never above it, including at the cap.
+    random.mockReturnValue(0)
+    for (let i = 2; i <= 7; i++) {
+      MockWebSocket.latest().simulateClose(1006, 'x', false)
+      const step = Math.min(1_000 * 2 ** (i - 1), 30_000)
+      await vi.advanceTimersByTimeAsync(step - 1)
+      expect(MockWebSocket.instances).toHaveLength(i)
+      await vi.advanceTimersByTimeAsync(1)
+      expect(MockWebSocket.instances).toHaveLength(i + 1)
+    }
+    random.mockRestore()
     rt.disconnect()
   })
 })

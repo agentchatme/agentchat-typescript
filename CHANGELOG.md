@@ -28,7 +28,7 @@ daemon's `livenessWebSocket` shim. Integrations keep only runtime code.
   `hello.ok`) and `livenessTimeoutMs` (default 100 s without an inbound frame
   or ping; the server pings every 45 s, so one missed ping is survived).
   Ping frames count on a socket that exposes them (`WebSocket` from `ws`,
-  passed as `webSocket`); on a browser-shaped socket the idle deadline is off
+  which the resolver now prefers on Node); on a browser-shaped socket the idle deadline is off
   unless set, because it cannot see pings and an idle healthy socket would
   otherwise be reopened every cycle. A tripped watchdog ends the socket as a
   client-initiated close — `terminate()` on `ws`, `close(4000, …)` elsewhere
@@ -42,10 +42,24 @@ daemon's `livenessWebSocket` shim. Integrations keep only runtime code.
 ### Changed
 
 - No reconnect cap. `maxReconnectAttempts` is ignored (deprecated, kept so
-  call sites compile). Backoff is exponential with ±25% jitter, capped at
-  `maxReconnectInterval` (30 s) for 60 consecutive failures and at five
-  minutes after that, forever; the 61st failure emits one `onError`
-  (`still reconnecting after 60 …`), once per outage.
+  call sites compile). Backoff is exponential, jittered up to 25% below
+  each step, capped at `maxReconnectInterval` (30 s) for 60 consecutive
+  failures and at five minutes after that, forever — the caps are true
+  ceilings; the 61st failure emits one `onError` (`still reconnecting after
+  60 …`), once per outage.
+- `resolveWebSocket()`: on Node, `ws` is preferred whenever it is installed
+  and the native `WebSocket` is the fallback (previously native first). The
+  native socket exposes no ping frames, so a long-lived integration on
+  Node 22 that never passed `webSocket` had no idle watchdog at all.
+  Browsers, Deno, Bun and edge runtimes still get their native socket
+  first. With no implementation anywhere, `connect()` rejects with a clear
+  error and the client stays `idle`: a configuration error, not an outage
+  (previously it entered the retry loop and emitted the same error every
+  backoff).
+- `onError` handlers are isolated like every other hook: a throwing handler
+  no longer breaks the step that follows the notice (arming the next timer,
+  opening the next socket). A close whose `reason` is missing (a polyfilled
+  socket) is handled as an empty reason.
 - A close the client itself initiated — handshake deadline, liveness
   deadline, a HELLO that could not be sent — is never read as a verdict from
   the server, and the client moves on at once instead of waiting for the

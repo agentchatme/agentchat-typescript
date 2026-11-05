@@ -119,7 +119,8 @@ export interface RealtimeOptions {
   reconnect?: boolean
   /**
    * Initial reconnect delay in milliseconds. Each consecutive failure
-   * doubles it (±25% jitter) up to `maxReconnectInterval`. Default: 500ms.
+   * doubles it, jittered up to 25% below the step, up to
+   * `maxReconnectInterval` (a true ceiling). Default: 500ms.
    */
   reconnectInterval?: number
   /**
@@ -203,11 +204,12 @@ export interface RealtimeOptions {
    * browser WebSocket shape (`onopen/onmessage/onclose/onerror`, `send`,
    * `close`, `readyState`) works.
    *
-   * Long-lived Node integrations should pass `WebSocket` from the `ws`
-   * package: it exposes the server's ping frames (`on('ping')`), which lets
-   * the liveness watchdog tell a quiet-but-healthy socket from a dead one.
-   * The browser-shaped socket (including Node's native one) cannot see
-   * pings — see `livenessTimeoutMs`.
+   * On Node the default resolution prefers `WebSocket` from the `ws`
+   * package when it is installed and falls back to the native socket only
+   * without it: `ws` exposes the server's ping frames (`on('ping')`), which
+   * lets the liveness watchdog tell a quiet-but-healthy socket from a dead
+   * one. The browser-shaped socket (including Node's native one) cannot see
+   * pings — see `livenessTimeoutMs`. Pass a constructor only to override.
    */
   webSocket?: typeof globalThis.WebSocket
   /**
@@ -258,7 +260,11 @@ const CLIENT_CLOSE_CODE = 4000
 const LONG_OUTAGE_AFTER_ATTEMPTS = 60
 const LONG_OUTAGE_MAX_INTERVAL_MS = 5 * 60_000
 
-/** ±25% on reconnect delays: a fleet that drops together spreads back out. */
+/**
+ * Reconnect delays are jittered up to 25% BELOW each step: a fleet that
+ * drops together spreads back out, and the documented caps stay true
+ * ceilings (30 s, then 5 min — never 37.5 s or 6.25 min).
+ */
 const RECONNECT_JITTER_RATIO = 0.25
 
 /**
@@ -293,6 +299,7 @@ const SERVER_AUTH_CLOSE_REASONS: readonly string[] = ['invalid token']
 export function isAuthRejectionClose(code: number, reason: string): boolean {
   if (UNAMBIGUOUS_AUTH_CLOSE_CODES.has(code)) return true
   if (code !== AMBIGUOUS_AUTH_CLOSE_CODE) return false
+  if (typeof reason !== 'string') return false
   const lower = reason.toLowerCase()
   return SERVER_AUTH_CLOSE_REASONS.some((known) => lower.includes(known))
 }
@@ -564,7 +571,9 @@ export class RealtimeClient {
    * Also the way to retry at once: called while `backoff` or `blocked`, it
    * cancels the pending timer and opens a socket now. A no-op while a socket
    * is already connecting or connected. Throws after `disconnect()` — create
-   * a fresh `RealtimeClient` instead.
+   * a fresh `RealtimeClient` instead. Rejects, without retrying, when no
+   * WebSocket implementation exists (neither `ws` nor a native one): that is
+   * a configuration error and the client stays `idle`.
    */
   async connect(): Promise<void> {
     if (this.disposed) {
@@ -577,10 +586,11 @@ export class RealtimeClient {
     try {
       WebSocketCtor = this.options.webSocket ?? (await resolveWebSocket())
     } catch (err) {
-      const error = err instanceof Error ? err : new ConnectionError('Failed to resolve WebSocket')
-      this.emitError(error)
-      this.scheduleReconnect()
-      throw error
+      // No WebSocket implementation anywhere is a configuration error, not
+      // an outage: nothing a retry could change. Reject so the caller sees
+      // it, and stay idle rather than announce the same error every backoff.
+      this.setState('idle')
+      throw err instanceof Error ? err : new ConnectionError('Failed to resolve WebSocket')
     }
     // disconnect() or a concurrent connect() may have run during the await.
     if (this.disposed || this.ws) return
@@ -725,7 +735,9 @@ export class RealtimeClient {
       this.ws = null
       this.handleClose({
         code: event.code,
-        reason: event.reason,
+        // A polyfilled socket may omit the reason; the rejection rule
+        // lowercases it, so it must be a string here.
+        reason: String(event.reason ?? ''),
         wasClean: event.wasClean,
         initiator: 'server',
       })
@@ -1088,9 +1100,7 @@ export class RealtimeClient {
     this.setState('backoff')
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
-      // connect() emits its own error and schedules the next attempt when
-      // it fails; nothing to add here.
-      void this.connect().catch(() => {})
+      this.retryNow()
     }, delay)
   }
 
@@ -1129,8 +1139,22 @@ export class RealtimeClient {
     if (retryInMs === null) return
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
-      void this.connect().catch(() => {})
+      this.retryNow()
     }, retryInMs)
+  }
+
+  /**
+   * The timer-driven attempt. connect() emits and re-arms on its own for
+   * every failure it retries (a throwing constructor, a close); the one
+   * failure it does not retry — no WebSocket implementation at all — left
+   * nothing armed, so it is announced here: the operator should see why the
+   * client went quiet.
+   */
+  private retryNow(): void {
+    void this.connect().catch((err) => {
+      if (this.disposed || this.ws || this.reconnectTimer) return
+      this.emitError(err instanceof Error ? err : new ConnectionError(String(err)))
+    })
   }
 
   private clearReconnectTimer(): void {
@@ -1146,16 +1170,22 @@ export class RealtimeClient {
     // minutes instead of every `maxReconnectInterval`, for as long as it takes.
     const cap =
       attempt > LONG_OUTAGE_AFTER_ATTEMPTS ? this.longOutageCap() : this.options.maxReconnectInterval
-    return this.jittered(Math.min(exp, cap), RECONNECT_JITTER_RATIO)
+    return this.jitteredBelow(Math.min(exp, cap), RECONNECT_JITTER_RATIO)
   }
 
   private longOutageCap(): number {
     return Math.max(this.options.maxReconnectInterval, LONG_OUTAGE_MAX_INTERVAL_MS)
   }
 
-  /** Symmetric ±ratio jitter: thundering-herd-safe across a fleet. */
+  /** Symmetric ±ratio jitter around `ms` — for the blocked retry, a range (10–15 min), not a cap. */
   private jittered(ms: number, ratio: number): number {
     const factor = 1 - ratio + Math.random() * 2 * ratio
+    return Math.max(0, Math.floor(ms * factor))
+  }
+
+  /** Jitter in [ms × (1 − ratio), ms]: `ms` is a ceiling. Thundering-herd-safe across a fleet. */
+  private jitteredBelow(ms: number, ratio: number): number {
+    const factor = 1 - Math.random() * ratio
     return Math.max(0, Math.floor(ms * factor))
   }
 
@@ -1398,7 +1428,11 @@ export class RealtimeClient {
 
   private emitError(error: Error): void {
     for (const handler of this.errorHandlers) {
-      handler(error)
+      // Every notice is emitted right before the step that keeps the client
+      // alive (arming a timer, opening the next socket). A throwing observer
+      // must not take that step with it — that would be the one way into a
+      // parked client.
+      try { handler(error) } catch { /* user hook must not break flow */ }
     }
   }
 

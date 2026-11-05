@@ -51,6 +51,10 @@ export interface SequenceGapInfo {
     | 'gap_fill_failed'
     | 'gap_fill_unavailable'
     | 'buffer_overflow'
+    // ackOnReceipt only: the socket closed while frames sat in the gap
+    // buffer. They were already acknowledged, so they were handed to the
+    // handlers in seq order instead of being dropped (see the option).
+    | 'connection_closed'
 }
 
 export type SequenceGapHandler = (info: SequenceGapInfo) => void
@@ -124,6 +128,15 @@ export interface RealtimeOptions {
    * rows; the REST offline drain keeps its settle-then-ack cursor. Default
    * `false`: ack after every handler settled, for app clients whose
    * handler IS the processing.
+   *
+   * Trade-off: an acked frame is never re-offered by the server, so a frame
+   * that is parked on a seq gap when the socket drops is handed to the
+   * handlers at close time, in seq order but possibly ahead of the seqs it
+   * was waiting for (which arrive after the reconnect). Ack-on-receipt
+   * trades strict ordering across a connection drop for no loss; the
+   * default mode keeps ordering because unacked frames come back in order
+   * on the next drain. Such a flush fires `onSequenceGap` with
+   * `reason: 'connection_closed'`.
    */
   ackOnReceipt?: boolean
   /**
@@ -520,6 +533,15 @@ export class RealtimeClient {
         } catch { /* user hook must not break flow */ }
       }
 
+      // Ack-on-receipt: every frame parked on a seq gap was acknowledged at
+      // parse, so the server has it `delivered` and will never re-offer it.
+      // Dropping the buffer here would lose it for good — the exact loss the
+      // ack protocol exists to prevent. Hand the parked frames to the
+      // handlers now, in seq order, before the state goes. Default mode
+      // skips this: its parked frames are unacked and come back in order on
+      // the next drain.
+      if (this.options.ackOnReceipt) this.flushParkedFrames('connection_closed')
+
       // Drop all per-conversation ordering state. Across the connection
       // break the application is responsible for calling /sync (or
       // enabling `autoDrainOnConnect`), which re-establishes the cursor
@@ -910,7 +932,7 @@ export class RealtimeClient {
     // Flush any buffered envelopes synchronously so the caller doesn't
     // miss them after disconnect(). No gap-fill — we're tearing down,
     // and an in-flight HTTP request would race the close.
-    this.drainAllPendingForShutdown()
+    this.flushParkedFrames('gap_fill_unavailable')
     try { this.ws?.close() } catch { /* already closed */ }
     this.ws = null
     this.authenticated = false
@@ -1402,7 +1424,11 @@ export class RealtimeClient {
     this.orderStates.clear()
   }
 
-  private drainAllPendingForShutdown(): void {
+  // Hand every parked frame to the handlers in seq order per conversation,
+  // cancel the gap timers and clear the ordering state. Used when frames
+  // must not be dropped: on disconnect() (the caller is leaving) and, under
+  // ackOnReceipt, on every socket close (the frames are already acked).
+  private flushParkedFrames(reason: SequenceGapInfo['reason']): void {
     for (const [conversationId, state] of this.orderStates) {
       if (state.gapTimer !== null) {
         clearTimeout(state.gapTimer)
@@ -1418,7 +1444,7 @@ export class RealtimeClient {
         bufferedSeq: seqs[0] ?? null,
         gapMs: state.gapStartedAt !== null ? Date.now() - state.gapStartedAt : 0,
         recovered: false,
-        reason: 'gap_fill_unavailable',
+        reason,
       })
     }
     this.orderStates.clear()

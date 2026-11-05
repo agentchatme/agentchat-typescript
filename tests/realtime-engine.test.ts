@@ -360,6 +360,112 @@ describe('RealtimeClient — ackOnReceipt', () => {
   })
 })
 
+describe('RealtimeClient — stored rows older than the live anchor', () => {
+  // The server registers a socket and THEN drains the stored backlog, so a
+  // live frame (seq 5) can anchor a conversation before the drain brings
+  // stored seqs 3 and 4. Those are below the anchor but were never
+  // dispatched; dropping them would lose them because the ack marks them
+  // delivered for good.
+
+  it.each([false, true])(
+    'backlog pushed over the socket after a live anchor is dispatched and acked once (ackOnReceipt=%s)',
+    async (ackOnReceipt) => {
+      const { rt, ws } = await connected({ ackOnReceipt })
+      const dispatched: number[] = []
+      rt.on('message.new', (m) => void dispatched.push((m.payload as { seq: number }).seq))
+
+      ws.simulateMessage(messageNew('c', 5)) // live fan-out beats the drain
+      ws.simulateMessage(messageNew('c', 3)) // server's reconnect drain, stored rows
+      ws.simulateMessage(messageNew('c', 4))
+      await settle()
+
+      expect(dispatched).toEqual([5, 3, 4])
+      expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_5', 'msg_3', 'msg_4'])
+      rt.disconnect()
+    },
+  )
+
+  it.each([false, true])(
+    'REST drain rows below the live anchor are dispatched before the cursor covers them (ackOnReceipt=%s)',
+    async (ackOnReceipt) => {
+      let resolveSync!: (rows: Record<string, unknown>[]) => void
+      const sync = vi
+        .fn()
+        .mockImplementationOnce(() => new Promise<Record<string, unknown>[]>((r) => (resolveSync = r)))
+      const syncAck = vi.fn(async () => ({ acked: 2 }))
+      const client = { getMessages: vi.fn(), sync, syncAck } as unknown as AgentChatClient
+      const rt = new RealtimeClient({
+        apiKey: 'k',
+        webSocket: MockWebSocketCtor,
+        reconnect: false,
+        ackOnReceipt,
+        client,
+      })
+      const dispatched: string[] = []
+      rt.on('message.new', (m) => void dispatched.push(String(m.payload.id)))
+      await rt.connect()
+      const ws = MockWebSocket.latest()
+      ws.simulateOpen()
+      ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] }) // drain starts, waits on sync
+
+      ws.simulateMessage(messageNew('c', 5)) // live frame anchors c at 5
+      resolveSync([syncRow('c', 3), syncRow('c', 4)])
+      await settle()
+
+      expect(dispatched).toEqual(['msg_5', 'msg_c_3', 'msg_c_4'])
+      expect(syncAck).toHaveBeenCalledWith(syncRow('c', 4).delivery_id)
+      // Drain rows are covered by the cursor, never by a WS ack frame.
+      expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_5'])
+      rt.disconnect()
+    },
+  )
+
+  it('a true repeat below the anchor (same message id) is skipped and acked once more', async () => {
+    const { rt, ws } = await connected()
+    const onMessage = vi.fn()
+    rt.on('message.new', onMessage)
+
+    ws.simulateMessage(messageNew('c', 5))
+    ws.simulateMessage(messageNew('c', 6))
+    await settle()
+    ws.simulateMessage(messageNew('c', 5)) // server double-publish / lost ack
+    await settle()
+
+    expect(onMessage).toHaveBeenCalledTimes(2)
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_5', 'msg_6', 'msg_5'])
+    rt.disconnect()
+  })
+
+  it('a seq skipped by a failed gap-fill that arrives late is dispatched, not dropped', async () => {
+    vi.useFakeTimers()
+    const onGap = vi.fn()
+    const rt = new RealtimeClient({
+      apiKey: 'k',
+      webSocket: MockWebSocketCtor,
+      reconnect: false,
+      onSequenceGap: onGap, // no client → gap-fill unavailable
+    })
+    const dispatched: number[] = []
+    rt.on('message.new', (m) => void dispatched.push((m.payload as { seq: number }).seq))
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+
+    ws.simulateMessage(messageNew('c', 1))
+    ws.simulateMessage(messageNew('c', 3))
+    await vi.advanceTimersByTimeAsync(2_100) // gap window lapses; 3 is released, 2 skipped
+    expect(dispatched).toEqual([1, 3])
+    expect(onGap).toHaveBeenCalledOnce()
+
+    ws.simulateMessage(messageNew('c', 2)) // the skipped seq finally arrives
+    await vi.advanceTimersByTimeAsync(0)
+    expect(dispatched).toEqual([1, 3, 2])
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_1', 'msg_3', 'msg_2'])
+    rt.disconnect()
+  })
+})
+
 describe('RealtimeClient — a guest in a host process', () => {
   it('runs two instances side by side; closing one leaves the other untouched', async () => {
     vi.useFakeTimers()

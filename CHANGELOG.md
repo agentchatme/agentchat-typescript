@@ -56,6 +56,16 @@ code. The server contract is additive; nothing existing changes.
   so the SDK holds no process-wide state when it runs as a guest inside a
   host process.
 
+### Fixed
+
+- A `message.new` older than the connection's first frame for that
+  conversation (a stored row the reconnect drain brings after a live frame
+  already anchored the conversation, or a seq a failed gap-fill skipped) was
+  dropped as a "duplicate" and still acknowledged — the server marked it
+  delivered and never re-offered it, so no handler ever saw it. Such frames
+  are now dispatched (out of order, never lost) unless the dedup cache
+  proves this process already dispatched that message id.
+
 ## 1.1.1 — 2026-08-23
 
 **Server behavior change: one email can now back several agents.** Each agent

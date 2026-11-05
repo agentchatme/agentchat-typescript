@@ -696,10 +696,11 @@ export class RealtimeClient {
             break
           }
           // Reaching here means the row is safe to cover with the cursor:
-          // either its dispatch settled cleanly, or the ordered pipeline
-          // dropped it as a below-anchor duplicate (drain/live overlap) —
-          // it will never be dispatched this session, and acking it stops
-          // the server from re-offering it forever.
+          // its dispatch settled cleanly, or it was a dedup hit (already
+          // dispatched by this process — prior processing is the proof).
+          // Every drain row that is not parked on a seq gap reaches
+          // dispatchMessageNew, below-anchor rows included, so a settlement
+          // always exists for it.
           const deliveryId = row.delivery_id
           if (typeof deliveryId === 'string' && deliveryId.length > 0) {
             ackCursor = deliveryId
@@ -1117,9 +1118,12 @@ export class RealtimeClient {
   // ─── Per-conversation seq ordering ───────────────────────────────────────
   //
   // Invariant: for any conversation_id, handlers see message.new envelopes
-  // strictly in seq-ascending order with no skipped or repeated seqs (modulo
-  // the gap-fill failure path, where we surface the incident via
-  // onSequenceGap and continue forward).
+  // in seq-ascending order with no skipped or repeated seqs — except that a
+  // frame older than this connection's anchor (a stored row the drain brings
+  // after a live frame anchored the conversation, or a seq a failed gap-fill
+  // skipped) is dispatched late rather than dropped: never lost beats
+  // strictly ordered, since the ack would otherwise bury it for good. The
+  // dedup cache alone decides what is a repeat.
   //
   // Why per-conversation instead of global: seq numbers are minted per
   // conversation by send_message_atomic, so cross-conversation arrivals
@@ -1157,9 +1161,19 @@ export class RealtimeClient {
     }
 
     if (seq < state.nextExpectedSeq) {
-      // Duplicate — usually a drain↔live-fanout race after reconnect, or
-      // a server-side double-publish. We've already dispatched this seq
-      // (or skipped it during a gap-fill failure), so drop silently.
+      // Below the anchor. With a first-arrival anchor this means "older
+      // than the first frame this connection saw", NOT "already
+      // dispatched": the server registers a socket before it drains the
+      // stored backlog, so a live frame can anchor a conversation at seq 5
+      // and the drain then brings stored seqs 3 and 4 that no handler has
+      // ever seen. Dropping them here would lose them: the drain cursor (or
+      // the ack-on-receipt frame) marks them delivered and the server never
+      // re-offers them. The same holds for a seq skipped by a failed
+      // gap-fill that arrives late. So hand the frame to dispatch, where the
+      // dedup cache — the only evidence of a prior dispatch — decides: a hit
+      // skips the handlers and acks, a miss dispatches (out of order, never
+      // lost) and acks after.
+      this.dispatch(message)
       return
     }
 

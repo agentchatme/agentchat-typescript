@@ -51,6 +51,10 @@ export interface SequenceGapInfo {
     | 'gap_fill_failed'
     | 'gap_fill_unavailable'
     | 'buffer_overflow'
+    // ackOnReceipt only: the socket closed while frames sat in the gap
+    // buffer. They were already acknowledged, so they were handed to the
+    // handlers in seq order instead of being dropped (see the option).
+    | 'connection_closed'
 }
 
 export type SequenceGapHandler = (info: SequenceGapInfo) => void
@@ -124,6 +128,15 @@ export interface RealtimeOptions {
    * rows; the REST offline drain keeps its settle-then-ack cursor. Default
    * `false`: ack after every handler settled, for app clients whose
    * handler IS the processing.
+   *
+   * Trade-off: an acked frame is never re-offered by the server, so a frame
+   * that is parked on a seq gap when the socket drops is handed to the
+   * handlers at close time, in seq order but possibly ahead of the seqs it
+   * was waiting for (which arrive after the reconnect). Ack-on-receipt
+   * trades strict ordering across a connection drop for no loss; the
+   * default mode keeps ordering because unacked frames come back in order
+   * on the next drain. Such a flush fires `onSequenceGap` with
+   * `reason: 'connection_closed'`.
    */
   ackOnReceipt?: boolean
   /**
@@ -520,6 +533,15 @@ export class RealtimeClient {
         } catch { /* user hook must not break flow */ }
       }
 
+      // Ack-on-receipt: every frame parked on a seq gap was acknowledged at
+      // parse, so the server has it `delivered` and will never re-offer it.
+      // Dropping the buffer here would lose it for good — the exact loss the
+      // ack protocol exists to prevent. Hand the parked frames to the
+      // handlers now, in seq order, before the state goes. Default mode
+      // skips this: its parked frames are unacked and come back in order on
+      // the next drain.
+      if (this.options.ackOnReceipt) this.flushParkedFrames('connection_closed')
+
       // Drop all per-conversation ordering state. Across the connection
       // break the application is responsible for calling /sync (or
       // enabling `autoDrainOnConnect`), which re-establishes the cursor
@@ -674,10 +696,11 @@ export class RealtimeClient {
             break
           }
           // Reaching here means the row is safe to cover with the cursor:
-          // either its dispatch settled cleanly, or the ordered pipeline
-          // dropped it as a below-anchor duplicate (drain/live overlap) —
-          // it will never be dispatched this session, and acking it stops
-          // the server from re-offering it forever.
+          // its dispatch settled cleanly, or it was a dedup hit (already
+          // dispatched by this process — prior processing is the proof).
+          // Every drain row that is not parked on a seq gap reaches
+          // dispatchMessageNew, below-anchor rows included, so a settlement
+          // always exists for it.
           const deliveryId = row.delivery_id
           if (typeof deliveryId === 'string' && deliveryId.length > 0) {
             ackCursor = deliveryId
@@ -910,7 +933,7 @@ export class RealtimeClient {
     // Flush any buffered envelopes synchronously so the caller doesn't
     // miss them after disconnect(). No gap-fill — we're tearing down,
     // and an in-flight HTTP request would race the close.
-    this.drainAllPendingForShutdown()
+    this.flushParkedFrames('gap_fill_unavailable')
     try { this.ws?.close() } catch { /* already closed */ }
     this.ws = null
     this.authenticated = false
@@ -1095,9 +1118,12 @@ export class RealtimeClient {
   // ─── Per-conversation seq ordering ───────────────────────────────────────
   //
   // Invariant: for any conversation_id, handlers see message.new envelopes
-  // strictly in seq-ascending order with no skipped or repeated seqs (modulo
-  // the gap-fill failure path, where we surface the incident via
-  // onSequenceGap and continue forward).
+  // in seq-ascending order with no skipped or repeated seqs — except that a
+  // frame older than this connection's anchor (a stored row the drain brings
+  // after a live frame anchored the conversation, or a seq a failed gap-fill
+  // skipped) is dispatched late rather than dropped: never lost beats
+  // strictly ordered, since the ack would otherwise bury it for good. The
+  // dedup cache alone decides what is a repeat.
   //
   // Why per-conversation instead of global: seq numbers are minted per
   // conversation by send_message_atomic, so cross-conversation arrivals
@@ -1135,9 +1161,19 @@ export class RealtimeClient {
     }
 
     if (seq < state.nextExpectedSeq) {
-      // Duplicate — usually a drain↔live-fanout race after reconnect, or
-      // a server-side double-publish. We've already dispatched this seq
-      // (or skipped it during a gap-fill failure), so drop silently.
+      // Below the anchor. With a first-arrival anchor this means "older
+      // than the first frame this connection saw", NOT "already
+      // dispatched": the server registers a socket before it drains the
+      // stored backlog, so a live frame can anchor a conversation at seq 5
+      // and the drain then brings stored seqs 3 and 4 that no handler has
+      // ever seen. Dropping them here would lose them: the drain cursor (or
+      // the ack-on-receipt frame) marks them delivered and the server never
+      // re-offers them. The same holds for a seq skipped by a failed
+      // gap-fill that arrives late. So hand the frame to dispatch, where the
+      // dedup cache — the only evidence of a prior dispatch — decides: a hit
+      // skips the handlers and acks, a miss dispatches (out of order, never
+      // lost) and acks after.
+      this.dispatch(message)
       return
     }
 
@@ -1402,7 +1438,11 @@ export class RealtimeClient {
     this.orderStates.clear()
   }
 
-  private drainAllPendingForShutdown(): void {
+  // Hand every parked frame to the handlers in seq order per conversation,
+  // cancel the gap timers and clear the ordering state. Used when frames
+  // must not be dropped: on disconnect() (the caller is leaving) and, under
+  // ackOnReceipt, on every socket close (the frames are already acked).
+  private flushParkedFrames(reason: SequenceGapInfo['reason']): void {
     for (const [conversationId, state] of this.orderStates) {
       if (state.gapTimer !== null) {
         clearTimeout(state.gapTimer)
@@ -1418,7 +1458,7 @@ export class RealtimeClient {
         bufferedSeq: seqs[0] ?? null,
         gapMs: state.gapStartedAt !== null ? Date.now() - state.gapStartedAt : 0,
         recovered: false,
-        reason: 'gap_fill_unavailable',
+        reason,
       })
     }
     this.orderStates.clear()

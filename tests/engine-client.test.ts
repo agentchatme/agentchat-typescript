@@ -9,6 +9,7 @@ interface Captured {
   url: string
   method: string
   body: unknown
+  headers: Record<string, string>
   signal: AbortSignal | null | undefined
 }
 
@@ -19,6 +20,7 @@ function capture(response: () => Response) {
       url: String(input),
       method: init?.method ?? 'GET',
       body: typeof init?.body === 'string' ? JSON.parse(init.body) : init?.body,
+      headers: Object.fromEntries(new Headers(init?.headers).entries()),
       signal: init?.signal,
     })
     return response()
@@ -183,6 +185,22 @@ describe('client.decisions.record', () => {
     await client.decisions.record('conv/odd id', { decision: 'defer' })
     expect(calls[0]?.url).toBe('https://api.test/v1/conversations/conv%2Fodd%20id/decisions')
   })
+
+  it('takes call options in the same object and keeps them off the wire', async () => {
+    const { fetch, calls } = capture(() => json(201, { decision }))
+    const client = new AgentChatClient({ apiKey: 'k', baseUrl: 'https://api.test', fetch })
+    const controller = new AbortController()
+    await client.decisions.record('conv_1', {
+      decision: 'dismiss',
+      throughMessageId: 'msg_1',
+      idempotencyKey: 'idem-123',
+      signal: controller.signal,
+      timeoutMs: 5_000,
+    })
+    expect(calls[0]?.body).toEqual({ decision: 'dismiss', through_message_id: 'msg_1' })
+    expect(calls[0]?.headers['idempotency-key']).toBe('idem-123')
+    expect(calls[0]?.signal).toBeDefined()
+  })
 })
 
 describe('client.conversations.markRead', () => {
@@ -219,7 +237,7 @@ describe('client.texts.get', () => {
     }
     const { fetch, calls } = capture(() => json(200, texts))
     const client = new AgentChatClient({ apiKey: 'k', baseUrl: 'https://api.test', fetch })
-    const result = await client.texts.get({ runtime: 'claude-code' })
+    const result = await client.texts.get({ runtime: 'claude-code', timeoutMs: 5_000 })
     expect(result).toEqual(texts)
     expect(calls[0]?.method).toBe('GET')
     expect(calls[0]?.url).toBe('https://api.test/v1/texts?runtime=claude-code')

@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { RealtimeClient } from '../src/realtime.js'
-import type { WakeFrame } from '../src/types/index.js'
+import type { AgentChatClient } from '../src/client.js'
+import type { Message, WakeFrame } from '../src/types/index.js'
 import {
   MockWebSocket,
   MockWebSocketCtor,
@@ -12,7 +13,19 @@ import {
 // ─── wake frames, ack-on-receipt, several instances per process ────────────
 
 beforeEach(() => MockWebSocket.reset())
-afterEach(() => vi.useRealTimers())
+afterEach(() => {
+  vi.useRealTimers()
+  vi.unstubAllGlobals()
+})
+
+// One bare-array row as `GET /v1/messages/sync` ships it.
+function syncRow(conversationId: string, seq: number): Record<string, unknown> {
+  return {
+    ...(messageNew(conversationId, seq).payload as Record<string, unknown>),
+    id: `msg_${conversationId}_${seq}`,
+    delivery_id: `del_${seq.toString(16).padStart(32, '0')}`,
+  }
+}
 
 async function connected(options: Partial<ConstructorParameters<typeof RealtimeClient>[0]> = {}) {
   const rt = new RealtimeClient({
@@ -207,6 +220,250 @@ describe('RealtimeClient — ackOnReceipt', () => {
     expect(sentFrames(ws, 'ack')).toEqual([{ type: 'ack', message_id: 'msg_1' }])
     rt.disconnect()
   })
+
+  it('hands an acked frame parked on a seq gap to the handlers when the socket drops (1006)', async () => {
+    const onGap = vi.fn()
+    const { rt, ws } = await connected({ ackOnReceipt: true, onSequenceGap: onGap })
+    const dispatched: number[] = []
+    rt.on('message.new', (m) => void dispatched.push((m.payload as { seq: number }).seq))
+
+    ws.simulateMessage(messageNew('c', 1))
+    ws.simulateMessage(messageNew('c', 3)) // parked; already acked
+    await settle()
+    expect(dispatched).toEqual([1])
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_1', 'msg_3'])
+
+    // The server has msg_3 as delivered and will never re-offer it. An
+    // abnormal close must not drop it with the ordering state.
+    ws.simulateClose(1006, 'abnormal', false)
+    await settle()
+    expect(dispatched).toEqual([1, 3])
+    expect(onGap).toHaveBeenCalledTimes(1)
+    expect(onGap.mock.calls[0]?.[0]).toMatchObject({
+      conversationId: 'c',
+      expectedSeq: 2,
+      bufferedSeq: 3,
+      recovered: false,
+      reason: 'connection_closed',
+    })
+    // No second ack: it was acked at receipt.
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_1', 'msg_3'])
+    rt.disconnect()
+  })
+
+  it('in default mode a parked frame is dropped on close: unacked, the server re-offers it in order', async () => {
+    const onGap = vi.fn()
+    const { rt, ws } = await connected({ onSequenceGap: onGap })
+    const dispatched: number[] = []
+    rt.on('message.new', (m) => void dispatched.push((m.payload as { seq: number }).seq))
+
+    ws.simulateMessage(messageNew('c', 1))
+    ws.simulateMessage(messageNew('c', 3))
+    await settle()
+    ws.simulateClose(1006, 'abnormal', false)
+    await settle()
+
+    expect(dispatched).toEqual([1])
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_1'])
+    expect(onGap).not.toHaveBeenCalled()
+    rt.disconnect()
+  })
+
+  it('acks a gap-filled row when it is fetched, dispatches in order, never acks it twice', async () => {
+    vi.useFakeTimers()
+    const getMessages = vi.fn(async (): Promise<Message[]> => [
+      messageNew('c', 2).payload as unknown as Message,
+    ])
+    const client = { getMessages, sync: vi.fn(), syncAck: vi.fn() } as unknown as AgentChatClient
+    const onGap = vi.fn()
+    const rt = new RealtimeClient({
+      apiKey: 'k',
+      webSocket: MockWebSocketCtor,
+      reconnect: false,
+      ackOnReceipt: true,
+      client,
+      autoDrainOnConnect: false,
+      onSequenceGap: onGap,
+    })
+    const dispatched: number[] = []
+    rt.on('message.new', (m) => void dispatched.push((m.payload as { seq: number }).seq))
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+
+    ws.simulateMessage(messageNew('c', 1))
+    ws.simulateMessage(messageNew('c', 3))
+    expect(dispatched).toEqual([1])
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_1', 'msg_3'])
+
+    await vi.advanceTimersByTimeAsync(2_100) // past the gap window
+    await vi.runAllTimersAsync()
+
+    expect(getMessages).toHaveBeenCalledOnce()
+    expect(dispatched).toEqual([1, 2, 3])
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_1', 'msg_3', 'msg_2'])
+    expect(onGap.mock.calls[0]?.[0]).toMatchObject({ recovered: true, reason: 'gap_filled' })
+    rt.disconnect()
+  })
+
+  it('keeps the REST drain on its settle-then-ack cursor: no WS acks for drained rows', async () => {
+    const sync = vi.fn(async () => [syncRow('c', 1), syncRow('c', 2)])
+    const syncAck = vi.fn(async () => ({ acked: 2 }))
+    const client = { getMessages: vi.fn(), sync, syncAck } as unknown as AgentChatClient
+    const rt = new RealtimeClient({
+      apiKey: 'k',
+      webSocket: MockWebSocketCtor,
+      reconnect: false,
+      ackOnReceipt: true,
+      client,
+    })
+    const dispatched: string[] = []
+    rt.on('message.new', (m) => void dispatched.push(String(m.payload.id)))
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+    await settle()
+
+    expect(sync).toHaveBeenCalledOnce()
+    expect(dispatched).toEqual(['msg_c_1', 'msg_c_2'])
+    expect(syncAck).toHaveBeenCalledWith(syncRow('c', 2).delivery_id)
+    expect(sentFrames(ws, 'ack')).toEqual([])
+    rt.disconnect()
+  })
+
+  it('REST drain under ackOnReceipt still withholds the cursor when a handler throws', async () => {
+    const sync = vi.fn(async () => [syncRow('c', 1)])
+    const syncAck = vi.fn(async () => ({ acked: 1 }))
+    const client = { getMessages: vi.fn(), sync, syncAck } as unknown as AgentChatClient
+    const rt = new RealtimeClient({
+      apiKey: 'k',
+      webSocket: MockWebSocketCtor,
+      reconnect: false,
+      ackOnReceipt: true,
+      client,
+    })
+    rt.on('message.new', () => {
+      throw new Error('boom')
+    })
+    rt.onError(() => undefined)
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+    await settle()
+
+    expect(syncAck).not.toHaveBeenCalled()
+    expect(sentFrames(ws, 'ack')).toEqual([])
+    rt.disconnect()
+  })
+})
+
+describe('RealtimeClient — stored rows older than the live anchor', () => {
+  // The server registers a socket and THEN drains the stored backlog, so a
+  // live frame (seq 5) can anchor a conversation before the drain brings
+  // stored seqs 3 and 4. Those are below the anchor but were never
+  // dispatched; dropping them would lose them because the ack marks them
+  // delivered for good.
+
+  it.each([false, true])(
+    'backlog pushed over the socket after a live anchor is dispatched and acked once (ackOnReceipt=%s)',
+    async (ackOnReceipt) => {
+      const { rt, ws } = await connected({ ackOnReceipt })
+      const dispatched: number[] = []
+      rt.on('message.new', (m) => void dispatched.push((m.payload as { seq: number }).seq))
+
+      ws.simulateMessage(messageNew('c', 5)) // live fan-out beats the drain
+      ws.simulateMessage(messageNew('c', 3)) // server's reconnect drain, stored rows
+      ws.simulateMessage(messageNew('c', 4))
+      await settle()
+
+      expect(dispatched).toEqual([5, 3, 4])
+      expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_5', 'msg_3', 'msg_4'])
+      rt.disconnect()
+    },
+  )
+
+  it.each([false, true])(
+    'REST drain rows below the live anchor are dispatched before the cursor covers them (ackOnReceipt=%s)',
+    async (ackOnReceipt) => {
+      let resolveSync!: (rows: Record<string, unknown>[]) => void
+      const sync = vi
+        .fn()
+        .mockImplementationOnce(() => new Promise<Record<string, unknown>[]>((r) => (resolveSync = r)))
+      const syncAck = vi.fn(async () => ({ acked: 2 }))
+      const client = { getMessages: vi.fn(), sync, syncAck } as unknown as AgentChatClient
+      const rt = new RealtimeClient({
+        apiKey: 'k',
+        webSocket: MockWebSocketCtor,
+        reconnect: false,
+        ackOnReceipt,
+        client,
+      })
+      const dispatched: string[] = []
+      rt.on('message.new', (m) => void dispatched.push(String(m.payload.id)))
+      await rt.connect()
+      const ws = MockWebSocket.latest()
+      ws.simulateOpen()
+      ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] }) // drain starts, waits on sync
+
+      ws.simulateMessage(messageNew('c', 5)) // live frame anchors c at 5
+      resolveSync([syncRow('c', 3), syncRow('c', 4)])
+      await settle()
+
+      expect(dispatched).toEqual(['msg_5', 'msg_c_3', 'msg_c_4'])
+      expect(syncAck).toHaveBeenCalledWith(syncRow('c', 4).delivery_id)
+      // Drain rows are covered by the cursor, never by a WS ack frame.
+      expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_5'])
+      rt.disconnect()
+    },
+  )
+
+  it('a true repeat below the anchor (same message id) is skipped and acked once more', async () => {
+    const { rt, ws } = await connected()
+    const onMessage = vi.fn()
+    rt.on('message.new', onMessage)
+
+    ws.simulateMessage(messageNew('c', 5))
+    ws.simulateMessage(messageNew('c', 6))
+    await settle()
+    ws.simulateMessage(messageNew('c', 5)) // server double-publish / lost ack
+    await settle()
+
+    expect(onMessage).toHaveBeenCalledTimes(2)
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_5', 'msg_6', 'msg_5'])
+    rt.disconnect()
+  })
+
+  it('a seq skipped by a failed gap-fill that arrives late is dispatched, not dropped', async () => {
+    vi.useFakeTimers()
+    const onGap = vi.fn()
+    const rt = new RealtimeClient({
+      apiKey: 'k',
+      webSocket: MockWebSocketCtor,
+      reconnect: false,
+      onSequenceGap: onGap, // no client → gap-fill unavailable
+    })
+    const dispatched: number[] = []
+    rt.on('message.new', (m) => void dispatched.push((m.payload as { seq: number }).seq))
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+
+    ws.simulateMessage(messageNew('c', 1))
+    ws.simulateMessage(messageNew('c', 3))
+    await vi.advanceTimersByTimeAsync(2_100) // gap window lapses; 3 is released, 2 skipped
+    expect(dispatched).toEqual([1, 3])
+    expect(onGap).toHaveBeenCalledOnce()
+
+    ws.simulateMessage(messageNew('c', 2)) // the skipped seq finally arrives
+    await vi.advanceTimersByTimeAsync(0)
+    expect(dispatched).toEqual([1, 3, 2])
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_1', 'msg_3', 'msg_2'])
+    rt.disconnect()
+  })
 })
 
 describe('RealtimeClient — a guest in a host process', () => {
@@ -289,5 +546,38 @@ describe('RealtimeClient — a guest in a host process', () => {
     expect(vi.getTimerCount()).toBe(1)
     rt.disconnect()
     expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('resolves the WebSocket constructor per connect, never from a process-wide memo', async () => {
+    // Two hosts in one process may provide different implementations; the
+    // second client must get the one in scope when IT connects. A module
+    // memo would hand it the first client's constructor.
+    class HostA extends MockWebSocket {}
+    class HostB extends MockWebSocket {}
+
+    vi.stubGlobal('WebSocket', HostA)
+    const a = new RealtimeClient({ apiKey: 'ka', reconnect: false })
+    await a.connect()
+    const wsA = MockWebSocket.latest()
+
+    vi.stubGlobal('WebSocket', HostB)
+    const b = new RealtimeClient({ apiKey: 'kb', reconnect: false })
+    await b.connect()
+    const wsB = MockWebSocket.latest()
+
+    expect(wsA).toBeInstanceOf(HostA)
+    expect(wsB).toBeInstanceOf(HostB)
+    expect(wsB).not.toBeInstanceOf(HostA)
+
+    // No cross-talk: each socket carries its own HELLO and only its own frames.
+    wsA.simulateOpen()
+    wsB.simulateOpen()
+    expect(JSON.parse(wsA.sent[0]!)).toMatchObject({ api_key: 'ka' })
+    expect(JSON.parse(wsB.sent[0]!)).toMatchObject({ api_key: 'kb' })
+    expect(wsA.sent).toHaveLength(1)
+    expect(wsB.sent).toHaveLength(1)
+
+    a.disconnect()
+    b.disconnect()
   })
 })

@@ -35,6 +35,7 @@ export {
   type GateModelCall,
   type GateOutcome,
   type GateRecordFailure,
+  type GateReply,
   type GateResult,
   type RunGateOptions,
   type ToolNamer,

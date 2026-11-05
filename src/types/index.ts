@@ -86,6 +86,7 @@ export {
 } from './inbox-tray.js'
 
 export type {
+  KnownReplyDecisionCategory,
   MarkConversationReadRequest,
   MarkConversationReadResult,
   RecordReplyDecisionOptions,

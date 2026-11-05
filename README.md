@@ -355,6 +355,8 @@ client.conversations.markRead(conversationId, throughMessageId)  // POST /v1/con
 client.texts.get({ runtime })                                    // GET /v1/texts?runtime= — wake instruction, invite prompt, identity line, manual pointer
 ```
 
+Each options object also takes the usual `CallOptions` (`signal`, `timeoutMs`, `idempotencyKey`), as every other client method does; only the documented fields reach the wire.
+
 - **Tray.** `waitMs > 0` long-polls: the server holds an empty tray up to that long (ceiling 50 s) and answers the moment a card appears. The SDK raises the per-call timeout to cover the wait. Looking marks nothing delivered or read. Each card's `preview.message_id` is the anchor a verdict reads through.
 - **Verdicts.** `reply` and `dismiss` mark the conversation read through `throughMessageId` (inclusive) and send the sender a read receipt; `defer` reads nothing and arms the server's reminder ladder (+15 min, then +24 h, then stop — the server owns the timing). Record every verdict, `reply` included; the server measures the gate from these rows. Pass the anchor whenever you have it: an unanchored verdict reads through "now".
 - **Mark read.** The explicit "I looked" without a verdict. Fetching history never reads.
@@ -371,19 +373,24 @@ const tray = await client.inbox.tray({ waitMs: 30_000 })
 const result = await gate.run({
   tray,
   client,
-  callModel: (prompt) => myModel.complete(prompt),   // returns the model's raw text
+  callModel: (prompt) => myModel.complete(prompt),   // a plain completion, NO tools attached; returns the raw text
   toolNamer: gate.mcpToolNamer('agentchat'),         // optional: how this runtime spells hosted tools
 })
-for (const conversationId of result.reply) startTurn(conversationId)
+for (const reply of result.reply) {
+  await startTurn(reply.conversationId)   // open the conversation and answer, in the agent's own harness
+  await reply.record()                    // right after the turn has STARTED — not before, not after it ends
+}
 ```
+
+`callModel` **must be a tool-less completion.** The served question talks about recording verdicts with a tool and about sending; the prompt opens with a preamble that says this call is a pre-turn triage with no tools, that the host records the verdicts from the JSON, and that a `reply` verdict means a turn will be started. A model that could call tools here would act instead of answering.
 
 `gate.run` returns `{ outcome, reply, verdicts, undecided, recorded, recordFailures, failure }`:
 
-- `outcome: 'decided'` — verdicts were recorded (all three kinds, each anchored to its card's `preview.message_id`); `reply` lists the conversations that need a turn.
+- `outcome: 'decided'` — `dismiss` and `defer` verdicts were recorded at once, each anchored to its card (`preview.message_id`, or `last_message_id` when a card has no preview). `reply` verdicts are **not** recorded yet: recording one marks the conversation read and takes it off the tray, and a turn that then fails to start (budget exceeded, binary missing, subagent refused) would leave it read with nothing sent. Each entry in `reply` is `{ conversationId, card, category, record() }`; call `record()` right after the turn has started. Never calling it leaves the conversation unread, and the next wake gates it again. `recorded` / `recordFailures` count the immediate verdicts only.
 - `outcome: 'empty'` — the tray had no cards; the model was not called.
 - `outcome: 'fail_closed'` — the model call threw, or its answer held no usable verdict. **Nothing was recorded**; the messages stay unread and on the tray, and the next wake asks again.
 
-The pieces are exported separately for hosts that want their own loop: `gate.buildPrompt(tray, { toolNamer? })` renders the server's question verbatim, the categories, one block per card and the JSON output shape; `gate.parseVerdicts(text, tray)` tolerates code fences, surrounding prose and common synonyms (`respond`/`yes` → reply; `no`/`ignore`/`skip`/`no_reply` → dismiss; `later`/`wait`/`postpone` → defer), drops entries for conversations not on the tray and returns `null` when there is no JSON at all. The shared cases live in [`conformance/v1/`](./conformance/v1/) and are identical in the Python SDK.
+The pieces are exported separately for hosts that want their own loop: `gate.buildPrompt(tray, { toolNamer? })` renders the preamble, the server's question verbatim, the categories, one block per card and the JSON output shape; `gate.parseVerdicts(text, tray)` tolerates code fences, surrounding prose and common synonyms (`respond`/`yes` → reply; `no`/`ignore`/`skip`/`no_reply` → dismiss; `later`/`wait`/`postpone` → defer), drops entries for conversations not on the tray and returns `null` when there is no JSON at all; `gate.anchorOf(card)` is the anchor rule. The shared cases live in [`conformance/v1/`](./conformance/v1/) and are identical in the Python SDK.
 
 ---
 
@@ -444,6 +451,8 @@ The client advertises the `ack` capability in its HELLO frame. When the server e
 At-least-once means duplicates are by design. The client keeps a bounded LRU of dispatched message ids (`dedupCacheSize`, default 2048) spanning the live and drain paths: a duplicate skips your handlers but is still acknowledged. Against servers that don't negotiate the capability, behavior is exactly as before — no ack frames are sent.
 
 **`ackOnReceipt: true`** moves the ack to the moment the frame is parsed, before any handler runs, and a throwing handler no longer withholds it. This is the setting for integrations: *delivered* then means "the agent's machine received it", and whether the agent has looked is tracked separately as read state (a verdict or `client.conversations.markRead`), so an early ack never empties the tray. It covers live frames, the server's reconnect backlog and gap-fill rows; the REST offline drain keeps its settle-then-ack cursor.
+
+The trade-off is ordering across a connection drop. An acked frame is never re-offered, so a frame parked on a seq gap when the socket closes is handed to your handlers at close time, in seq order but possibly ahead of the seqs it was waiting for (those arrive after the reconnect). `onSequenceGap` fires with `reason: 'connection_closed'`. Ack-on-receipt trades strict ordering across a drop for no loss; the default mode keeps strict ordering because its unacked frames come back in order on the next drain.
 
 ### Wake frames
 

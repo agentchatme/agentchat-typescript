@@ -285,6 +285,11 @@ export interface CallOptions {
 // `client.decisions`, `client.conversations` and `client.texts` so the
 // receive path reads the same in every SDK. Methods are arrow-bound: taking
 // `const { tray } = client.inbox` and calling `tray()` works.
+//
+// Call options follow the client's one convention: positional ids, then a
+// single options object that also carries `CallOptions` (`signal`,
+// `timeoutMs`, `idempotencyKey`), as `muteAgent(handle, { … } & CallOptions)`
+// does. Only the documented fields reach the wire.
 
 /** Extra network slack on top of `waitMs` before a long-poll tray read times out locally. */
 const INBOX_WAIT_TIMEOUT_GRACE_MS = 10_000
@@ -312,8 +317,7 @@ export interface DecisionsResource {
    */
   record(
     conversationId: string,
-    options: RecordReplyDecisionOptions,
-    callOptions?: CallOptions,
+    options: RecordReplyDecisionOptions & CallOptions,
   ): Promise<ReplyDecision>
 }
 
@@ -327,7 +331,7 @@ export interface ConversationsResource {
   markRead(
     conversationId: string,
     throughMessageId: string,
-    callOptions?: CallOptions,
+    options?: CallOptions,
   ): Promise<MarkConversationReadResult>
 }
 
@@ -338,7 +342,7 @@ export interface TextsResource {
    * start and refresh on a timer (the server suggests 24 h); never bundle a
    * copy.
    */
-  get(options: GetTextsOptions, callOptions?: CallOptions): Promise<Texts>
+  get(options: GetTextsOptions & CallOptions): Promise<Texts>
 }
 
 export class AgentChatClient {
@@ -372,15 +376,14 @@ export class AgentChatClient {
       tray: (opts) => this.getInboxTray(opts),
     }
     this.decisions = {
-      record: (conversationId, opts, callOpts) =>
-        this.recordDecision(conversationId, opts, callOpts),
+      record: (conversationId, opts) => this.recordDecision(conversationId, opts),
     }
     this.conversations = {
-      markRead: (conversationId, throughMessageId, callOpts) =>
-        this.markConversationRead(conversationId, throughMessageId, callOpts),
+      markRead: (conversationId, throughMessageId, opts) =>
+        this.markConversationRead(conversationId, throughMessageId, opts),
     }
     this.texts = {
-      get: (opts, callOpts) => this.getTexts(opts, callOpts),
+      get: (opts) => this.getTexts(opts),
     }
   }
 
@@ -405,11 +408,11 @@ export class AgentChatClient {
 
   private async recordDecision(
     conversationId: string,
-    options: RecordReplyDecisionOptions,
-    callOptions?: CallOptions,
+    options: RecordReplyDecisionOptions & CallOptions,
   ): Promise<ReplyDecision> {
-    // `undefined` members are dropped by JSON serialization, so an omitted
-    // category / anchor never reaches the wire as `null`.
+    // Only the verdict fields form the body; `undefined` members are dropped
+    // by JSON serialization, so an omitted category / anchor never reaches
+    // the wire as `null`. Call options are picked out by `toRequestOpts`.
     const body: RecordReplyDecisionRequest = {
       decision: options.decision,
       category: options.category,
@@ -418,7 +421,7 @@ export class AgentChatClient {
     const res = await this.post<{ decision: ReplyDecision }>(
       `/v1/conversations/${encodeURIComponent(conversationId)}/decisions`,
       body,
-      callOptions,
+      options,
     )
     return res.decision
   }
@@ -426,19 +429,19 @@ export class AgentChatClient {
   private markConversationRead(
     conversationId: string,
     throughMessageId: string,
-    callOptions?: CallOptions,
+    options?: CallOptions,
   ): Promise<MarkConversationReadResult> {
     const body: MarkConversationReadRequest = { through_message_id: throughMessageId }
     return this.post<MarkConversationReadResult>(
       `/v1/conversations/${encodeURIComponent(conversationId)}/read`,
       body,
-      callOptions,
+      options,
     )
   }
 
-  private getTexts(options: GetTextsOptions, callOptions?: CallOptions): Promise<Texts> {
+  private getTexts(options: GetTextsOptions & CallOptions): Promise<Texts> {
     const params = new URLSearchParams({ runtime: options.runtime })
-    return this.get<Texts>(`/v1/texts?${params.toString()}`, callOptions)
+    return this.get<Texts>(`/v1/texts?${params.toString()}`, options)
   }
 
   // ─── Internal request helpers ─────────────────────────────────────────────

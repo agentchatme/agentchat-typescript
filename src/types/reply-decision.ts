@@ -6,11 +6,8 @@
 
 export type ReplyDecisionVerdict = 'reply' | 'dismiss' | 'defer'
 
-/**
- * Fixed taxonomy a verdict may carry. The live list is served on every tray
- * (`InboxTray.categories`); this type names the members known to this SDK.
- */
-export type ReplyDecisionCategory =
+/** The category members this SDK knows by name. */
+export type KnownReplyDecisionCategory =
   | 'open_request'
   | 'new_info'
   | 'goal_followup'
@@ -20,6 +17,13 @@ export type ReplyDecisionCategory =
   | 'no_action_needed'
   | 'spam'
   | 'other'
+
+/**
+ * A verdict category as served. The live taxonomy comes with every tray
+ * (`InboxTray.categories`) and may grow ahead of this SDK, so the type keeps
+ * autocomplete for the known members without forbidding a newer one.
+ */
+export type ReplyDecisionCategory = KnownReplyDecisionCategory | (string & {})
 
 /** Options for `client.decisions.record()`. */
 export interface RecordReplyDecisionOptions {
@@ -54,8 +58,8 @@ export interface ReplyDecision {
    * verdicts and once the ladder has run out.
    */
   defer_until: string | null
-  /** Defer ladder step this verdict landed on; absent on servers that predate the ladder. */
-  defer_step?: number
+  /** Defer-ladder step this verdict landed on; null for other verdicts, absent on servers that predate the ladder. */
+  defer_step?: number | null
   created_at: string
 }
 

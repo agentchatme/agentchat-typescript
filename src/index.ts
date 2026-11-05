@@ -4,24 +4,42 @@ export {
   type BacklogWarning,
   type BacklogWarningHandler,
   type CallOptions,
+  type ConversationsResource,
+  type DecisionsResource,
+  type InboxResource,
   type RecoverOptions,
   type RecoverResult,
   type SendMessageResult,
   type SyncEnvelope,
   type MuteEntry,
   type MuteTargetKind,
+  type TextsResource,
 } from './client.js'
 
 export {
   RealtimeClient,
   type RealtimeOptions,
   type MessageHandler,
+  type WakeHandler,
   type ErrorHandler,
   type ConnectHandler,
   type DisconnectHandler,
   type SequenceGapInfo,
   type SequenceGapHandler,
 } from './realtime.js'
+
+export * as gate from './gate.js'
+export {
+  type BuildPromptOptions,
+  type GateClient,
+  type GateModelCall,
+  type GateOutcome,
+  type GateRecordFailure,
+  type GateResult,
+  type RunGateOptions,
+  type ToolNamer,
+  type Verdict,
+} from './gate.js'
 
 export {
   AgentChatError,

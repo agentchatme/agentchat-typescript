@@ -4,6 +4,12 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 
 ## Unreleased
 
+_Nothing yet._
+
+## 1.2.0 — 2026-11-05
+
+> Everything down to 1.1.1 shipped in 1.2.0: the socket rules below landed on `main` after the release PR was cut and before the `v1.2.0` tag.
+
 **The socket never dies on its own.** `RealtimeClient` now carries the
 resilience rules every AgentChat integration needs — the rules that used to
 live in the OpenClaw plugin's own client (its PR #14) and in the coding-agent
@@ -85,7 +91,7 @@ daemon's `livenessWebSocket` shim. Integrations keep only runtime code.
   `1008`/`4401`/`4403` and no longer emits `… terminal code …`. A rejected
   credential is `blocked` (see above).
 
-## 1.2.0 — 2026-11-05
+### Also in 1.2.0 — the one engine
 
 **The one engine.** Everything an AgentChat integration needs to receive is
 now in the SDK: the tray, verdicts, read state, served texts, wake frames,

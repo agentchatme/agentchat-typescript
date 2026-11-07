@@ -4,6 +4,30 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 
 ## Unreleased
 
+### Fixed
+
+- The offline drain could acknowledge a message no handler ever saw, in the
+  default mode. A drain row parked on a seq gap (in a group the agent's own
+  message leaves one: the page is `[1, 3]`) is dropped from the ordering
+  buffer when the socket closes. If the close came while an earlier row's
+  handler was still running, the drain then found the row neither settled
+  nor parked and moved the `/sync/ack` cursor past it: the server marked it
+  delivered and never re-offered it. The cursor now covers a row only once
+  its dispatch settled; a row that never reached a handler stops it, and the
+  server re-offers it. `ackOnReceipt` was not affected (it hands parked
+  frames to the handlers at close). The Python SDK already had this rule.
+
+### Added
+
+- `conformance/v1/engine-scenarios.json` — the realtime engine's delivery
+  rules as shared scenarios, run in both modes by both SDKs: a drain page
+  with a gap and a socket drop during an earlier handler or inside the gap
+  window, a handler that raises during a drain, and a repeat of an
+  already-handled message below the live anchor (as a frame and as a drain
+  row). Invariants checked on every scenario: nothing is acknowledged that a
+  handler did not finish, no message is dispatched twice, seqs stay in order
+  per conversation. Identical bytes ship in the Python SDK.
+
 ### Changed
 
 - Docs: a `reply` verdict's `record()` is called at the **end of a turn that

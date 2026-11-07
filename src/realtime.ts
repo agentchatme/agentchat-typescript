@@ -774,14 +774,18 @@ export class RealtimeClient {
    * - A row whose handler threw is not acked — nor is anything after it
    *   (the ack cursor is at-or-before) — so the server re-offers it; the
    *   dedup cache suppresses re-dispatch of its acked predecessors.
-   * - A row parked in the out-of-order buffer (awaiting seq gap-fill) is
-   *   not acked until actually dispatched: acks FREEZE at the last settled
-   *   row for the remainder of the drain. Without this, a disconnect that
-   *   clears the ordering buffers (`resetOrderStates`) would silently drop
-   *   an already-acked message — acked-but-undispatched is exactly the
+   * - A row no handler has been handed yet is not acked: acks FREEZE at the
+   *   last settled row for the remainder of the drain. That is a row
+   *   parked in the out-of-order buffer (awaiting seq gap-fill), and also a
+   *   row that was parked when the socket closed: in the default mode the
+   *   close clears the ordering buffers (`resetOrderStates`) without
+   *   dispatching them, possibly while the drain is still awaiting an
+   *   earlier row's handler. Covering either would mark a message
+   *   delivered that no handler saw — acked-but-undispatched is exactly the
    *   loss the ack protocol exists to prevent. Reading continues so the
    *   in-session gap-fill still resolves; the frozen tail is re-offered on
-   *   the next drain and absorbed by the dedup cache.
+   *   the next drain (or the server's reconnect backlog) and absorbed by
+   *   the dedup cache.
    *
    * Concurrent calls are coalesced (the second returns immediately). The
    * server-side ack pointer only moves forward, so re-running after a
@@ -864,26 +868,26 @@ export class RealtimeClient {
           const envelope = envelopes[i]
           if (!row || !envelope) break // unreachable; satisfies indexed access
           const settlement = this.drainSettlements.get(envelope)
-          if (settlement) {
-            const ok = await settlement
-            if (!ok) {
-              // Handler failure — leave this row and everything after it
-              // unacked so the server re-offers them.
-              acksFrozen = true
-              break
-            }
-          } else if (this.isBufferedInOrderState(row)) {
-            // Parked on a seq gap — not dispatched yet. See the stranding
-            // note in the method doc.
+          if (!settlement) {
+            // Never handed to a handler: still parked on a seq gap, or
+            // parked and then cleared from the buffer by a socket close
+            // (`resetOrderStates`) while an earlier row's handler was
+            // running. No handler saw it, so the cursor stops here and the
+            // server re-offers it. See the stranding note in the method doc.
+            acksFrozen = true
+            break
+          }
+          if (!(await settlement)) {
+            // Handler failure — leave this row and everything after it
+            // unacked so the server re-offers them.
             acksFrozen = true
             break
           }
           // Reaching here means the row is safe to cover with the cursor:
           // its dispatch settled cleanly, or it was a dedup hit (already
           // dispatched by this process — prior processing is the proof).
-          // Every drain row that is not parked on a seq gap reaches
-          // dispatchMessageNew, below-anchor rows included, so a settlement
-          // always exists for it.
+          // A settlement exists only once dispatchMessageNew ran for the
+          // envelope, so its presence is the proof a handler was reached.
           const deliveryId = row.delivery_id
           if (typeof deliveryId === 'string' && deliveryId.length > 0) {
             ackCursor = deliveryId
@@ -919,15 +923,6 @@ export class RealtimeClient {
       if (nextAfter === null) return
       after = nextAfter
     }
-  }
-
-  // True when a drain row is currently parked in the per-conversation
-  // out-of-order buffer (its dispatch is deferred to the gap-fill
-  // machinery — natural arrival, gap-fill fetch, or forced resolveGap).
-  private isBufferedInOrderState(row: SyncEnvelope): boolean {
-    if (typeof row.seq !== 'number') return false
-    const state = this.orderStates.get(row.conversation_id)
-    return state !== undefined && state.buffer.has(row.seq)
   }
 
   /**
@@ -1023,7 +1018,9 @@ export class RealtimeClient {
     // ack protocol exists to prevent. Hand the parked frames to the
     // handlers now, in seq order, before the state goes. Default mode
     // skips this: its parked frames are unacked and come back in order on
-    // the next drain.
+    // the next drain. That includes REST drain rows: the drain's cursor
+    // covers only rows that reached a handler, so a parked row dropped
+    // here stops the cursor instead of being acked.
     if (this.options.ackOnReceipt) this.flushParkedFrames('connection_closed')
 
     // Drop all per-conversation ordering state. Across the connection

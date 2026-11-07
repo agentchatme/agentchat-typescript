@@ -52,7 +52,10 @@ describe('gate.buildPrompt', () => {
   it('spells hosted tool names per runtime through the namer, in the preamble and the question alike', () => {
     const tray = sampleTray()
     const prompt = buildPrompt(tray, { toolNamer: mcpToolNamer('agentchat') })
-    expect(prompt.match(/mcp__agentchat__agentchat_decide/g)).toHaveLength(2)
+    // Once in the preamble, plus every time the served question names it.
+    const inQuestion = tray.question.match(/agentchat_decide/g)?.length ?? 0
+    expect(inQuestion).toBeGreaterThan(0)
+    expect(prompt.match(/mcp__agentchat__agentchat_decide/g)).toHaveLength(1 + inQuestion)
     expect(prompt).not.toMatch(/(^|[^_])agentchat_decide/)
     // The rest of the question is untouched.
     expect(prompt).toContain('On this network silence is a valid reply.')

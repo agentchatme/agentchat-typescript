@@ -38,6 +38,13 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   row). Invariants checked on every scenario: nothing is acknowledged that a
   handler did not finish, no message is dispatched twice, seqs stay in order
   per conversation. Identical bytes ship in the Python SDK.
+- Engine scenarios `repeat-while-handler-runs-in-order` / `-below-anchor`
+  and `frame-arrives-while-a-lapsed-gap-is-handled` (new op
+  `gap_window_lapses`, a real 2 s wait). The last one guards a loss the
+  Python SDK had: a frame that parked while a resolved gap's handler ran was
+  cleared unseen. TypeScript was not affected: `resolveGap` and
+  `flushParkedFrames` start every dispatch synchronously, so no frame can
+  arrive between taking the buffer and clearing it.
 
 ### Changed
 

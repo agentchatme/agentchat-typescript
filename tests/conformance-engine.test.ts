@@ -35,6 +35,7 @@ type Step =
   | { op: 'drain' }
   | { op: 'close' }
   | { op: 'frame'; payload: Payload }
+  | { op: 'gap_window_lapses' }
   | { op: 'wait_handler'; message_id: string }
   | { op: 'release'; message_id: string }
 interface Expectation {
@@ -61,7 +62,11 @@ interface EngineDoc {
 
 const doc = JSON.parse(readFileSync(FIXTURE, 'utf8')) as EngineDoc
 
-const OPS = ['close', 'connect', 'drain', 'frame', 'release', 'wait_handler']
+const OPS = ['close', 'connect', 'drain', 'frame', 'gap_window_lapses', 'release', 'wait_handler']
+
+// The client's gap window (GAP_FILL_WINDOW_MS) plus slack. Real time: the
+// harness runs on real timers throughout.
+const GAP_WINDOW_LAPSE_MS = 2_150
 const EXPECTATIONS = ['cursor_acks', 'dispatched', 'dispatched_includes', 'ws_acks']
 const INVARIANTS = ['acked_was_handled', 'acks_follow_handling', 'dispatched_once', 'seq_order']
 
@@ -144,6 +149,9 @@ async function run(scenario: Scenario, mode: Mode): Promise<Outcome> {
         break
       case 'drain':
         drains.push(rt!.drainOfflineEnvelopes())
+        break
+      case 'gap_window_lapses':
+        await new Promise((r) => setTimeout(r, GAP_WINDOW_LAPSE_MS))
         break
       case 'wait_handler':
         for (let i = 0; i < 100 && !dispatched.some((p) => p.id === step.message_id); i++) {
@@ -257,7 +265,7 @@ describe('conformance — engine-scenarios.json', () => {
         const outcome = await run(scenario, mode)
         checkInvariants(outcome, mode)
         checkExpectations(outcome, scenario.expect[mode])
-      })
+      }, 10_000)
     }
   }
 })

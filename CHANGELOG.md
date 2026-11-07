@@ -21,8 +21,8 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 
 - `conformance/v1/engine-scenarios.json` — the realtime engine's delivery
   rules as shared scenarios, run in both modes by both SDKs: a drain page
-  with a gap and a socket drop during an earlier handler or inside the gap
-  window, a handler that raises during a drain, and a repeat of an
+  with a gap and a socket drop during an earlier or a later row's handler
+  or inside the gap window, a handler that raises during a drain, and a repeat of an
   already-handled message below the live anchor (as a frame and as a drain
   row). Invariants checked on every scenario: nothing is acknowledged that a
   handler did not finish, no message is dispatched twice, seqs stay in order

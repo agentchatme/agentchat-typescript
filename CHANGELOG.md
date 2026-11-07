@@ -16,6 +16,17 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   its dispatch settled; a row that never reached a handler stops it, and the
   server re-offers it. `ackOnReceipt` was not affected (it hands parked
   frames to the handlers at close). The Python SDK already had this rule.
+- A message could reach the `message.new` handlers twice while its first
+  copy's handler was still running. After a reconnect the server pushes its
+  stored backlog on the socket and the REST drain brings the same rows; the
+  dedup cache is filled only once a handler succeeds, so with a slow handler
+  (a model call) the second copy was dispatched again, and a script that
+  replies per message replied twice. A copy whose first copy is still with
+  the handlers is now not dispatched: it takes that outcome. Success acks it
+  (an ack frame for a live copy, the cursor for a drain row); a failure
+  leaves it unacked so the server re-offers it and it is tried again. Copies
+  wait on the first copy only where they waited on their own handler call
+  before, and the in-flight entries live only while handlers run.
 
 ### Added
 

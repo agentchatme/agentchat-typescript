@@ -507,6 +507,13 @@ export class RealtimeClient {
   // only AFTER a successful dispatch: adding earlier would let a failed
   // dispatch suppress its own redelivery.
   private dedupSeen = new Set<string>()
+  // Dispatches still running, by message id: the first copy's settlement.
+  // A second copy of an id that is here (the server's reconnect backlog and
+  // the REST drain bring the same stored rows; a slow handler is still on
+  // the first) is not handed to the handlers again. It takes the first
+  // copy's outcome instead. An entry lives exactly as long as its handlers
+  // run, so the map is bounded by the dispatches in flight.
+  private inFlight = new Map<string, Promise<boolean>>()
   // Envelopes injected by the REST drain, as opposed to live WS frames.
   // Drain rows are acknowledged via the REST sync/ack cursor, never via a
   // WS ack frame; everything else on the message.new pipeline (live frames,
@@ -1469,6 +1476,10 @@ export class RealtimeClient {
    * acked. Resolves `false` when any handler threw or rejected: the
    * message is NOT acked on any path and the server re-offers it.
    *
+   * A copy of a message whose first copy is still with the handlers is not
+   * dispatched again: it resolves with the first copy's outcome (and, when
+   * that succeeded, is acked like a dedup hit).
+   *
    * Ack routing: live frames (including server-pushed reconnect backlog
    * and gap-fill rows) send a WS `{type:'ack'}` frame when ack-mode was
    * negotiated; REST-drain rows are covered by the drain's sync/ack
@@ -1485,9 +1496,21 @@ export class RealtimeClient {
 
     let settlement: Promise<boolean>
 
+    const first = messageId !== null ? this.inFlight.get(messageId) : undefined
+
     if (messageId !== null && this.dedupHit(messageId)) {
       settlement = Promise.resolve(true)
       if (ackAfterDispatch) this.sendAckFrame(messageId)
+    } else if (messageId !== null && first !== undefined) {
+      // The same message is already with the handlers. Wait for that
+      // outcome instead of dispatching it twice: success covers this copy
+      // too (acked like a dedup hit), a failure leaves it unacked so the
+      // server re-offers it. A drain row's cursor waits here as it would
+      // for its own handler.
+      settlement = first.then((ok) => {
+        if (ok && ackAfterDispatch) this.sendAckFrame(messageId)
+        return ok
+      })
     } else {
       const handlers = this.handlers.get('message.new')
       const pending: Array<Promise<unknown>> = []
@@ -1501,7 +1524,13 @@ export class RealtimeClient {
           }
         }
       }
-      settlement = Promise.allSettled(pending).then((outcomes) => {
+      const own: Promise<boolean> = Promise.allSettled(pending).then((outcomes) => {
+        // Leave the in-flight map in the same step the outcome is known
+        // (and, on success, the id enters the dedup cache): a later copy
+        // always finds one or the other, never neither.
+        if (messageId !== null && this.inFlight.get(messageId) === own) {
+          this.inFlight.delete(messageId)
+        }
         let ok = true
         for (const outcome of outcomes) {
           if (outcome.status === 'rejected') {
@@ -1516,6 +1545,8 @@ export class RealtimeClient {
         }
         return true
       })
+      if (messageId !== null) this.inFlight.set(messageId, own)
+      settlement = own
     }
 
     if (isDrainRow) this.drainSettlements.set(message, settlement)

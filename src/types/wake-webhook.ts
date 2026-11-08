@@ -80,6 +80,16 @@ export interface WakeWebhookPayload {
   type: 'agentchat.wake'
   /** Shape version (contract v1); absent on older servers. */
   version?: 1
+  /**
+   * Why this wake (contract v1): `messages` (undelivered mail), `reminder`
+   * (a defer came due), `invite` (a new group invite), `unanswered` (cards
+   * still waiting; subscriptions with `rewake`), `test`. Every reason means
+   * the same to a receiver: start the agent, read the tray. Absent on older
+   * servers; newer reasons may arrive.
+   */
+  reason?: 'messages' | 'reminder' | 'invite' | 'unanswered' | 'test' | (string & {})
+  /** The re-wake rung, on `unanswered` only (1–4). */
+  step?: number
   /** Recipient handle, with `@`. */
   handle: string
   conversations: Array<{

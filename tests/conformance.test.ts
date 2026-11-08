@@ -105,6 +105,10 @@ describe('conformance — gate prompt', () => {
     expect(buildPrompt(tray, { texts }) + '\n').toBe(raw('gate-prompt.expected.txt'))
   })
 
+  it('renders the same prompt without texts (the legacy wording, deprecated)', () => {
+    expect(buildPrompt(tray) + '\n').toBe(raw('gate-prompt.expected.txt'))
+  })
+
   it('carries the served preamble first, then the server question verbatim, and the served answer format last', () => {
     const prompt = buildPrompt(tray, { texts })
     expect(prompt.startsWith(`${texts.gate_call_preamble}\n\n${tray.question}\n\n`)).toBe(true)
@@ -120,7 +124,7 @@ describe('conformance — tray.v1.sample.json', () => {
     expect(v1.invites?.length).toBeGreaterThan(0)
     expect(v1.invites_truncated).toBe(false)
     for (const invite of v1.invites ?? []) {
-      expect(invite.invite_id).toMatch(/^ginv_/)
+      expect(invite.invite_id).toMatch(/^gri_/)
       expect(invite.invited_by.startsWith('@')).toBe(true)
       expect(typeof invite.group.id).toBe('string')
       expect(typeof invite.group.member_count).toBe('number')
@@ -132,7 +136,7 @@ describe('conformance — tray.v1.sample.json', () => {
   it('a v1 tray gates like any other: only conversations are cards', () => {
     const prompt = buildPrompt(v1, { texts })
     expect(prompt).toContain(`Your tray, as the server built it: ${v1.conversations.length} conversations.`)
-    expect(prompt).not.toContain('ginv_')
+    expect(prompt).not.toContain('gri_')
   })
 })
 
@@ -158,6 +162,9 @@ describe('conformance — socket frames', () => {
       reconnect: false,
       ...options,
     })
+    // The usual order: a message handler is attached before the socket opens,
+    // so the HELLO offers acks. Tests add their own handlers alongside.
+    rt.on('message.new', () => undefined)
     await rt.connect()
     const ws = MockWebSocket.latest()
     ws.simulateOpen()

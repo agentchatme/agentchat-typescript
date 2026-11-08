@@ -4,7 +4,9 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 
 ## Unreleased
 
-Contract v1 ("finish the gate"). Needs a server that serves contract v1.
+Contract v1 ("finish the gate"). Additive: an app or integration that
+upgrades from 1.2.x without code changes behaves as before against today's
+server and against a contract v1 server.
 
 ### Added
 
@@ -14,7 +16,9 @@ Contract v1 ("finish the gate"). Needs a server that serves contract v1.
   invite pair), `anchor.render` / `find` / `replace` / `remove`,
   `probeHostedTools`, and `ReceiveLoop` with a `gateCall` and a `singleRun`
   mode and a `status()` snapshot. A runtime supplies only `callModel` +
-  `startTurn`, or `startRun`.
+  `startTurn`, or `startRun`. In single-run mode an invite still pending
+  after two completed runs is dismissed, so an ignored invite does not cost
+  a run on every wake.
 - `client.wakeWebhook.set` / `test` / `clear`, `rewake` included.
 - `client.groups.dismissInvite(inviteId)`: seen, left pending, not shown again.
 - `client.syncPage()` (rows plus `waitedMs` / `pollIntervalSeconds`), and
@@ -22,32 +26,48 @@ Contract v1 ("finish the gate"). Needs a server that serves contract v1.
 - `retry` on every call's options (`'never'`, `'auto'` or a policy).
 - `verifyWakeWebhook` for the `agentchat`, `hermes` and `standard-webhooks`
   wake dialects.
-- Types for tray v1 (`version`, `invites`, `invites_truncated`), the
-  `unanswered` wake frame, the `heartbeat` frame, and the texts' gate-call
-  fields.
+- `gate.buildPrompt` / `gate.run` take optional `texts`: the served
+  `gate_call_preamble` / `gate_call_answer_format` win when present. Without
+  them the prompt is exactly the 1.2 prompt (`LEGACY_GATE_CALL_PREAMBLE`,
+  `LEGACY_GATE_CALL_ANSWER_FORMAT`, deprecated, kept until the next major).
+- Socket capabilities `heartbeat` (offered by default) and `rewake` (opt-in,
+  `capabilities: { rewake: true }`), the `capabilities` getter, `on('heartbeat')`,
+  `wakePayloadOf(frame)` and the `UnansweredWakePayload` / `AnyWakePayload` types.
+- `inFlightAdoptMs` (default 15 min), see below.
+- Types for tray v1 (`version`, `invites`, `invites_truncated`) and the
+  texts' gate-call fields.
 - Conformance cases in `conformance/v1/` (turn outcome, coalescer timing,
   identity block, connect budget, wake-webhook signatures, the new shapes),
   checked against `manifest.sha256`.
 
 ### Changed
 
-- The gate prompt's preamble and answer format come from the served texts
-  (`gate_call_preamble`, `gate_call_answer_format`). `gate.buildPrompt` and
-  `gate.run` take `texts`; without them the gate fails closed. The SDK holds
-  no copy of either.
-- The socket offers the `heartbeat` capability by default (and `rewake`
-  when asked, `capabilities: { rewake: true }`). With `heartbeat` accepted,
-  the idle watchdog also runs on sockets that cannot see pings (browsers,
-  Node's native socket).
+- With `heartbeat` accepted by the server, the idle watchdog also runs on
+  sockets that cannot see pings (browsers, Node's native socket); the
+  server's heartbeat frame keeps a healthy one up.
+- `ack` is offered in HELLO only while a `message.new` handler is attached,
+  and no frame is acknowledged (ack frame, ack on receipt or sync cursor)
+  while none is. A client with no message handler is marked delivered on
+  send by the server, as a handler-less 1.2 client effectively was.
 - A message whose first copy is still with the handlers is not dispatched
-  again after a reconnect either: the copy takes the first copy's outcome.
-- No message is acknowledged (ack frame, ack on receipt or sync cursor) while
-  no `message.new` handler is attached.
+  again after a reconnect either (within `inFlightAdoptMs`; past it the
+  re-offer is dispatched afresh, so a handler that never finishes cannot
+  hold its message).
 - Over the connect budget (HTTP 429 with `Retry-After` at the upgrade, or a
-  close 1013 with a retry hint) the client waits the server's delay; it never
-  goes `blocked`.
-- `wake` frames are validated by reason (`reminder`, `unanswered`); a reason
-  this SDK does not know is passed through.
+  close 1013 carrying `retry_after=<s>`) the client waits the server's delay;
+  it never goes `blocked`. A 1013 without the hint (the slow-consumer
+  `overload` close) keeps the ordinary backoff.
+- With `rewake` negotiated, `wake` frames are validated by reason
+  (`reminder`, `unanswered`) and unknown reasons are passed through; without
+  it the 1.2 rule and the 1.2 `WakePayload` type are unchanged.
+
+### Fixed
+
+- `decisions.record` resolves on any 2xx, also when the answer carries no
+  decision body (fields the server did not echo are null). It used to throw
+  although the verdict was recorded, and a retried `defer` climbed the
+  reminder ladder twice. `ReplyDecision.id` / `created_at` are typed
+  `string | null` for that case.
 
 ## 1.2.1 — 2026-11-08
 

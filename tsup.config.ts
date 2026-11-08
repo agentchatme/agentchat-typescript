@@ -30,10 +30,6 @@ export default defineConfig({
     __SDK_VERSION__: JSON.stringify(pkg.version),
   },
   treeshake: true,
-  // Keep `node:` on the kit's lazy file imports: Deno resolves only the
-  // prefixed names, and a browser bundle never reaches them.
-  removeNodeProtocol: false,
-  external: [/^node:/],
   splitting: false,
   minify: false,
 })

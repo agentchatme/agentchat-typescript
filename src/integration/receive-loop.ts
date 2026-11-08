@@ -13,8 +13,10 @@
  *   (`startInviteTurn`, default `startTurn`) and the same rule.
  * - `singleRun` (Claude Code, Codex, routines, a listener): when anything is
  *   owed, start one run (`startRun`) with the served wake text; the run reads
- *   the tray itself and records its own verdicts. The loop records nothing on
- *   its behalf.
+ *   the tray itself and records its own verdicts. The loop records nothing
+ *   for cards. An invite still pending and undismissed after two completed
+ *   runs is dismissed (seen, left pending, not shown again), so an ignored
+ *   invite does not cost a run on every wake; the count is in memory only.
  *
  * Wakes: a `message.new` frame that is not the echo of the agent's own send,
  * a `wake` frame (a reminder, or unanswered cards), every accepted HELLO (a
@@ -578,9 +580,26 @@ export class ReceiveLoop {
     else if (end.status === 'failed') this.counts.runsFailed += 1
     else this.counts.runsNotStarted += 1
     this.emit({ type: 'run', end })
+    // Cards: the run recorded its own verdicts; nothing is recorded for it.
+    // Invites sit on the tray until answered, so one the run ignored would
+    // cost a run on every wake: the same rule as an invite turn (D5) —
+    // pending after the second completed run → dismissed.
+    const startedWith = tray === null ? [] : trayInvites(tray)
+    if (startedWith.length > 0 && !this.stopped) await this.track(this.afterRunInvites(startedWith, end))
     const outcome: CycleOutcome =
       end.status === 'completed' ? 'run_completed' : end.status === 'failed' ? 'run_failed' : 'run_not_started'
     return this.summary(outcome, { ...base, failure: end.status === 'completed' ? null : (end.detail ?? null) })
+  }
+
+  private async afterRunInvites(invites: TrayInvite[], end: RunEnd): Promise<void> {
+    const completed = end.status === 'completed'
+    const fresh = completed ? await this.readTray() : null
+    const turn: TurnEnd = completed
+      ? { status: 'completed', agentchatCalls: null }
+      : { status: 'failed', ...(end.detail !== undefined ? { detail: end.detail } : {}) }
+    for (const invite of invites) {
+      await this.settleInvite(invite, turn, fresh)
+    }
   }
 
   // ─── turns (gate-call mode) ─────────────────────────────────────────────
@@ -637,6 +656,7 @@ export class ReceiveLoop {
     })
     this.count(outcome.reason)
     if (outcome.reason === 'silent_first') this.remember(key, silentBefore + 1)
+    if (outcome.reason === 'card_left_tray' || outcome.reason === 'turn_recorded_verdict') this.silent.delete(key)
     let recorded = false
     if (outcome.action !== 'none' && !this.stopped) {
       try {
@@ -685,12 +705,17 @@ export class ReceiveLoop {
   }
 
   private async recordInviteOutcome(invite: TrayInvite, end: TurnEnd): Promise<void> {
-    const fresh = await this.readTray()
+    await this.settleInvite(invite, end, await this.readTray())
+  }
+
+  /** The D5 rule for one invite after a turn or a run, and the one call it asks for. */
+  private async settleInvite(invite: TrayInvite, end: TurnEnd, fresh: InboxTray | null): Promise<void> {
     const key = `invite|${invite.invite_id}`
     const silentBefore = this.silent.get(key) ?? 0
     const outcome = inviteOutcome({ turn: end, invite, freshTray: fresh, silentBefore })
     this.count(`invite_${outcome.reason}`)
     if (outcome.reason === 'silent_first') this.remember(key, silentBefore + 1)
+    if (outcome.reason === 'invite_answered') this.silent.delete(key)
     let recorded = false
     if (outcome.action !== 'none' && !this.stopped) {
       try {

@@ -527,12 +527,29 @@ export class AgentChatClient {
       category: options.category,
       through_message_id: options.throughMessageId,
     }
-    const res = await this.post<{ decision: ReplyDecision }>(
+    const res = await this.post<{ decision?: Partial<ReplyDecision> | null } | null | undefined>(
       `/v1/conversations/${encodeURIComponent(conversationId)}/decisions`,
       body,
       options,
     )
-    return res.decision
+    // Any 2xx means the verdict was recorded. A body without the decision
+    // (empty, null, or a proxy that stripped it) must not read as a failure:
+    // a caller that retried a `defer` would climb the reminder ladder twice.
+    // Fields the server did not echo are null; the request's own facts fill
+    // the rest.
+    const echoed = res !== null && typeof res === 'object' ? res.decision : undefined
+    const d: Partial<ReplyDecision> = echoed !== null && typeof echoed === 'object' ? echoed : {}
+    return {
+      ...d,
+      id: typeof d.id === 'string' ? d.id : null,
+      conversation_id: typeof d.conversation_id === 'string' ? d.conversation_id : conversationId,
+      decision: d.decision ?? options.decision,
+      category: d.category !== undefined ? d.category : (options.category ?? null),
+      through_message_id:
+        d.through_message_id !== undefined ? d.through_message_id : (options.throughMessageId ?? null),
+      defer_until: d.defer_until ?? null,
+      created_at: typeof d.created_at === 'string' ? d.created_at : null,
+    }
   }
 
   private markConversationRead(

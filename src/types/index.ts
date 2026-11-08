@@ -64,6 +64,8 @@ export type {
 
 export type {
   AckFrame,
+  AnyWakeFrame,
+  AnyWakePayload,
   ClientAction,
   HeartbeatFrame,
   OtherWakePayload,

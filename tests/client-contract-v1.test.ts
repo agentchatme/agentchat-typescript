@@ -51,15 +51,15 @@ describe('client.groups.dismissInvite', () => {
   it('POSTs …/dismiss with an Idempotency-Key and returns the body', async () => {
     const { fetch, calls } = capture([() => json(200, { dismissed: true })])
     const client = new AgentChatClient({ apiKey: 'k', fetch })
-    await expect(client.groups.dismissInvite('ginv_1')).resolves.toEqual({ dismissed: true })
-    expect(calls[0]).toMatchObject({ method: 'POST', url: 'https://api.agentchat.me/v1/groups/invites/ginv_1/dismiss' })
+    await expect(client.groups.dismissInvite('gri_1')).resolves.toEqual({ dismissed: true })
+    expect(calls[0]).toMatchObject({ method: 'POST', url: 'https://api.agentchat.me/v1/groups/invites/gri_1/dismiss' })
     expect(calls[0]!.headers['idempotency-key']).toMatch(/\S{8,}/)
   })
 
   it('is retried safely on a transient error, with the same key', async () => {
     const { fetch, calls } = capture([() => json(503, { code: 'X', message: 'busy' }), () => json(200, { dismissed: true })])
     const client = new AgentChatClient({ apiKey: 'k', fetch, retry: fastRetry })
-    await client.groups.dismissInvite('ginv_1', { idempotencyKey: 'key-1' })
+    await client.groups.dismissInvite('gri_1', { idempotencyKey: 'key-1' })
     expect(calls).toHaveLength(2)
     expect(calls.map((c) => c.headers['idempotency-key'])).toEqual(['key-1', 'key-1'])
   })
@@ -67,7 +67,7 @@ describe('client.groups.dismissInvite', () => {
   it('throws NotFoundError for an unknown, answered or cancelled invite', async () => {
     const { fetch } = capture([() => json(404, { code: 'INVITE_NOT_FOUND', message: 'no such invite' })])
     const client = new AgentChatClient({ apiKey: 'k', fetch })
-    await expect(client.groups.dismissInvite('ginv_x')).rejects.toBeInstanceOf(NotFoundError)
+    await expect(client.groups.dismissInvite('gri_x')).rejects.toBeInstanceOf(NotFoundError)
   })
 })
 
@@ -157,5 +157,45 @@ describe('per-call retry option', () => {
       client.inbox.tray({ retry: { maxRetries: 1, baseDelayMs: 1, maxDelayMs: 1 } }),
     ).rejects.toThrow()
     expect(calls).toHaveLength(2)
+  })
+})
+
+describe('client.decisions.record — any 2xx is a recorded verdict', () => {
+  it.each([
+    ['an empty body', () => new Response(null, { status: 200 })],
+    ['a 204', () => new Response(null, { status: 204 })],
+    ['a null body', () => json(200, null)],
+    ['a body without the decision', () => json(201, { ok: true })],
+    ['a null decision', () => json(200, { decision: null })],
+  ])('%s: resolves (fields the server did not echo are null), never throws', async (_what, respond) => {
+    const { fetch, calls } = capture([respond])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    const result = await client.decisions.record('conv_1', { decision: 'defer', category: 'goal_followup', throughMessageId: 'msg_9' })
+    expect(result).toEqual({
+      id: null,
+      conversation_id: 'conv_1',
+      decision: 'defer',
+      category: 'goal_followup',
+      through_message_id: 'msg_9',
+      defer_until: null,
+      created_at: null,
+    })
+    expect(calls).toHaveLength(1)
+  })
+
+  it('the server decision, when present, is returned as served', async () => {
+    const served = {
+      id: 'dec_1',
+      conversation_id: 'conv_1',
+      decision: 'defer',
+      category: 'goal_followup',
+      through_message_id: 'msg_9',
+      defer_until: '2026-11-08T09:15:00.000Z',
+      defer_step: 1,
+      created_at: '2026-11-08T09:00:00.000Z',
+    }
+    const { fetch } = capture([() => json(201, { decision: served })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    await expect(client.decisions.record('conv_1', { decision: 'defer' })).resolves.toEqual(served)
   })
 })

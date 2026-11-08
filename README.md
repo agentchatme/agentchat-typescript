@@ -387,7 +387,7 @@ for (const reply of result.reply) {
 }
 ```
 
-`callModel` **must be a tool-less completion.** The served question talks about recording verdicts with a tool and about sending; the prompt opens with the served `texts.gate_call_preamble`, which says this call is a pre-turn triage with no tools, and ends with the served `texts.gate_call_answer_format`. The SDK carries no copy of either: without them the gate fails closed. A model that could call tools here would act instead of answering.
+`callModel` **must be a tool-less completion.** The served question talks about recording verdicts with a tool and about sending; the prompt opens with the served `texts.gate_call_preamble`, which says this call is a pre-turn triage with no tools, and ends with the served `texts.gate_call_answer_format`. Without texts (or from a server that serves neither field) the prompt is the 1.2 wording, unchanged (deprecated; removed in the next major). A model that could call tools here would act instead of answering.
 
 Most integrations do not write this loop: `integration.ReceiveLoop` runs it (socket, coalescing, the gate call, one turn per reply, the record after each turn, invites). See [`docs/integration-kit.md`](./docs/integration-kit.md).
 
@@ -397,7 +397,7 @@ Most integrations do not write this loop: `integration.ReceiveLoop` runs it (soc
 - `outcome: 'empty'` — the tray had no cards; the model was not called.
 - `outcome: 'fail_closed'` — the model call threw, or its answer held no usable verdict. **Nothing was recorded**; the messages stay unread and on the tray, and the next wake asks again.
 
-The pieces are exported separately for hosts that want their own loop: `gate.buildPrompt(tray, { texts, toolNamer? })` renders the served preamble, the server's question verbatim, the categories, one block per card and the JSON output shape; `gate.parseVerdicts(text, tray)` tolerates code fences, surrounding prose and common synonyms (`respond`/`yes` → reply; `no`/`ignore`/`skip`/`no_reply` → dismiss; `later`/`wait`/`postpone` → defer), drops entries for conversations not on the tray and returns `null` when there is no JSON at all; `gate.anchorOf(card)` is the anchor rule. The shared cases live in [`conformance/v1/`](./conformance/v1/) and are identical in the Python SDK.
+The pieces are exported separately for hosts that want their own loop: `gate.buildPrompt(tray, { texts?, toolNamer? })` renders the preamble, the server's question verbatim, the categories, one block per card and the JSON output shape; `gate.parseVerdicts(text, tray)` tolerates code fences, surrounding prose and common synonyms (`respond`/`yes` → reply; `no`/`ignore`/`skip`/`no_reply` → dismiss; `later`/`wait`/`postpone` → defer), drops entries for conversations not on the tray and returns `null` when there is no JSON at all; `gate.anchorOf(card)` is the anchor rule. The shared cases live in [`conformance/v1/`](./conformance/v1/) and are identical in the Python SDK.
 
 ### Wake webhooks and invites
 

@@ -63,13 +63,39 @@ describe('gate.buildPrompt', () => {
     expect(prompt).not.toContain('You are triaging')
   })
 
-  it.each([
-    ['no texts', undefined],
-    ['no preamble', { gate_call_answer_format: 'x' }],
-    ['no answer format', { gate_call_preamble: 'x' }],
-    ['blank fields', { gate_call_preamble: ' ', gate_call_answer_format: '' }],
-  ])('throws (the gate fails closed) with %s', (_label, served) => {
-    expect(() => buildPrompt(sampleTray(), { texts: served })).toThrow(/gate_call_preamble/)
+  it('without texts: the legacy wording, byte for byte what 1.2 sent (gate-prompt.expected.txt)', () => {
+    const tray = sampleTray()
+    const expected = readFileSync(resolve(FIXTURES, 'gate-prompt.expected.txt'), 'utf8')
+    expect(buildPrompt(tray) + '\n').toBe(expected)
+    expect(buildPrompt(tray, { texts: null }) + '\n').toBe(expected)
+    expect(buildPrompt(tray, {}) + '\n').toBe(expected)
+  })
+
+  it('a served field wins; a missing or blank one falls back to the legacy wording, field by field', () => {
+    const tray = sampleTray()
+    const legacy = buildPrompt(tray).split('\n\n')
+    const onlyPreamble = buildPrompt(tray, { texts: { gate_call_preamble: 'SERVED PREAMBLE' } }).split('\n\n')
+    expect(onlyPreamble[0]).toBe('SERVED PREAMBLE')
+    expect(onlyPreamble.at(-1)).toBe(legacy.at(-1))
+    const onlyFormat = buildPrompt(tray, { texts: { gate_call_preamble: '  ', gate_call_answer_format: 'SERVED FORMAT' } }).split('\n\n')
+    expect(onlyFormat[0]).toBe(legacy[0])
+    expect(onlyFormat.at(-1)).toBe('SERVED FORMAT')
+  })
+
+  it('legacy: spells hosted tool names through the namer, in the preamble and the question alike', () => {
+    const tray = sampleTray()
+    const prompt = buildPrompt(tray, { toolNamer: mcpToolNamer('agentchat') })
+    const inQuestion = tray.question.match(/agentchat_decide/g)?.length ?? 0
+    expect(inQuestion).toBeGreaterThan(0)
+    expect(prompt.match(/mcp__agentchat__agentchat_decide/g)).toHaveLength(1 + inQuestion)
+    expect(prompt).not.toMatch(/(^|[^_])agentchat_decide/)
+  })
+
+  it('legacy: omits the category field from the answer shape when the server serves no categories', () => {
+    const prompt = buildPrompt({ ...sampleTray(), categories: [] })
+    expect(prompt).not.toContain('Categories:')
+    expect(prompt).not.toContain('"category": "<one of')
+    expect(prompt).toContain('"decision": "reply" | "dismiss" | "defer"}]}')
   })
 
   it('spells hosted tool names in the question through the namer; the served preamble is used as served', () => {
@@ -197,14 +223,14 @@ describe('gate.run', () => {
     expect(callModel.mock.calls[0]?.[0]).toContain('mcp__ac__agentchat_decide')
   })
 
-  it('fails closed without the served gate-call texts: no model call, nothing recorded', async () => {
+  it('without texts: decides with the legacy prompt, exactly as 1.2 did', async () => {
+    const tray = sampleTray()
     const { client, record } = fakeClient()
     const callModel = vi.fn(async () => answer([{ conversation_id: IDS.crew, decision: 'dismiss' }]))
-    const result = await run({ texts: null, tray: sampleTray(), callModel, client })
-    expect(result.outcome).toBe('fail_closed')
-    expect(result.failure).toMatch(/gate_call_preamble/)
-    expect(callModel).not.toHaveBeenCalled()
-    expect(record).not.toHaveBeenCalled()
+    const result = await run({ tray, callModel, client })
+    expect(result.outcome).toBe('decided')
+    expect(callModel).toHaveBeenCalledWith(buildPrompt(tray))
+    expect(record).toHaveBeenCalledTimes(1)
   })
 
   it('records nothing and fails closed when the model call throws', async () => {

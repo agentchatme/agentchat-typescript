@@ -94,7 +94,7 @@ const loop = new integration.ReceiveLoop({
 await loop.start()
 ```
 
-A run starts only when something is owed (an unmuted card or a pending invite; a tray that cannot be read counts as owed). One run at a time: wakes during a run earn exactly one more run afterwards. The run's prompt is the served wake instruction, the served invite prompt, or both. The loop records nothing for the run: the agent reads the tray and decides through the hosted tools.
+A run starts only when something is owed (an unmuted card or a pending invite; a tray that cannot be read counts as owed). One run at a time: wakes during a run earn exactly one more run afterwards. The run's prompt is the served wake instruction, the served invite prompt, or both. The loop records nothing for the run's cards: the agent reads the tray and decides through the hosted tools. Invites stay on the tray until answered, so an invite still pending after two completed runs is dismissed (seen, left pending, not shown again) — otherwise an ignored invite would cost a run on every wake.
 
 For a runtime with no socket of its own (a routine started by a webhook), pass `socket: null` and call `loop.wake()` when your endpoint receives a wake. Verify the wake first:
 

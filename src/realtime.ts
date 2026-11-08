@@ -1,4 +1,12 @@
-import type { WsMessage, Message, WakeFrame, HeartbeatFrame, SocketCapability } from './types/index.js'
+import type {
+  AnyWakeFrame,
+  AnyWakePayload,
+  HeartbeatFrame,
+  Message,
+  SocketCapability,
+  WakeFrame,
+  WsMessage,
+} from './types/index.js'
 import type { AgentChatClient, SyncEnvelope } from './client.js'
 import { ConnectionError } from './errors.js'
 import { connectBudgetDelayMs } from './connect-budget.js'
@@ -17,7 +25,11 @@ import {
  * ack goes out before handlers run and completion no longer gates it.
  */
 export type MessageHandler = (message: WsMessage) => void | Promise<void>
-/** Handler for `wake` frames: a content-free "check AgentChat" signal. */
+/**
+ * Handler for `wake` frames: a content-free "check AgentChat" signal. With
+ * the `rewake` capability other reasons arrive too; read the payload with
+ * `wakePayloadOf(frame)`.
+ */
 export type WakeHandler = (frame: WakeFrame) => void | Promise<void>
 /** Handler for `heartbeat` frames (capability `heartbeat`): proof of life, nothing to do. */
 export type HeartbeatHandler = (frame: HeartbeatFrame) => void
@@ -241,7 +253,17 @@ export interface RealtimeOptions {
    */
   livenessTimeoutMs?: number
   /**
-   * Socket capabilities to offer in HELLO besides `ack` (always offered).
+   * How long a message still with its handlers keeps a re-offer that arrives
+   * on a LATER connection from being dispatched again, in ms. Within that
+   * time the re-offer takes the running dispatch's outcome (no second
+   * dispatch); past it, it is dispatched afresh, so a handler that never
+   * finishes cannot hold its message forever. On the same connection a
+   * repeat always takes the running outcome. Default 900 000 (15 min).
+   */
+  inFlightAdoptMs?: number
+  /**
+   * Socket capabilities to offer in HELLO besides `ack` (offered while a
+   * `message.new` handler is attached).
    * The server echoes what it accepted (`capabilities` getter).
    *
    * - `heartbeat` (default `true`): the server sends a `heartbeat` frame on
@@ -258,6 +280,9 @@ export interface RealtimeOptions {
     rewake?: boolean
   }
 }
+
+/** See `inFlightAdoptMs`. */
+const DEFAULT_IN_FLIGHT_ADOPT_MS = 15 * 60_000
 
 /** Handshake deadline, `connect()` → `hello.ok`. See `handshakeTimeoutMs`. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000
@@ -320,6 +345,15 @@ const SERVER_AUTH_CLOSE_REASONS: readonly string[] = ['invalid token']
  * before `hello.ok`, means the credential was rejected. Pure; exported so
  * integrations and tests share one definition.
  */
+/**
+ * A wake frame's payload typed as every shape it can have: the reminder, and
+ * on a socket that negotiated `rewake` the `unanswered` wake and reasons this
+ * SDK does not know yet. Discriminate on `reason`.
+ */
+export function wakePayloadOf(frame: WakeFrame | AnyWakeFrame): AnyWakePayload {
+  return frame.payload as AnyWakePayload
+}
+
 export function isAuthRejectionClose(code: number, reason: string): boolean {
   if (UNAMBIGUOUS_AUTH_CLOSE_CODES.has(code)) return true
   if (code !== AMBIGUOUS_AUTH_CLOSE_CODE) return false
@@ -457,6 +491,7 @@ function toError(reason: unknown, context: string): Error {
 interface InFlight {
   promise: Promise<boolean>
   generation: number
+  startedAt: number
   settled: boolean
   ok: boolean
 }
@@ -500,6 +535,7 @@ export class RealtimeClient {
     webSocket?: typeof globalThis.WebSocket
     clientIdentity: AgentChatClientIdentity
     offeredCapabilities: SocketCapability[]
+    inFlightAdoptMs: number
   }
   private handlers = new Map<string, Set<MessageHandler>>()
   private errorHandlers = new Set<ErrorHandler>()
@@ -532,6 +568,8 @@ export class RealtimeClient {
   private ackMode = false
   // Every capability the server echoed in this connection's hello.ok.
   private negotiated: ReadonlySet<string> = new Set()
+  // What this connection's HELLO offered.
+  private offeredThisHello: SocketCapability[] = []
   // The current socket's upgrade was answered with an HTTP status instead of
   // 101 (Node `ws` only; a browser-shaped socket cannot see it).
   private upgradeRejection: { status: number; retryAfter: string | null } | null = null
@@ -548,11 +586,12 @@ export class RealtimeClient {
   // here (the server's reconnect backlog and the REST drain bring the same
   // stored rows; a lost ack makes the server re-offer it after a reconnect;
   // a slow handler is still on the first) is not handed to the handlers
-  // again, on this connection or a later one: it takes the first copy's
-  // outcome, and nothing ever waits for it. An entry lives exactly as long
-  // as its handlers run, so the map is bounded by the dispatches in flight.
-  // A handler that never finishes therefore holds its message: it is neither
-  // dispatched again nor acked (in the default mode) until it finishes.
+  // again: it takes the first copy's outcome, and nothing ever waits for it.
+  // On the same connection always; on a later one while the first copy has
+  // run less than `inFlightAdoptMs` — past that a re-offer is dispatched
+  // afresh, so a handler that never finishes cannot hold its message for
+  // good. An entry lives exactly as long as its handlers run, so the map is
+  // bounded by the dispatches in flight.
   private inFlight = new Map<string, InFlight>()
   // Drain rows that adopted an in-flight copy instead of being dispatched.
   // The cursor reads that copy's outcome; it never waits for it.
@@ -611,6 +650,10 @@ export class RealtimeClient {
       ackOnReceipt: options.ackOnReceipt ?? false,
       webSocket: options.webSocket,
       clientIdentity: options.clientIdentity ?? DEFAULT_CLIENT_IDENTITY,
+      inFlightAdoptMs:
+        typeof options.inFlightAdoptMs === 'number' && Number.isFinite(options.inFlightAdoptMs) && options.inFlightAdoptMs >= 0
+          ? options.inFlightAdoptMs
+          : DEFAULT_IN_FLIGHT_ADOPT_MS,
       offeredCapabilities: [
         'ack',
         ...(options.capabilities?.heartbeat === false ? [] : (['heartbeat'] as const)),
@@ -674,6 +717,7 @@ export class RealtimeClient {
     this.authenticated = false
     this.ackMode = false
     this.negotiated = new Set()
+    this.offeredThisHello = []
     this.upgradeRejection = null
     this.livenessMs =
       this.options.livenessTimeoutMs ?? (isPingCapable(ws) ? DEFAULT_LIVENESS_TIMEOUT_MS : 0)
@@ -698,7 +742,7 @@ export class RealtimeClient {
           JSON.stringify({
             type: 'hello',
             api_key: this.options.apiKey,
-            capabilities: this.options.offeredCapabilities,
+            capabilities: this.helloCapabilities(),
             client: this.options.clientIdentity.name,
             ...(this.options.clientIdentity.version
               ? { client_version: this.options.clientIdentity.version }
@@ -734,8 +778,11 @@ export class RealtimeClient {
           // (marks envelopes delivered on send); sending ack frames to it
           // would just be unknown frames.
           const caps = (message as { capabilities?: unknown }).capabilities
+          // A capability holds when this HELLO offered it AND the server
+          // accepted it (an echo of something not offered counts for nothing).
+          const offered = new Set<string>(this.offeredThisHello)
           this.negotiated = new Set(
-            Array.isArray(caps) ? caps.filter((c): c is string => typeof c === 'string') : [],
+            Array.isArray(caps) ? caps.filter((c): c is string => typeof c === 'string' && offered.has(c)) : [],
           )
           this.ackMode = this.negotiated.has('ack')
           // A server that sends heartbeat frames makes the idle deadline
@@ -1639,7 +1686,12 @@ export class RealtimeClient {
 
     let settlement: Promise<boolean>
 
-    const first = messageId !== null ? this.inFlight.get(messageId) : undefined
+    const running = messageId !== null ? this.inFlight.get(messageId) : undefined
+    const first =
+      running !== undefined &&
+      (running.generation === this.generation || Date.now() - running.startedAt < this.options.inFlightAdoptMs)
+        ? running
+        : undefined
     const handlers = this.handlers.get('message.new')
 
     if (first === undefined && (handlers === undefined || handlers.size === 0)) {
@@ -1675,6 +1727,7 @@ export class RealtimeClient {
       const entry: InFlight = {
         promise: Promise.resolve(false),
         generation: this.generation,
+        startedAt: Date.now(),
         settled: false,
         ok: false,
       }
@@ -1745,6 +1798,21 @@ export class RealtimeClient {
     }
   }
 
+  /**
+   * The capabilities this HELLO offers. `ack` only while a `message.new`
+   * handler is attached: with no handler nothing on this machine receives a
+   * message, and an ack-mode socket that never acks would leave every
+   * envelope `stored` until the recipient backlog cap. Without `ack` the
+   * server marks envelopes delivered as it sends them, which is what a
+   * handler-less 1.2 client effectively got (it acked frames no handler saw).
+   * The next HELLO, after a handler is attached, offers it again.
+   */
+  private helloCapabilities(): SocketCapability[] {
+    const withAck = this.hasMessageHandler()
+    this.offeredThisHello = this.options.offeredCapabilities.filter((c) => c !== 'ack' || withAck)
+    return this.offeredThisHello
+  }
+
   /** A `message.new` handler is attached: only then has this machine received a message. */
   private hasMessageHandler(): boolean {
     const handlers = this.handlers.get('message.new')
@@ -1788,9 +1856,20 @@ export class RealtimeClient {
     const p = payload as Record<string, unknown>
     const text = (key: string): string | null =>
       typeof p[key] !== 'string' || p[key] === '' ? `${key} is not a non-empty string` : null
+    const integerStep = typeof p.step === 'number' && Number.isInteger(p.step)
+    // Without `rewake` the server sends reminder wakes only, and handlers
+    // were written against that shape (`WakePayload`): the 1.2 rule, as it was.
+    if (!this.negotiated.has('rewake')) {
+      return (
+        text('reason') ??
+        text('conversation_id') ??
+        text('anchor_message_id') ??
+        text('at') ??
+        (integerStep ? null : 'step is not an integer')
+      )
+    }
     const reasonProblem = text('reason') ?? text('at')
     if (reasonProblem !== null) return reasonProblem
-    const integerStep = typeof p.step === 'number' && Number.isInteger(p.step)
     switch (p.reason) {
       case 'reminder':
         return text('conversation_id') ?? text('anchor_message_id') ?? (integerStep ? null : 'step is not an integer')

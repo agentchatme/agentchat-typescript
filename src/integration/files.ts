@@ -24,8 +24,17 @@ interface NodeModules {
 
 let modules: Promise<NodeModules> | null = null
 
+// The specifiers are not literals on purpose, and the imports carry the
+// bundlers' ignore comments: a browser or edge bundle of this SDK must never
+// try to resolve (or fail on) Node's built-ins it never calls.
+const FS_MODULE = 'node:fs/promises'
+const PATH_MODULE = 'node:path'
+
 function nodeModules(): Promise<NodeModules> {
-  modules ??= Promise.all([import('node:fs/promises'), import('node:path')]).then(([fs, path]) => ({
+  modules ??= Promise.all([
+    import(/* webpackIgnore: true */ /* @vite-ignore */ FS_MODULE) as Promise<FsPromises>,
+    import(/* webpackIgnore: true */ /* @vite-ignore */ PATH_MODULE) as Promise<PathModule>,
+  ]).then(([fs, path]) => ({
     fs: (fs as { default?: FsPromises }).default ?? fs,
     path: (path as { default?: PathModule }).default ?? path,
   }))

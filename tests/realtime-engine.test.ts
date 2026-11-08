@@ -34,6 +34,9 @@ async function connected(options: Partial<ConstructorParameters<typeof RealtimeC
     reconnect: false,
     ...options,
   })
+  // The usual order: a message handler is attached before the socket opens,
+  // so the HELLO offers acks. Tests add their own handlers alongside.
+  rt.on('message.new', () => undefined)
   await rt.connect()
   const ws = MockWebSocket.latest()
   ws.simulateOpen()
@@ -619,10 +622,13 @@ describe('RealtimeClient — a repeat while the first copy is still with the han
     for (const ackOnReceipt of [false, true]) {
       MockWebSocket.reset()
       const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false, ackOnReceipt })
+      // A handler that was there at HELLO (acks offered) and is gone when the frame arrives.
+      const off = rt.on('message.new', () => undefined)
       await rt.connect()
       const ws = MockWebSocket.latest()
       ws.simulateOpen()
       ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+      off()
       ws.simulateMessage(messageNew('c', 1))
       await settle()
       expect(sentFrames(ws, 'ack')).toEqual([])

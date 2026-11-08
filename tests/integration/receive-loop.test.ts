@@ -252,7 +252,7 @@ describe('ReceiveLoop — gate-call mode', () => {
     await loop.stop()
   })
 
-  it('fails closed without the served gate-call texts; waits without any texts', async () => {
+  it('texts without the gate-call fields: the legacy gate wording; no texts at all: waits', async () => {
     const { client, state, record } = fakeClient()
     state.tray = trayOf([DIRECT])
     const callModel = vi.fn(answer([{ conversation_id: DIRECT.conversation_id, decision: 'dismiss' }]))
@@ -261,9 +261,9 @@ describe('ReceiveLoop — gate-call mode', () => {
     await loop.start()
     loop.wake()
     await until(() => loop.status().lastCycle !== null)
-    expect(loop.status().lastCycle).toMatchObject({ outcome: 'fail_closed' })
-    expect(callModel).not.toHaveBeenCalled()
-    expect(record).not.toHaveBeenCalled()
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'decided', dismiss: 1 })
+    expect(callModel.mock.calls[0]![0]).toMatch(/^You are triaging your AgentChat tray before any turn starts/)
+    expect(record).toHaveBeenCalledTimes(1)
     await loop.stop()
 
     const none = gateLoop({ client, callModel, texts: textsSource(null) })
@@ -371,7 +371,7 @@ describe('ReceiveLoop — the socket', () => {
     await until(() => loop.status().coalescer.cycles === 2, 'a message wake')
     ws.simulateMessage(json('wake-frame.unanswered.json'))
     await until(() => loop.status().coalescer.cycles === 3, 'a wake-frame wake')
-    ws.simulateMessage({ type: 'group.invite.received', payload: { invite_id: 'ginv_1', group_id: 'grp_1' } })
+    ws.simulateMessage({ type: 'group.invite.received', payload: { invite_id: 'gri_1', group_id: 'grp_1' } })
     await until(() => loop.status().coalescer.cycles === 4, 'an invite wake')
     // Delivered on receipt, the echo included (it reached this machine); nothing else is sent.
     expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_own1', 'msg_peer2'])
@@ -507,3 +507,58 @@ describe('ReceiveLoop — single-run mode', () => {
 
 // Keep the type import used for readers of this file.
 export type { TrayInvite }
+
+// ─── conformance/v1/turn-outcome.cases.json — single_run_invite_cases ──────
+
+interface SingleRunInviteCase {
+  name: string
+  why: string
+  invite: TrayInvite
+  runs: Array<{ status: 'completed' | 'failed' | 'not_started'; fresh_tray: { invites: TrayInvite[]; invites_truncated: boolean } | null }>
+  expect: Array<{ action: string; reason: string }>
+}
+const outcomeDoc = json<{ single_run_invite_cases: SingleRunInviteCase[] }>('turn-outcome.cases.json')
+
+describe('conformance — single-run invites (turn-outcome.cases.json)', () => {
+  it.each(outcomeDoc.single_run_invite_cases.map((c) => [c.name, c] as const))('%s', async (_name, c) => {
+    // Each run: the tray it starts from holds the invite; a completed run is followed by the case's tray.
+    const answers: Array<InboxTray | Error> = []
+    for (const r of c.runs) {
+      answers.push(trayOf([], { invites: [c.invite] }))
+      if (r.status === 'completed') {
+        answers.push(r.fresh_tray === null ? new Error('read failed') : trayOf([], r.fresh_tray))
+      }
+    }
+    const tray = vi.fn(async () => {
+      const next = answers.shift() ?? trayOf([])
+      if (next instanceof Error) throw next
+      return next
+    })
+    const dismissInvite = vi.fn(async () => ({ dismissed: true }))
+    const record = vi.fn()
+    const client = { inbox: { tray }, decisions: { record }, groups: { dismissInvite }, baseUrl: 'https://api.agentchat.me' }
+    const statuses = c.runs.map((r) => r.status)
+    const outcomes: Array<{ action: string; reason: string }> = []
+    const loop = new ReceiveLoop({
+      mode: 'singleRun',
+      client: client as never,
+      texts: textsSource(),
+      socket: null,
+      quietMs: 0,
+      maxMs: 0,
+      startRun: async () => ({ status: statuses.shift()! }),
+      onEvent: (e) => {
+        if (e.type === 'invite_outcome') outcomes.push({ action: e.outcome.action, reason: e.outcome.reason })
+      },
+    })
+    for (let i = 0; i < c.runs.length; i++) {
+      loop.wake()
+      await until(() => outcomes.length === i + 1, `the outcome after run ${i + 1}`)
+    }
+    expect(outcomes).toEqual(c.expect)
+    const dismissals = c.expect.filter((e) => e.action === 'dismiss_invite').length
+    expect(dismissInvite).toHaveBeenCalledTimes(dismissals)
+    expect(record).not.toHaveBeenCalled() // cards: the run's own verdicts only
+    await loop.stop()
+  })
+})

@@ -36,9 +36,17 @@ export interface WsMessage {
   id?: string
 }
 
-/** `wake` payload: a deferred conversation's reminder came due. */
-export type ReminderWakePayload = {
-  reason: 'reminder'
+/**
+ * Payload of a `wake` frame, as every socket receives it: a deferred
+ * conversation's reminder came due. (The 1.2 shape, unchanged.)
+ */
+export type WakePayload = {
+  /**
+   * Why the server woke you. `reminder`: a deferred conversation is due
+   * again. Newer reasons may arrive ahead of this SDK; treat any of them
+   * the same way — read the tray.
+   */
+  reason: 'reminder' | (string & {})
   conversation_id: string
   /** The newest message the deferral covered; anything newer is a fresh card anyway. */
   anchor_message_id: string
@@ -48,11 +56,15 @@ export type ReminderWakePayload = {
   at: string
 }
 
+/** The reminder wake (`reason: "reminder"`). */
+export type ReminderWakePayload = WakePayload & { reason: 'reminder' }
+
 /**
- * `wake` payload (contract v1, sockets that negotiated `rewake`): cards on
- * your tray are still unanswered. The server re-wakes on its own ladder
- * (+1 m, +5 m, +30 m, +3 h after the newest message or invite on them);
- * no integration keeps a retry ladder of its own.
+ * `wake` payload (contract v1) on sockets that negotiated `rewake` only:
+ * cards on your tray are still unanswered. The server re-wakes on its own
+ * ladder (+1 m, +5 m, +30 m, +3 h after the newest message or invite on
+ * them); no integration keeps a retry ladder of its own. Read a frame's
+ * payload as this union with `wakePayloadOf(frame)`.
  */
 export type UnansweredWakePayload = {
   reason: 'unanswered'
@@ -63,10 +75,7 @@ export type UnansweredWakePayload = {
   at: string
 }
 
-/**
- * A wake reason this SDK does not know yet. Newer reasons may arrive ahead
- * of the SDK; treat any of them the same way — read the tray.
- */
+/** A wake reason this SDK does not know yet (sockets that negotiated `rewake` only). Read the tray. */
 export type OtherWakePayload = {
   reason: string & {}
   at: string
@@ -74,13 +83,19 @@ export type OtherWakePayload = {
   [key: string]: unknown
 }
 
-/** Payload of a `wake` frame. Discriminate on `reason`. */
-export type WakePayload = ReminderWakePayload | UnansweredWakePayload | OtherWakePayload
+/** Every `wake` payload a socket that negotiated `rewake` can receive. Discriminate on `reason`. */
+export type AnyWakePayload = ReminderWakePayload | UnansweredWakePayload | OtherWakePayload
 
 /** Server → client: a content-free wake. */
 export type WakeFrame = {
   type: 'wake'
   payload: WakePayload
+}
+
+/** A wake frame with its payload typed as every shape `rewake` allows. */
+export type AnyWakeFrame = {
+  type: 'wake'
+  payload: AnyWakePayload
 }
 
 /** Server → client: the heartbeat timer frame (capability `heartbeat`). Never answered. */

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { RealtimeClient, type RealtimeOptions } from '../src/realtime.js'
+import { RealtimeClient, wakePayloadOf, type RealtimeOptions } from '../src/realtime.js'
 import type { HeartbeatFrame, WakeFrame } from '../src/types/index.js'
 import { MockWebSocket, MockWebSocketCtor, sentFrames, settle } from './helpers/mock-websocket.js'
 import { json, raw } from './integration/fixtures.js'
@@ -39,6 +39,7 @@ const MockNodeWebSocketCtor = MockNodeWebSocket as unknown as typeof globalThis.
 function client(options: Partial<RealtimeOptions> = {}): RealtimeClient {
   const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, ...options })
   rt.onError(() => undefined)
+  rt.on('message.new', () => undefined) // attached before the socket opens: the HELLO offers acks
   return rt
 }
 
@@ -72,6 +73,32 @@ describe('capabilities', () => {
     MockWebSocket.latest().simulateOpen()
     expect(JSON.parse(MockWebSocket.latest().sent[0]!)).toMatchObject({ capabilities: ['ack'] })
     quiet.disconnect()
+  })
+
+  it('offers ack only while a message handler is attached: a handler-less client is marked on send, as before', async () => {
+    const bare = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor })
+    bare.onError(() => undefined)
+    await bare.connect()
+    let ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    expect(JSON.parse(ws.sent[0]!)).toMatchObject({ capabilities: ['heartbeat'] })
+    ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack', 'heartbeat'] }) // a server echo it was not offered
+    expect(bare.ackNegotiated).toBe(false)
+    // A handler attached now: frames reach it; the next HELLO offers acks.
+    const seen: string[] = []
+    bare.on('message.new', (m) => {
+      seen.push(String(m.payload.id))
+    })
+    ws.simulateMessage({ type: 'message.new', payload: { id: 'msg_1', conversation_id: 'c', seq: 1 } })
+    await settle()
+    expect(seen).toEqual(['msg_1'])
+    expect(sentFrames(ws, 'ack')).toEqual([])
+    ws.simulateClose(1006, '', false)
+    await bare.connect()
+    ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    expect(JSON.parse(ws.sent[0]!)).toMatchObject({ capabilities: ['ack', 'heartbeat'] })
+    bare.disconnect()
   })
 
   it('hello-ok.v1.json: exposes what the server accepted; a close clears it', async () => {
@@ -158,8 +185,27 @@ describe('wake frames (contract v1)', () => {
     rt.disconnect()
   })
 
-  it('validates each known reason by its own shape; forwards an unknown reason', async () => {
+  it('without rewake the 1.2 rule holds: only reminder-shaped wakes reach the handlers', async () => {
     const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false })
+    const errors: Error[] = []
+    rt.onError((e) => errors.push(e))
+    const ws = await open(rt) // the server echo names rewake, but this HELLO did not offer it
+    expect(rt.capabilities.has('rewake')).toBe(false)
+    const wakes: WakeFrame[] = []
+    rt.on('wake', (frame) => {
+      wakes.push(frame)
+    })
+    ws.simulateMessage(raw('wake-frame.unanswered.json'))
+    ws.simulateMessage({ type: 'wake', payload: { reason: 'something_new', at: '2026-11-08T09:01:00.000Z' } })
+    ws.simulateMessage(raw('wake-frame.json'))
+    await settle()
+    expect(wakes).toEqual([json('wake-frame.json')])
+    expect(errors).toHaveLength(2)
+    rt.disconnect()
+  })
+
+  it('with rewake: validates each known reason by its own shape; forwards an unknown reason', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false, capabilities: { rewake: true } })
     const errors: Error[] = []
     rt.onError((e) => errors.push(e))
     const ws = await open(rt)
@@ -177,7 +223,7 @@ describe('wake frames (contract v1)', () => {
     await settle()
     expect(errors).toHaveLength(4)
     expect(errors.every((e) => /wake frame failed validation/.test(e.message))).toBe(true)
-    expect(wakes.map((w) => w.payload.reason)).toEqual(['something_new', 'unanswered'])
+    expect(wakes.map((w) => wakePayloadOf(w).reason)).toEqual(['something_new', 'unanswered'])
     rt.disconnect()
   })
 })
@@ -253,6 +299,27 @@ describe('connect budget (D8) — the socket backs off for the server delay, nev
     ;(MockWebSocket.latest() as MockNodeWebSocket).simulateUpgradeAnswer(502)
     await vi.advanceTimersByTimeAsync(10)
     expect(MockWebSocket.instances).toHaveLength(2)
+    rt.disconnect()
+  })
+})
+
+describe('in-flight adoption across reconnects is bounded (inFlightAdoptMs)', () => {
+  it('a re-offer on a later connection past the bound is dispatched afresh', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false, inFlightAdoptMs: 0 })
+    rt.onError(() => undefined)
+    const calls: string[] = []
+    rt.on('message.new', async (m) => {
+      calls.push(String(m.payload.id))
+      if (calls.length === 1) await new Promise(() => undefined) // a handler that never finishes
+    })
+    let ws = await open(rt, { type: 'hello.ok', capabilities: ['ack'] })
+    ws.simulateMessage({ type: 'message.new', payload: { id: 'msg_1', conversation_id: 'c', seq: 1 } })
+    await settle()
+    ws.simulateClose(1006, '', false)
+    ws = await open(rt, { type: 'hello.ok', capabilities: ['ack'] })
+    ws.simulateMessage({ type: 'message.new', payload: { id: 'msg_1', conversation_id: 'c', seq: 1 } })
+    await settle()
+    expect(calls).toEqual(['msg_1', 'msg_1'])
     rt.disconnect()
   })
 })

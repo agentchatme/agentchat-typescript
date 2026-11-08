@@ -38,6 +38,7 @@ interface Doc {
   rules: string[]
   cases: Case[]
   invite_cases: InviteCase[]
+  single_run_invite_cases: Array<{ name: string }>
 }
 
 const doc = json<Doc>('turn-outcome.cases.json')
@@ -49,7 +50,7 @@ function turnOf(wire: WireTurn): TurnEnd {
 
 describe('conformance — turn-outcome.cases.json', () => {
   it('has unique case names', () => {
-    const names = [...doc.cases, ...doc.invite_cases].map((c) => c.name)
+    const names = [...doc.cases, ...doc.invite_cases, ...doc.single_run_invite_cases].map((c) => c.name)
     expect(new Set(names).size).toBe(names.length)
   })
 

@@ -9,8 +9,11 @@
  * verbatim and each card as the server built it; the text that frames the
  * call as a tool-less triage and the answer shape it ends with are the
  * served `texts.gate_call_preamble` and `texts.gate_call_answer_format`
- * (contract v1, D6) — this package carries no copy of them. Without them
- * the gate fails closed. This module adds the card labels, the parser, and
+ * (contract v1, D6). A caller that passes no texts (or a server that serves
+ * neither field) gets the wording this SDK used before the texts carried it
+ * (`LEGACY_GATE_CALL_PREAMBLE`, deprecated, kept until the next major), so an
+ * installed integration on a floating 1.x range keeps working unchanged. This
+ * module adds the card labels, the parser, and
  * the recording through `client.decisions.record`. No model runs here: the
  * host passes `callModel(prompt) => Promise<string>` so the judgement is the
  * agent's own model, in the host's own harness. That call MUST be a plain
@@ -90,6 +93,51 @@ export function mcpToolNamer(serverName: string): ToolNamer {
 // re-spells exactly those tokens and nothing else.
 const HOSTED_TOOL_TOKEN = /\bagentchat_[a-z0-9_]+\b/g
 
+// ─── Legacy gate-call wording ───────────────────────────────────────────────
+//
+// What this SDK said before the served texts carried `gate_call_preamble`
+// and `gate_call_answer_format` (contract v1, D6). Used only when the caller
+// passes no texts, or the texts lack a field — so integrations released
+// against 1.2.x (which call `gate.run` without texts) produce exactly the
+// prompt they always did (conformance `gate-prompt.expected.txt`). The
+// served texts win whenever they are there.
+
+/** The hosted verdict tool the legacy preamble names; spelled through the namer. */
+const LEGACY_DECIDE_TOOL = 'agentchat_decide'
+
+/**
+ * @deprecated The served `texts.gate_call_preamble` replaces it. Kept, byte
+ * for byte, for callers that pass no texts; removed in the next major.
+ */
+export function LEGACY_GATE_CALL_PREAMBLE(namer: ToolNamer = BARE_TOOL_NAMER): string {
+  return (
+    'You are triaging your AgentChat tray before any turn starts. This call has NO tools: ' +
+    `do not call ${namer(LEGACY_DECIDE_TOOL)}, do not open or send anything, and do not write a reply. ` +
+    'Answer the question below for every card, in JSON only; the host records your verdicts from that JSON. ' +
+    'Where the question says to record a verdict or to send, that happens later: for each conversation ' +
+    'you mark "reply", a turn will be started in which you open it and reply.'
+  )
+}
+
+/**
+ * @deprecated The served `texts.gate_call_answer_format` replaces it. Kept,
+ * byte for byte, for callers that pass no texts; removed in the next major.
+ */
+export function LEGACY_GATE_CALL_ANSWER_FORMAT(categories: readonly string[]): string {
+  let shape =
+    '{"decisions": [{"conversation_id": "<conversation_id from a card>", ' +
+    '"decision": "reply" | "dismiss" | "defer"'
+  if (categories.length > 0) {
+    shape += `, "category": "<one of: ${categories.join(', ')}>"`
+  }
+  shape += '}]}'
+  return (
+    'Answer with ONLY a JSON object, no prose and no code fences, in this shape: ' +
+    shape +
+    ' — one entry per card, every card decided.'
+  )
+}
+
 // ─── Verdicts ───────────────────────────────────────────────────────────────
 
 /** One parsed answer for one card. Snake-case: it is data, shared with the conformance fixtures. */
@@ -128,7 +176,8 @@ export interface BuildPromptOptions {
   /**
    * The served texts. `gate_call_preamble` opens the prompt and
    * `gate_call_answer_format` closes it, verbatim (they are already spelled
-   * for the runtime the texts were fetched for).
+   * for the runtime the texts were fetched for). Optional: a field that is
+   * absent falls back to the legacy wording this SDK always used.
    */
   texts?: GateTexts | null
   /** How this runtime spells the hosted tools named inside the tray's question. Default: as served. */
@@ -194,27 +243,26 @@ function sortKeysDeep(value: unknown): unknown {
 }
 
 /**
- * Render the gate prompt for one tray: the served preamble, the tray's
- * question verbatim, the categories, one block per card, then the served
- * answer format. Pure.
+ * Render the gate prompt for one tray: the preamble, the tray's question
+ * verbatim, the categories, one block per card, then the answer format.
+ * Pure. The preamble and the answer format are the served texts when given
+ * (`texts.gate_call_preamble`, `texts.gate_call_answer_format`), else the
+ * legacy wording (deprecated; unchanged from 1.2).
  *
- * Throws when the tray carries no question or the texts carry no gate-call
- * preamble or answer format — judging without them is exactly the drift
- * this design removes, so the gate fails closed instead.
+ * Throws when the tray carries no question — judging without it is exactly
+ * the drift this design removes, so the gate fails closed instead.
  */
 export function buildPrompt(tray: InboxTray, options?: BuildPromptOptions): string {
   const question: unknown = tray.question
   if (typeof question !== 'string' || question.trim().length === 0) {
     throw new Error('gate: tray carries no question')
   }
-  const preamble = servedText(options?.texts?.gate_call_preamble)
-  const answerFormat = servedText(options?.texts?.gate_call_answer_format)
-  if (preamble === null || answerFormat === null) {
-    throw new Error('gate: texts carry no gate_call_preamble / gate_call_answer_format (GET /v1/texts, contract v1)')
-  }
   const namer = options?.toolNamer ?? BARE_TOOL_NAMER
   const cards = cardsOf(tray)
   const categories = categoriesOf(tray)
+  const preamble = servedText(options?.texts?.gate_call_preamble) ?? LEGACY_GATE_CALL_PREAMBLE(namer)
+  const answerFormat =
+    servedText(options?.texts?.gate_call_answer_format) ?? LEGACY_GATE_CALL_ANSWER_FORMAT(categories)
 
   const sections: string[] = [preamble]
   sections.push(question.trim().replace(HOSTED_TOOL_TOKEN, (token) => namer(token)))
@@ -341,8 +389,8 @@ export interface RunGateOptions {
   tray: InboxTray
   callModel: GateModelCall
   client: GateClient
-  /** The served texts (`gate_call_preamble`, `gate_call_answer_format`). Without them the gate fails closed. */
-  texts: GateTexts | null | undefined
+  /** The served texts (`gate_call_preamble`, `gate_call_answer_format`). Absent: the legacy wording (deprecated). */
+  texts?: GateTexts | null
   /** How this runtime spells the hosted tools named inside the question. */
   toolNamer?: ToolNamer
 }

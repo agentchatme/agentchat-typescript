@@ -23,6 +23,7 @@ export {
 export {
   RealtimeClient,
   isAuthRejectionClose,
+  wakePayloadOf,
   type RealtimeOptions,
   type RealtimeState,
   type MessageHandler,

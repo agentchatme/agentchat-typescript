@@ -214,12 +214,13 @@ describe('RealtimeClient — handshake', () => {
     ws.simulateOpen()
 
     expect(ws.sent).toHaveLength(1)
-    // The HELLO frame always advertises the delivery-ack capability; the
-    // server decides (via the hello.ok echo) whether it's actually used.
+    // No message handler is attached, so the HELLO does not offer delivery
+    // acks (the server marks on send); with one attached it does, and the
+    // server decides (via the hello.ok echo) whether they are used.
     expect(JSON.parse(ws.sent[0])).toEqual({
       type: 'hello',
       api_key: 'sk_test',
-      capabilities: ['ack', 'heartbeat'],
+      capabilities: ['heartbeat'],
       client: 'typescript_sdk',
       client_version: '0.0.0-dev',
     })
@@ -835,6 +836,7 @@ describe('RealtimeClient — WS delivery acks (capability-negotiated)', () => {
       webSocket: MockWebSocketCtor,
       reconnect: false,
     })
+    rt.on('message.new', () => undefined) // attached before the socket opens: the HELLO offers acks
     await rt.connect()
     const ws = MockWebSocket.latest()
     ws.simulateOpen()
@@ -1297,6 +1299,7 @@ describe('RealtimeClient — liveness watchdog', () => {
   it('Node ws: trips after 100 s without frames or pings, as a client close, and reconnects', async () => {
     vi.useFakeTimers()
     const rt = makeClient({ webSocket: MockNodeWebSocketCtor })
+    rt.on('message.new', () => undefined)
     const p = probe(rt)
     await rt.connect()
     const ws = handshake(MockWebSocket.latest()) as MockNodeWebSocket
@@ -1555,6 +1558,7 @@ describe('RealtimeClient — state and capabilities', () => {
 
   it('ackNegotiated mirrors the hello.ok capabilities and resets on close', async () => {
     const rt = makeClient({ reconnect: false })
+    rt.on('message.new', () => undefined)
     expect(rt.ackNegotiated).toBe(false)
     await rt.connect()
     handshake(MockWebSocket.latest(), ['ack'])

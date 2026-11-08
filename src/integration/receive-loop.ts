@@ -363,6 +363,8 @@ export class ReceiveLoop {
   private readonly unsubscribe: Array<() => void> = []
   private readonly silent = new Map<string, number>()
   private readonly waiting: Array<{ handle: TurnHandle; admit: () => Promise<boolean> }> = []
+  /** Turns holding a slot (admitted, not yet ended or released). */
+  private readonly slotted = new Set<TurnHandle>()
 
   private handle: string | null
   private started = false
@@ -406,6 +408,9 @@ export class ReceiveLoop {
     this.maxTurns = maxTurns
     this.handle = options.handle ? normalizeHandle(options.handle) : null
     this.tracker = options.tracker ?? new TurnTracker({ now: this.now })
+    // A released turn (here, or by another holder of a shared tracker) frees
+    // its slot at once: the runtime may never end it.
+    this.unsubscribe.push(this.tracker.onRelease((handle) => this.releaseSlot(handle)))
     this.pacer = new Pacer(options.paceMs ?? PACE_MS, this.now)
     this.coalescer = new WakeCoalescer({
       onCycle: () => this.cycle(),
@@ -846,23 +851,30 @@ export class ReceiveLoop {
       this.counts.turnsQueued += 1
       return 'queued'
     }
-    this.activeTurns += 1
-    if (await admit()) return 'started'
-    this.activeTurns -= 1
-    return 'refused'
+    return (await this.admitInSlot(handle, admit)) ? 'started' : 'refused'
   }
 
-  /** A slot freed: start the turns waiting for one. */
-  private slotFreed(): void {
-    this.activeTurns = Math.max(0, this.activeTurns - 1)
-    void this.pump()
+  private async admitInSlot(handle: TurnHandle, admit: () => Promise<boolean>): Promise<boolean> {
+    this.activeTurns += 1
+    this.slotted.add(handle)
+    const started = await admit()
+    if (!started) this.releaseSlot(handle, { pump: false })
+    return started
+  }
+
+  /** The turn's slot is free (it ended, was refused, or was released): start the turns waiting for one. */
+  private releaseSlot(handle: TurnHandle, options: { pump?: boolean } = {}): void {
+    if (this.slotted.delete(handle)) this.activeTurns = Math.max(0, this.activeTurns - 1)
+    const queued = this.waiting.findIndex((w) => w.handle === handle)
+    if (queued >= 0) this.waiting.splice(queued, 1) // released while it waited
+    if (options.pump !== false) void this.pump()
   }
 
   private async pump(): Promise<void> {
     while (this.waiting.length > 0 && this.activeTurns < this.maxTurns && !this.stopped) {
       const next = this.waiting.shift()!
-      this.activeTurns += 1
-      if (!(await next.admit())) this.activeTurns -= 1
+      if (!this.tracker.holds(next.handle)) continue // released while it waited
+      await this.admitInSlot(next.handle, next.admit)
     }
   }
 
@@ -874,7 +886,7 @@ export class ReceiveLoop {
       await this.track(this.recordReplyOutcome(handle, reply, end))
     } finally {
       this.tracker.end(handle)
-      this.slotFreed()
+      this.releaseSlot(handle)
       this.afterTurnEnded()
     }
   }
@@ -924,7 +936,7 @@ export class ReceiveLoop {
       this.pacer.hold(`invite:${invite.invite_id}`, null)
     } finally {
       this.tracker.end(handle)
-      this.slotFreed()
+      this.releaseSlot(handle)
       this.afterTurnEnded()
     }
   }

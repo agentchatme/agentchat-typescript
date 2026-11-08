@@ -265,6 +265,17 @@ export interface RealtimeOptions {
    */
   inFlightAdoptMs?: number
   /**
+   * Backpressure: how many `message.new` handler runs may be queued or
+   * running at once, across every conversation. Past it the client takes no
+   * new messages in: a live frame is neither acknowledged (not even with
+   * `ackOnReceipt`) nor dispatched, and the offline drain stops, so the
+   * server keeps them `stored`. Once the queue is back to half, the client
+   * fetches what it left (the REST drain when a `client` is configured, else
+   * one quiet reconnect, after which the server re-offers its backlog). A
+   * slow handler therefore cannot grow memory without limit. Default 1000.
+   */
+  maxQueuedMessages?: number
+  /**
    * Socket capabilities to offer in HELLO besides `ack` (offered while a
    * `message.new` handler is attached).
    * The server echoes what it accepted (`capabilities` getter).
@@ -283,6 +294,9 @@ export interface RealtimeOptions {
     rewake?: boolean
   }
 }
+
+/** See `maxQueuedMessages`. */
+const DEFAULT_MAX_QUEUED_MESSAGES = 1_000
 
 /** See `inFlightAdoptMs`. */
 const DEFAULT_IN_FLIGHT_ADOPT_MS = 15 * 60_000
@@ -542,6 +556,7 @@ export class RealtimeClient {
     clientIdentity: AgentChatClientIdentity
     offeredCapabilities: SocketCapability[]
     inFlightAdoptMs: number
+    maxQueuedMessages: number
   }
   private handlers = new Map<string, Set<MessageHandler>>()
   private errorHandlers = new Set<ErrorHandler>()
@@ -577,8 +592,8 @@ export class RealtimeClient {
   // What this connection's HELLO offered, and whether it has been sent.
   private offeredThisHello: SocketCapability[] = []
   private helloSent = false
-  // The current socket is being closed to negotiate `ack` (see maybeRenegotiateAck).
-  private renegotiating = false
+  // The current socket is being closed for a quiet reconnect (maybeRenegotiateAck, jobDone).
+  private quietReconnect = false
   // The current socket's upgrade was answered with an HTTP status instead of
   // 101 (Node `ws` only; a browser-shaped socket cannot see it): ordinary backoff.
   private upgradeRejection: { status: number } | null = null
@@ -627,6 +642,12 @@ export class RealtimeClient {
   // message at a time per conversation, in seq order). The tail of each
   // lane; an idle lane has no entry, so the map holds busy lanes only.
   private lanes = new Map<string, Promise<void>>()
+  // Handler runs queued or running across all lanes (backpressure).
+  private queuedJobs = 0
+  // Messages were left un-taken because the queue was full; fetched again once it drains.
+  private shedding = false
+  // A drain was asked for while one ran: run once more when it ends.
+  private drainAgain = false
   private disposed = false
 
   constructor(options: RealtimeOptions) {
@@ -663,6 +684,10 @@ export class RealtimeClient {
       ackOnReceipt: options.ackOnReceipt ?? false,
       webSocket: options.webSocket,
       clientIdentity: options.clientIdentity ?? DEFAULT_CLIENT_IDENTITY,
+      maxQueuedMessages:
+        typeof options.maxQueuedMessages === 'number' && Number.isInteger(options.maxQueuedMessages) && options.maxQueuedMessages >= 1
+          ? options.maxQueuedMessages
+          : DEFAULT_MAX_QUEUED_MESSAGES,
       inFlightAdoptMs:
         typeof options.inFlightAdoptMs === 'number' && Number.isFinite(options.inFlightAdoptMs) && options.inFlightAdoptMs >= 0
           ? options.inFlightAdoptMs
@@ -840,6 +865,12 @@ export class RealtimeClient {
       // other event type (presence, group.deleted, message.read, system
       // messages without a seq) passes straight through.
       if (this.isMessageNew(message)) {
+        // Backpressure: with the handlers this far behind, the frame is not
+        // taken in — not acked, not dispatched — and the server keeps it.
+        if (this.queueFull()) {
+          this.startShedding()
+          return
+        }
         // Ack-on-receipt: the frame is parsed, the machine has it. Sent
         // before ordering so a frame parked on a seq gap is already
         // delivered; the post-dispatch ack is suppressed for this mode.
@@ -949,10 +980,16 @@ export class RealtimeClient {
   async drainOfflineEnvelopes(): Promise<void> {
     const client = this.options.client
     if (!client) return
-    if (this.drainInFlight) return
+    if (this.drainInFlight) {
+      this.drainAgain = true
+      return
+    }
     this.drainInFlight = true
     try {
-      await this.runDrain(client)
+      do {
+        this.drainAgain = false
+        await this.runDrain(client)
+      } while (this.drainAgain && !this.disposed && !this.shedding)
     } finally {
       this.drainInFlight = false
     }
@@ -1011,9 +1048,18 @@ export class RealtimeClient {
         this.restDrainOrigin.add(envelope)
         return envelope
       })
-      for (const envelope of envelopes) {
+      // Backpressure: rows past a full queue are not handed over; the
+      // cursor stops at the first of them and the drain ends here.
+      let injected = envelopes.length
+      for (const [index, envelope] of envelopes.entries()) {
+        if (this.queueFull()) {
+          injected = index
+          this.startShedding()
+          break
+        }
         this.processOrderedMessage(envelope)
       }
+      const shed = injected < envelopes.length
 
       if (!acksFrozen) {
         let ackCursor: string | null = null
@@ -1070,6 +1116,8 @@ export class RealtimeClient {
           }
         }
       }
+
+      if (shed) return
 
       if (invalidIndex >= 0) {
         this.emitError(
@@ -1168,8 +1216,8 @@ export class RealtimeClient {
   private handleClose(info: DisconnectInfo): void {
     const duringHandshake = !this.authenticated
     const rejection = this.upgradeRejection
-    const renegotiating = this.renegotiating
-    this.renegotiating = false
+    const quietReconnect = this.quietReconnect
+    this.quietReconnect = false
     this.upgradeRejection = null
     this.negotiated = new Set()
     this.clearWatchdogs()
@@ -1177,7 +1225,7 @@ export class RealtimeClient {
     // must not clear the backoff counter — that is the whole point of the
     // stability window.
     this.cancelStabilityTimer()
-    if (!renegotiating) this.noteConnectionEnded()
+    if (!quietReconnect) this.noteConnectionEnded()
     this.authenticated = false
     this.ackMode = false
 
@@ -1194,7 +1242,7 @@ export class RealtimeClient {
     // the next drain. That includes REST drain rows: the drain's cursor
     // covers only rows that reached a handler, so a parked row dropped
     // here stops the cursor instead of being acked.
-    if (this.options.ackOnReceipt || renegotiating) this.flushParkedFrames('connection_closed')
+    if (this.options.ackOnReceipt || quietReconnect) this.flushParkedFrames('connection_closed')
 
     // Drop all per-conversation ordering state. Across the connection
     // break the application is responsible for calling /sync (or
@@ -1208,8 +1256,9 @@ export class RealtimeClient {
 
     if (this.disposed) return
 
-    // A quiet renegotiation: straight back, no backoff step, no notice.
-    if (renegotiating) {
+    // A quiet reconnect (to negotiate acks, or to have the server re-offer
+    // what backpressure left with it): straight back, no backoff step, no notice.
+    if (quietReconnect) {
       this.retryNow()
       return
     }
@@ -1821,16 +1870,62 @@ export class RealtimeClient {
    */
   private runInLane(key: string, task: () => boolean | Promise<boolean>): Promise<boolean> {
     const previous = this.lanes.get(key)
+    this.queuedJobs += 1
     if (previous === undefined) {
       const now = task()
       // Finished synchronously: the lane stays free.
-      if (!isThenable(now)) return Promise.resolve(now)
+      if (!isThenable(now)) {
+        this.jobDone()
+        return Promise.resolve(now)
+      }
+      void now.then(
+        () => this.jobDone(),
+        () => this.jobDone(),
+      )
       this.setLaneTail(key, this.heldAtMost(now))
       return now
     }
     const result = previous.then(task)
+    void result.then(
+      () => this.jobDone(),
+      () => this.jobDone(),
+    )
     this.setLaneTail(key, previous.then(() => this.heldAtMost(result)))
     return result
+  }
+
+  private queueFull(): boolean {
+    return this.queuedJobs >= this.options.maxQueuedMessages
+  }
+
+  /** The queue is full: messages are left with the server from here (one notice per episode). */
+  private startShedding(): void {
+    if (this.shedding) return
+    this.shedding = true
+    this.emitError(
+      new ConnectionError(
+        `message handlers are behind: ${this.queuedJobs} messages queued (maxQueuedMessages ` +
+          `${this.options.maxQueuedMessages}); new messages stay on the server, unacknowledged, ` +
+          'and are fetched again once the handlers catch up',
+      ),
+    )
+  }
+
+  /** One handler run finished; once the queue is back to half, fetch what was left with the server. */
+  private jobDone(): void {
+    this.queuedJobs = Math.max(0, this.queuedJobs - 1)
+    if (!this.shedding || this.queuedJobs > Math.floor(this.options.maxQueuedMessages / 2)) return
+    this.shedding = false
+    if (this.disposed) return
+    if (this.options.client) {
+      void this.drainOfflineEnvelopes().catch((err) => {
+        this.emitError(err instanceof Error ? err : new ConnectionError('sync drain failed'))
+      })
+    } else if (this.ws !== null && this.authenticated) {
+      // No REST client: one quiet reconnect, and the server re-offers its backlog.
+      this.quietReconnect = true
+      this.abandonSocket(1000, 'client reconnects to fetch messages it left with the server')
+    }
   }
 
   /**
@@ -1927,7 +2022,7 @@ export class RealtimeClient {
     const ws = this.ws
     queueMicrotask(() => {
       if (this.ws !== ws || this.disposed || !this.hasMessageHandler()) return
-      this.renegotiating = true
+      this.quietReconnect = true
       this.abandonSocket(1000, 'client reconnects to negotiate delivery acks')
     })
   }
@@ -2161,6 +2256,14 @@ export class RealtimeClient {
         bufferedSeq: this.minBufferedSeq(state),
       })
       return
+    }
+
+    // Backpressure: with the handlers this far behind the fetched rows are
+    // not taken in (not acked, not dispatched); the gap resolves as a failed
+    // fill and the rows are fetched again once the queue drains.
+    if (this.queueFull()) {
+      this.startShedding()
+      fetched = []
     }
 
     // Insert fetched rows into the buffer (skip anything below our cursor —

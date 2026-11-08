@@ -424,3 +424,80 @@ describe('one message at a time per conversation (promise 2)', () => {
     rt.disconnect()
   })
 })
+
+describe('backpressure (maxQueuedMessages)', () => {
+  it('a full handler queue takes no new frames in (no ack on receipt, no dispatch); once half drained the drain fetches them', async () => {
+    // The server: stored rows stay until a sync/ack cursor covers them.
+    const rows: Array<Record<string, unknown>> = []
+    const sync = vi.fn(async (opts?: { after?: string }) => {
+      const from = opts?.after ? rows.findIndex((r) => r.delivery_id === opts.after) + 1 : 0
+      return rows.slice(from)
+    })
+    const syncAck = vi.fn(async (cursor: string) => {
+      const upto = rows.findIndex((r) => r.delivery_id === cursor)
+      rows.splice(0, upto + 1)
+      return { acked: upto + 1 }
+    })
+    const client = { sync, syncAck, getMessages: vi.fn(async () => []) }
+    const rt = new RealtimeClient({
+      apiKey: 'k',
+      webSocket: MockWebSocketCtor,
+      reconnect: false,
+      ackOnReceipt: true,
+      autoDrainOnConnect: false,
+      maxQueuedMessages: 2,
+      client: client as never,
+    })
+    const errors: Error[] = []
+    rt.onError((e) => errors.push(e))
+    const seen: string[] = []
+    const releases: Array<() => void> = []
+    rt.on('message.new', async (m) => {
+      seen.push(String(m.payload.id))
+      await new Promise<void>((r) => releases.push(r))
+    })
+    const ws = await open(rt, { type: 'hello.ok', capabilities: ['ack'] })
+    const frame = (seq: number) => ({ type: 'message.new', payload: { id: `m${seq}`, conversation_id: 'a', seq } })
+    for (let seq = 1; seq <= 5; seq++) ws.simulateMessage(frame(seq))
+    await settle()
+    // Two taken in (one running, one queued); three left with the server: not acked.
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['m1', 'm2'])
+    expect(seen).toEqual(['m1'])
+    expect(errors.filter((e) => /handlers are behind/.test(e.message))).toHaveLength(1)
+    // The server still holds m3..m5; the drain brings them once the queue is back to half.
+    rows.push(
+      ...[3, 4, 5].map((seq) => ({ id: `m${seq}`, conversation_id: 'a', seq, delivery_id: `del_${seq}`, type: 'text', content: { text: 'x' } })),
+    )
+    releases.shift()!()
+    await settle()
+    expect(sync).toHaveBeenCalled()
+    for (let i = 0; i < 50 && seen.length < 5; i++) {
+      releases.shift()?.()
+      await settle()
+    }
+    expect(seen).toEqual(['m1', 'm2', 'm3', 'm4', 'm5'])
+    releases.splice(0).forEach((r) => r())
+    await settle()
+    expect(rows).toEqual([]) // every row the drain handed over was acked by the cursor, once handled
+    rt.disconnect()
+  })
+
+  it('without a REST client the recovery is one quiet reconnect, so the server re-offers its backlog', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false, ackOnReceipt: true, maxQueuedMessages: 1 })
+    rt.onError(() => undefined)
+    const releases: Array<() => void> = []
+    rt.on('message.new', async () => {
+      await new Promise<void>((r) => releases.push(r))
+    })
+    const ws = await open(rt, { type: 'hello.ok', capabilities: ['ack'] })
+    ws.simulateMessage({ type: 'message.new', payload: { id: 'n1', conversation_id: 'a', seq: 1 } })
+    ws.simulateMessage({ type: 'message.new', payload: { id: 'n2', conversation_id: 'a', seq: 2 } })
+    await settle()
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['n1'])
+    releases.shift()!()
+    await settle()
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(ws.closed).toEqual({ code: 1000, reason: 'client reconnects to fetch messages it left with the server' })
+    rt.disconnect()
+  })
+})

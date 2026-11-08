@@ -47,8 +47,8 @@ function keyOf(turn: TrackedTurn): string {
 export class TurnTracker {
   private readonly now: () => number
   private readonly turns = new Map<string, { handle: TurnHandle; waitTimedOutAt: number | null; released: boolean }>()
-  /** Turns held with no way to learn their end: resolved by `release`. */
-  private readonly waiters = new Map<string, () => void>()
+  /** Waits on a turn's end, ended by `release`. */
+  private readonly waiters = new Map<string, Array<() => void>>()
 
   constructor(options: { now?: () => number } = {}) {
     this.now = options.now ?? Date.now
@@ -97,17 +97,24 @@ export class TurnTracker {
    * outcome is recorded.
    */
   async confirmedEnd(handle: TurnHandle, done: Promise<TurnEnd>): Promise<ConfirmedTurnEnd | null> {
+    if (!this.holds(handle)) return null
+    // `release` ends the wait at once, whatever the runtime still owes.
+    const released = new Promise<null>((resolve) => {
+      const list = this.waiters.get(handle.key) ?? []
+      list.push(() => resolve(null))
+      this.waiters.set(handle.key, list)
+    })
     let report: Promise<TurnEnd> | undefined = done
     while (report !== undefined) {
-      let end: TurnEnd
+      let end: TurnEnd | null
       try {
-        end = await report
+        end = await Promise.race([report, released])
       } catch (err) {
         if (!this.holds(handle)) return null
         return { status: 'failed', agentchatCalls: null, detail: `the turn's report failed: ${err instanceof Error ? err.message : String(err)}` }
       }
       // A turn released while it ran records nothing, whatever it reports.
-      if (!this.holds(handle)) return null
+      if (end === null || !this.holds(handle)) return null
       if (end.status !== 'still_running') return end
       const entry = this.turns.get(handle.key)!
       entry.waitTimedOutAt = this.now()
@@ -115,15 +122,18 @@ export class TurnTracker {
     }
     // Still running and the runtime cannot say when it ends: hold the turn
     // until `release` lets go of it.
-    return new Promise<null>((resolve) => {
-      const entry = this.turns.get(handle.key)
-      if (!entry || entry.handle !== handle) {
-        resolve(null)
-        return
-      }
-      this.waiters.set(handle.key, () => resolve(null))
-    })
+    return released
   }
+
+  /** Called with every turn `release` lets go of (a loop frees its slot). */
+  onRelease(listener: (handle: TurnHandle) => void): () => void {
+    this.releaseListeners.add(listener)
+    return () => {
+      this.releaseListeners.delete(listener)
+    }
+  }
+
+  private readonly releaseListeners = new Set<(handle: TurnHandle) => void>()
 
   /** Whether this turn is still tracked (not ended, not released). Check it after every await before recording. */
   holds(handle: TurnHandle): boolean {
@@ -134,7 +144,10 @@ export class TurnTracker {
   /** Stop tracking a turn (its outcome is recorded, or it never started). */
   end(handle: TurnHandle): void {
     const entry = this.turns.get(handle.key)
-    if (entry?.handle === handle) this.turns.delete(handle.key)
+    if (entry?.handle === handle) {
+      this.turns.delete(handle.key)
+      this.waiters.delete(handle.key)
+    }
   }
 
   /**
@@ -146,8 +159,16 @@ export class TurnTracker {
     if (!entry) return false
     entry.released = true
     this.turns.delete(key)
-    this.waiters.get(key)?.()
+    const waiting = this.waiters.get(key) ?? []
     this.waiters.delete(key)
+    for (const wake of waiting) wake()
+    for (const listener of this.releaseListeners) {
+      try {
+        listener(entry.handle)
+      } catch {
+        // an observer must not break the release
+      }
+    }
     return true
   }
 }

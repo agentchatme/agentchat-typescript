@@ -776,3 +776,61 @@ describe('ReceiveLoop — after stop, and what it reports', () => {
     await loop.stop()
   })
 })
+
+describe('ReceiveLoop — releaseTurn frees the slot', () => {
+  it('a turn the runtime never ends: releasing it frees its slot and the waiting turn starts', async () => {
+    const OPS = sample.conversations[2]!
+    const { client, state, record } = fakeClient()
+    state.tray = trayOf([DIRECT, OPS])
+    const started: TurnRequest[] = []
+    const startTurn = vi.fn(async (request: TurnRequest): Promise<TurnAdmission> => {
+      started.push(request)
+      return { started: true, done: new Promise<TurnEnd>(() => undefined) } // never ends
+    })
+    const { loop } = gateLoop({
+      client,
+      callModel: answer([
+        { conversation_id: DIRECT.conversation_id, decision: 'reply' },
+        { conversation_id: OPS.conversation_id, decision: 'reply' },
+      ]),
+      startTurn,
+    })
+    loop.wake()
+    await until(() => loop.status().counters.turnsWaiting === 1)
+    expect(loop.status().counters.turnsActive).toBe(1)
+    expect(loop.releaseTurn(`conversation:${DIRECT.conversation_id}`)).toBe(true)
+    await until(() => started.length === 2, 'the waiting turn after the release')
+    expect((started[1] as { conversationId: string }).conversationId).toBe(OPS.conversation_id)
+    expect(loop.status().counters).toMatchObject({ turnsActive: 1, turnsWaiting: 0 })
+    expect(record).not.toHaveBeenCalled() // the released turn records nothing
+    // Released while waiting: it is dropped, nothing starts for it.
+    await loop.stop()
+  })
+
+  it('a turn released while it waits for a slot never starts', async () => {
+    const OPS = sample.conversations[2]!
+    const { client, state } = fakeClient()
+    state.tray = trayOf([DIRECT, OPS])
+    const t = turns()
+    const { loop } = gateLoop({
+      client,
+      callModel: answer([
+        { conversation_id: DIRECT.conversation_id, decision: 'reply' },
+        { conversation_id: OPS.conversation_id, decision: 'reply' },
+      ]),
+      startTurn: t.startTurn,
+    })
+    loop.wake()
+    await until(() => loop.status().counters.turnsWaiting === 1)
+    expect(loop.releaseTurn(`conversation:${OPS.conversation_id}`)).toBe(true)
+    expect(loop.status().counters.turnsWaiting).toBe(0) // the queued admission is dropped
+    // Released, its card may be gated again (a new turn, queued behind the running one).
+    await until(() => loop.status().counters.turnsWaiting === 1, 'the card gated again')
+    t.ends[0]!({ status: 'failed' })
+    await until(() => t.started.length === 2)
+    await idle()
+    // OPS started once: the re-gated turn, never the dropped admission as well.
+    expect(t.started.filter((r) => (r as { conversationId?: string }).conversationId === OPS.conversation_id)).toHaveLength(1)
+    await loop.stop()
+  })
+})

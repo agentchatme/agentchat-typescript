@@ -67,6 +67,13 @@ server and against a contract v1 server.
   again after a reconnect either (within `inFlightAdoptMs`; past it the
   re-offer is dispatched afresh, so a handler that never finishes cannot
   hold its message).
+- Backpressure (`maxQueuedMessages`, default 1000 handler runs queued or
+  running): past it new messages are not taken in (no ack, not even with
+  `ackOnReceipt`; the drain stops) and stay `stored` on the server; once the
+  queue is back to half the client fetches them (the REST drain, or one
+  quiet reconnect without a `client`).
+- `ReceiveLoop.releaseTurn` frees the turn's slot at once and starts the
+  next waiting turn (a turn the runtime never ends no longer blocks the cap).
 - A first `message.new` handler attached after a HELLO that offered no `ack`
   makes the client reconnect once, quietly, so the next HELLO negotiates it.
 - A per-call `retry` never makes a POST / PATCH without an Idempotency-Key

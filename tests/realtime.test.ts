@@ -219,7 +219,7 @@ describe('RealtimeClient — handshake', () => {
     expect(JSON.parse(ws.sent[0])).toEqual({
       type: 'hello',
       api_key: 'sk_test',
-      capabilities: ['ack'],
+      capabilities: ['ack', 'heartbeat'],
       client: 'typescript_sdk',
       client_version: '0.0.0-dev',
     })

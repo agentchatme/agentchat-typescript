@@ -11,4 +11,12 @@ describe('public SDK surface', () => {
     expect(AgentChatClient.prototype).not.toHaveProperty('getWebhook')
     expect(AgentChatClient.prototype).not.toHaveProperty('deleteWebhook')
   })
+
+  it('exposes wake-webhook verification and the integration kit', () => {
+    expect(typeof sdk.verifyWakeWebhook).toBe('function')
+    expect(typeof sdk.WakeWebhookVerificationError).toBe('function')
+    expect(typeof sdk.integration.WakeCoalescer).toBe('function')
+    expect(typeof sdk.integration.turnOutcome).toBe('function')
+    expect(typeof sdk.integration.anchor.render).toBe('function')
+  })
 })

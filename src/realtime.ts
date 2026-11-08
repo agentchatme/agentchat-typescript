@@ -1,6 +1,7 @@
-import type { WsMessage, Message, WakeFrame } from './types/index.js'
+import type { WsMessage, Message, WakeFrame, HeartbeatFrame, SocketCapability } from './types/index.js'
 import type { AgentChatClient, SyncEnvelope } from './client.js'
 import { ConnectionError } from './errors.js'
+import { connectBudgetDelayMs } from './connect-budget.js'
 import { resolveWebSocket } from './ws-resolver.js'
 import {
   DEFAULT_CLIENT_IDENTITY,
@@ -18,6 +19,8 @@ import {
 export type MessageHandler = (message: WsMessage) => void | Promise<void>
 /** Handler for `wake` frames: a content-free "check AgentChat" signal. */
 export type WakeHandler = (frame: WakeFrame) => void | Promise<void>
+/** Handler for `heartbeat` frames (capability `heartbeat`): proof of life, nothing to do. */
+export type HeartbeatHandler = (frame: HeartbeatFrame) => void
 export type ErrorHandler = (error: Error) => void
 
 /**
@@ -55,7 +58,8 @@ export type DisconnectHandler = (info: DisconnectInfo) => void
  * - `connecting` — a socket is opening, or its HELLO awaits `hello.ok`.
  * - `ready` — `hello.ok` received; frames flow.
  * - `backoff` — the socket closed; the next attempt is scheduled with
- *   exponential backoff.
+ *   exponential backoff, or after the server's own delay when it answered
+ *   "over the connect budget" (HTTP 429 at the upgrade, close 1013).
  * - `blocked` — the server rejected the credential during the handshake; a
  *   fresh attempt is scheduled every 10–15 minutes until one is accepted.
  * - `stopped` — `disconnect()` was called.
@@ -227,12 +231,32 @@ export interface RealtimeOptions {
    * the default (100 000) survives one missed ping and trips on the second.
    *
    * Ping frames are visible only on a socket with `on('ping')` (Node `ws`).
-   * A browser-shaped socket cannot see them, so there the idle deadline is
-   * OFF unless set explicitly: only application frames would keep it alive,
-   * and an idle but healthy connection would otherwise be reopened every
-   * cycle. `0` disables it on any socket; the handshake deadline stays.
+   * A browser-shaped socket (browsers, Node's native socket) cannot see
+   * them; there the deadline runs on the server's `heartbeat` frame, sent
+   * on the same 45 s timer once `hello.ok` accepted the `heartbeat`
+   * capability (contract v1). Against a server that did not accept it the
+   * idle deadline is OFF on such a socket unless set explicitly: only
+   * application frames would keep it alive. `0` disables it on any socket;
+   * the handshake deadline stays.
    */
   livenessTimeoutMs?: number
+  /**
+   * Socket capabilities to offer in HELLO besides `ack` (always offered).
+   * The server echoes what it accepted (`capabilities` getter).
+   *
+   * - `heartbeat` (default `true`): the server sends a `heartbeat` frame on
+   *   its ping timer, which keeps the idle deadline working on sockets that
+   *   cannot see pings.
+   * - `rewake` (default `false`): the server sends `wake` frames with
+   *   `reason: "unanswered"` while cards on your tray stay unanswered, and
+   *   counts this socket as present, so the wake webhook does not re-wake
+   *   too. Offer it only when a `wake` handler acts on those frames (the
+   *   integration kit's `ReceiveLoop` does).
+   */
+  capabilities?: {
+    heartbeat?: boolean
+    rewake?: boolean
+  }
 }
 
 /** Handshake deadline, `connect()` → `hello.ok`. See `handshakeTimeoutMs`. */
@@ -307,7 +331,7 @@ export function isAuthRejectionClose(code: number, reason: string): boolean {
 // A Node `ws` socket is an EventEmitter and surfaces ping/pong frames; the
 // browser shape has neither `on` nor the frames.
 type PingCapableSocket = WebSocket & {
-  on(event: 'ping' | 'pong', listener: () => void): unknown
+  on(event: 'ping' | 'pong' | 'unexpected-response', listener: () => void): unknown
 }
 function isPingCapable(ws: WebSocket): ws is PingCapableSocket {
   return typeof (ws as { on?: unknown }).on === 'function'
@@ -475,6 +499,7 @@ export class RealtimeClient {
     ackOnReceipt: boolean
     webSocket?: typeof globalThis.WebSocket
     clientIdentity: AgentChatClientIdentity
+    offeredCapabilities: SocketCapability[]
   }
   private handlers = new Map<string, Set<MessageHandler>>()
   private errorHandlers = new Set<ErrorHandler>()
@@ -505,6 +530,11 @@ export class RealtimeClient {
   // True only when the server echoed the 'ack' capability in hello.ok.
   // Per-connection: reset on every close and re-negotiated on every HELLO.
   private ackMode = false
+  // Every capability the server echoed in this connection's hello.ok.
+  private negotiated: ReadonlySet<string> = new Set()
+  // The current socket's upgrade was answered with an HTTP status instead of
+  // 101 (Node `ws` only; a browser-shaped socket cannot see it).
+  private upgradeRejection: { status: number; retryAfter: string | null } | null = null
   /** One error per long outage, then silent until a stable connection. */
   private longOutageAnnounced = false
   /** One error per run of rejected handshakes, then silent until hello.ok. */
@@ -581,6 +611,11 @@ export class RealtimeClient {
       ackOnReceipt: options.ackOnReceipt ?? false,
       webSocket: options.webSocket,
       clientIdentity: options.clientIdentity ?? DEFAULT_CLIENT_IDENTITY,
+      offeredCapabilities: [
+        'ack',
+        ...(options.capabilities?.heartbeat === false ? [] : (['heartbeat'] as const)),
+        ...(options.capabilities?.rewake === true ? (['rewake'] as const) : []),
+      ],
     }
   }
 
@@ -638,6 +673,8 @@ export class RealtimeClient {
     this.ws = ws
     this.authenticated = false
     this.ackMode = false
+    this.negotiated = new Set()
+    this.upgradeRejection = null
     this.livenessMs =
       this.options.livenessTimeoutMs ?? (isPingCapable(ws) ? DEFAULT_LIVENESS_TIMEOUT_MS : 0)
     this.armHandshakeDeadline()
@@ -661,7 +698,7 @@ export class RealtimeClient {
           JSON.stringify({
             type: 'hello',
             api_key: this.options.apiKey,
-            capabilities: ['ack'],
+            capabilities: this.options.offeredCapabilities,
             client: this.options.clientIdentity.name,
             ...(this.options.clientIdentity.version
               ? { client_version: this.options.clientIdentity.version }
@@ -697,7 +734,19 @@ export class RealtimeClient {
           // (marks envelopes delivered on send); sending ack frames to it
           // would just be unknown frames.
           const caps = (message as { capabilities?: unknown }).capabilities
-          this.ackMode = Array.isArray(caps) && caps.includes('ack')
+          this.negotiated = new Set(
+            Array.isArray(caps) ? caps.filter((c): c is string => typeof c === 'string') : [],
+          )
+          this.ackMode = this.negotiated.has('ack')
+          // A server that sends heartbeat frames makes the idle deadline
+          // work on a socket that cannot see pings (contract v1, D7).
+          if (
+            this.negotiated.has('heartbeat') &&
+            this.livenessMs === 0 &&
+            this.options.livenessTimeoutMs === null
+          ) {
+            this.livenessMs = DEFAULT_LIVENESS_TIMEOUT_MS
+          }
           this.clearHandshakeTimer()
           // The idle deadline takes over from the handshake deadline.
           this.touchLiveness()
@@ -774,6 +823,30 @@ export class RealtimeClient {
       }
       ws.on('ping', alive)
       ws.on('pong', alive)
+      // An upgrade answered with an HTTP status (429 + Retry-After when the
+      // connect budget is spent, D8). With a listener here `ws` leaves the
+      // request to us: note the answer, then end the attempt — its close
+      // event comes next and the close funnel reads the note.
+      ws.on('unexpected-response', ((req: unknown, res: unknown) => {
+        const response = res as {
+          statusCode?: number
+          headers?: Record<string, string | string[] | undefined>
+          resume?: () => void
+        }
+        if (current()) {
+          const header = response.headers?.['retry-after']
+          this.upgradeRejection = {
+            status: typeof response.statusCode === 'number' ? response.statusCode : 0,
+            retryAfter: typeof header === 'string' ? header : Array.isArray(header) ? (header[0] ?? null) : null,
+          }
+        }
+        try { response.resume?.() } catch { /* drain only */ }
+        try {
+          const terminate = (ws as { terminate?: () => void }).terminate
+          if (typeof terminate === 'function') terminate.call(ws)
+          else (req as { destroy?: () => void }).destroy?.()
+        } catch { /* already closed */ }
+      }) as () => void)
     }
   }
 
@@ -1040,6 +1113,9 @@ export class RealtimeClient {
    */
   private handleClose(info: DisconnectInfo): void {
     const duringHandshake = !this.authenticated
+    const rejection = this.upgradeRejection
+    this.upgradeRejection = null
+    this.negotiated = new Set()
     this.clearWatchdogs()
     // Cancel BEFORE clearing `authenticated`: a connection that dies young
     // must not clear the backoff counter — that is the whole point of the
@@ -1075,6 +1151,27 @@ export class RealtimeClient {
     this.generation++
 
     if (this.disposed) return
+
+    // Over the connect budget (D8): an upgrade answered 429, or a close 1013.
+    // Back off for the server's delay — never `blocked`, whatever the reason
+    // text says.
+    if (info.initiator === 'server') {
+      const budgetDelay =
+        rejection !== null
+          ? connectBudgetDelayMs({ kind: 'upgrade', status: rejection.status, retryAfter: rejection.retryAfter })
+          : connectBudgetDelayMs({ kind: 'close', code: info.code, reason: info.reason })
+      if (budgetDelay !== null) {
+        this.emitError(
+          new ConnectionError(
+            `the server refused the connection: connect budget exceeded ` +
+              `(${rejection !== null ? `HTTP ${rejection.status}` : `close ${info.code}`}); ` +
+              `retrying in ${Math.round(budgetDelay / 1000)}s`,
+          ),
+        )
+        this.scheduleReconnect(budgetDelay)
+        return
+      }
+    }
 
     // Only a close the SERVER sent, before hello.ok, with a code and reason
     // that mean rejection, is a rejection. Our own watchdog closes say
@@ -1112,7 +1209,8 @@ export class RealtimeClient {
     this.handleClose({ code, reason, wasClean: false, initiator: 'client' })
   }
 
-  private scheduleReconnect(): void {
+  /** `serverDelayMs`: the server said how long to wait (connect budget); it replaces the backoff step. */
+  private scheduleReconnect(serverDelayMs?: number): void {
     if (this.disposed) return
     if (this.reconnectTimer) return
     if (!this.options.reconnect) {
@@ -1135,7 +1233,7 @@ export class RealtimeClient {
       )
     }
 
-    const delay = this.computeReconnectDelay(attempt)
+    const delay = serverDelayMs ?? this.computeReconnectDelay(attempt)
     this.setState('backoff')
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
@@ -1304,13 +1402,14 @@ export class RealtimeClient {
    *   are released.
    */
   on(event: 'wake', handler: WakeHandler): () => void
+  on(event: 'heartbeat', handler: HeartbeatHandler): () => void
   on(event: 'state', handler: StateHandler): () => void
   on(event: 'blocked', handler: BlockedHandler): () => void
   on(event: 'stopped', handler: StoppedHandler): () => void
   on(event: string, handler: MessageHandler): () => void
   on(
     event: string,
-    handler: MessageHandler | WakeHandler | StateHandler | BlockedHandler | StoppedHandler,
+    handler: MessageHandler | WakeHandler | HeartbeatHandler | StateHandler | BlockedHandler | StoppedHandler,
   ): () => void {
     // Lifecycle events live in their own sets: a server frame that happened
     // to be typed 'state' must never reach them through dispatch.
@@ -1430,6 +1529,14 @@ export class RealtimeClient {
   }
 
   /**
+   * The capabilities this connection's `hello.ok` accepted (`ack`,
+   * `heartbeat`, `rewake`, …). Empty before `hello.ok` and after a close.
+   */
+  get capabilities(): ReadonlySet<string> {
+    return this.negotiated
+  }
+
+  /**
    * Close the socket, cancel every timer, and release all handlers. The
    * only way into `stopped`, and the only way the client ever stops on
    * purpose: works from any state (`blocked` and a pending backoff
@@ -1452,6 +1559,7 @@ export class RealtimeClient {
     try { ws?.close(1000, 'client disconnect') } catch { /* already closed */ }
     this.authenticated = false
     this.ackMode = false
+    this.negotiated = new Set()
     this.setState('stopped')
     for (const handler of this.stoppedHandlers) {
       try { handler() } catch { /* user hook must not break flow */ }
@@ -1678,11 +1786,25 @@ export class RealtimeClient {
       return 'payload is not an object'
     }
     const p = payload as Record<string, unknown>
-    for (const key of ['reason', 'conversation_id', 'anchor_message_id', 'at'] as const) {
-      if (typeof p[key] !== 'string' || p[key] === '') return `${key} is not a non-empty string`
+    const text = (key: string): string | null =>
+      typeof p[key] !== 'string' || p[key] === '' ? `${key} is not a non-empty string` : null
+    const reasonProblem = text('reason') ?? text('at')
+    if (reasonProblem !== null) return reasonProblem
+    const integerStep = typeof p.step === 'number' && Number.isInteger(p.step)
+    switch (p.reason) {
+      case 'reminder':
+        return text('conversation_id') ?? text('anchor_message_id') ?? (integerStep ? null : 'step is not an integer')
+      case 'unanswered': {
+        const ids = p.conversation_ids
+        if (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string' && id.length > 0)) {
+          return 'conversation_ids is not a list of ids'
+        }
+        return integerStep ? null : 'step is not an integer'
+      }
+      default:
+        // A reason this SDK does not know yet: forward it; the handler reads the tray.
+        return p.step === undefined || integerStep ? null : 'step is not an integer'
     }
-    if (typeof p.step !== 'number' || !Number.isInteger(p.step)) return 'step is not an integer'
-    return null
   }
 
   // ─── Per-conversation seq ordering ───────────────────────────────────────

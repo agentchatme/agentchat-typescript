@@ -2,7 +2,7 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. This project follows [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 1.3.0 — 2026-11-08
 
 Contract v1 ("finish the gate"). Additive at the API level: code written
 for 1.2.x compiles and runs unchanged (see "Type-level changes" for the

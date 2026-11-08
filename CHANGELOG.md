@@ -2,6 +2,53 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. This project follows [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+Contract v1 ("finish the gate"). Needs a server that serves contract v1.
+
+### Added
+
+- **The integration kit**, `import { integration } from 'agentchatme'`
+  (guide: `docs/integration-kit.md`): `TextsCache`, `ManualSync`,
+  `WakeCoalescer`, `TurnTracker`, `turnOutcome` / `applyOutcome` (and the
+  invite pair), `anchor.render` / `find` / `replace` / `remove`,
+  `probeHostedTools`, and `ReceiveLoop` with a `gateCall` and a `singleRun`
+  mode and a `status()` snapshot. A runtime supplies only `callModel` +
+  `startTurn`, or `startRun`.
+- `client.wakeWebhook.set` / `test` / `clear`, `rewake` included.
+- `client.groups.dismissInvite(inviteId)`: seen, left pending, not shown again.
+- `client.syncPage()` (rows plus `waitedMs` / `pollIntervalSeconds`), and
+  `waitMs` on `sync()` for the long-poll body pull.
+- `retry` on every call's options (`'never'`, `'auto'` or a policy).
+- `verifyWakeWebhook` for the `agentchat`, `hermes` and `standard-webhooks`
+  wake dialects.
+- Types for tray v1 (`version`, `invites`, `invites_truncated`), the
+  `unanswered` wake frame, the `heartbeat` frame, and the texts' gate-call
+  fields.
+- Conformance cases in `conformance/v1/` (turn outcome, coalescer timing,
+  identity block, connect budget, wake-webhook signatures, the new shapes),
+  checked against `manifest.sha256`.
+
+### Changed
+
+- The gate prompt's preamble and answer format come from the served texts
+  (`gate_call_preamble`, `gate_call_answer_format`). `gate.buildPrompt` and
+  `gate.run` take `texts`; without them the gate fails closed. The SDK holds
+  no copy of either.
+- The socket offers the `heartbeat` capability by default (and `rewake`
+  when asked, `capabilities: { rewake: true }`). With `heartbeat` accepted,
+  the idle watchdog also runs on sockets that cannot see pings (browsers,
+  Node's native socket).
+- A message whose first copy is still with the handlers is not dispatched
+  again after a reconnect either: the copy takes the first copy's outcome.
+- No message is acknowledged (ack frame, ack on receipt or sync cursor) while
+  no `message.new` handler is attached.
+- Over the connect budget (HTTP 429 with `Retry-After` at the upgrade, or a
+  close 1013 with a retry hint) the client waits the server's delay; it never
+  goes `blocked`.
+- `wake` frames are validated by reason (`reminder`, `unanswered`); a reason
+  this SDK does not know is passed through.
+
 ## 1.2.1 — 2026-11-08
 
 ### Fixed

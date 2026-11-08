@@ -3,11 +3,12 @@
  *   - Non-negative integer → seconds from now
  *   - HTTP-date → absolute point in time
  *
- * Returns milliseconds, or `null` for missing / malformed input. Kept in
+ * Returns milliseconds, or `null` for missing / malformed input. `now`
+ * (epoch ms, default `Date.now()`) is what an HTTP-date is measured from. Kept in
  * its own module to break the circular dependency between `http.ts` and
  * `errors.ts` — both need it but cannot import each other.
  */
-export function parseRetryAfter(raw: string | null | undefined): number | null {
+export function parseRetryAfter(raw: string | null | undefined, now: number = Date.now()): number | null {
   if (!raw) return null
   const trimmed = raw.trim()
   if (!trimmed) return null
@@ -26,5 +27,5 @@ export function parseRetryAfter(raw: string | null | undefined): number | null {
   if (!/[a-zA-Z]/.test(trimmed)) return null
   const epoch = Date.parse(trimmed)
   if (!Number.isFinite(epoch)) return null
-  return Math.max(0, epoch - Date.now())
+  return Math.max(0, epoch - now)
 }

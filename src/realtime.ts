@@ -515,19 +515,19 @@ export class RealtimeClient {
   // dispatch suppress its own redelivery.
   private dedupSeen = new Set<string>()
   // Dispatches still running, by message id. A second copy of an id that is
-  // here on the same connection (the server's reconnect backlog and the REST
-  // drain bring the same stored rows; a slow handler is still on the first)
-  // is not handed to the handlers again: it takes the first copy's outcome,
-  // and nothing ever waits for it. An entry lives exactly as long as its
-  // handlers run, so the map is bounded by the dispatches in flight.
+  // here (the server's reconnect backlog and the REST drain bring the same
+  // stored rows; a lost ack makes the server re-offer it after a reconnect;
+  // a slow handler is still on the first) is not handed to the handlers
+  // again, on this connection or a later one: it takes the first copy's
+  // outcome, and nothing ever waits for it. An entry lives exactly as long
+  // as its handlers run, so the map is bounded by the dispatches in flight.
+  // A handler that never finishes therefore holds its message: it is neither
+  // dispatched again nor acked (in the default mode) until it finishes.
   private inFlight = new Map<string, InFlight>()
   // Drain rows that adopted an in-flight copy instead of being dispatched.
   // The cursor reads that copy's outcome; it never waits for it.
   private drainAdopted = new WeakMap<WsMessage, InFlight>()
-  // Bumped on every socket close. Copies adopt an in-flight first copy only
-  // on the same connection; a re-offer on a later one is dispatched afresh
-  // even while the first copy runs (a handler that never finishes must not
-  // swallow every re-offer).
+  // Bumped on every socket close; recorded on each dispatch for diagnostics.
   private generation = 0
   // Envelopes injected by the REST drain, as opposed to live WS frames.
   // Drain rows are acknowledged via the REST sync/ack cursor, never via a
@@ -733,7 +733,7 @@ export class RealtimeClient {
         // Ack-on-receipt: the frame is parsed, the machine has it. Sent
         // before ordering so a frame parked on a seq gap is already
         // delivered; the post-dispatch ack is suppressed for this mode.
-        if (this.options.ackOnReceipt) {
+        if (this.options.ackOnReceipt && this.hasMessageHandler()) {
           const messageId = this.extractMessageId(message)
           if (messageId !== null) this.sendAckFrame(messageId)
         }
@@ -1531,24 +1531,28 @@ export class RealtimeClient {
 
     let settlement: Promise<boolean>
 
-    const inFlight = messageId !== null ? this.inFlight.get(messageId) : undefined
-    const first = inFlight?.generation === this.generation ? inFlight : undefined
+    const first = messageId !== null ? this.inFlight.get(messageId) : undefined
+    const handlers = this.handlers.get('message.new')
 
-    if (messageId !== null && this.dedupHit(messageId)) {
+    if (first === undefined && (handlers === undefined || handlers.size === 0)) {
+      // No handler attached: nothing on this machine received the message.
+      // Not acked on any path (the drain cursor stops here too) and not
+      // remembered, so the server keeps offering it until a handler is there.
+      settlement = Promise.resolve(false)
+    } else if (messageId !== null && this.dedupHit(messageId)) {
       settlement = Promise.resolve(true)
       if (ackAfterDispatch) this.sendAckFrame(messageId)
     } else if (messageId !== null && first !== undefined) {
-      // The same message is already with the handlers on this connection.
-      // Take that outcome instead of dispatching it twice: success acks this
-      // copy too (like a dedup hit), a failure leaves it unacked. Nothing
-      // waits for it: the drain cursor reads `drainAdopted` instead.
+      // The same message is already with the handlers (this connection or an
+      // earlier one). Take that outcome instead of dispatching it twice:
+      // success acks this copy too (like a dedup hit), a failure leaves it
+      // unacked. Nothing waits for it: the drain cursor reads `drainAdopted`.
       if (isDrainRow) this.drainAdopted.set(message, first)
       settlement = first.promise.then((ok) => {
         if (ok && ackAfterDispatch) this.sendAckFrame(messageId)
         return ok
       })
     } else {
-      const handlers = this.handlers.get('message.new')
       const pending: Array<Promise<unknown>> = []
       if (handlers) {
         for (const handler of handlers) {
@@ -1631,6 +1635,12 @@ export class RealtimeClient {
       if (oldest === undefined) break
       this.dedupSeen.delete(oldest)
     }
+  }
+
+  /** A `message.new` handler is attached: only then has this machine received a message. */
+  private hasMessageHandler(): boolean {
+    const handlers = this.handlers.get('message.new')
+    return handlers !== undefined && handlers.size > 0
   }
 
   private extractMessageId(message: WsMessage): string | null {
@@ -1846,7 +1856,7 @@ export class RealtimeClient {
         payload: row as unknown as Record<string, unknown>,
       }
       // Ack-on-receipt: the fetch is this machine's receipt of the row.
-      if (this.options.ackOnReceipt) {
+      if (this.options.ackOnReceipt && this.hasMessageHandler()) {
         const messageId = this.extractMessageId(envelope)
         if (messageId !== null) this.sendAckFrame(messageId)
       }

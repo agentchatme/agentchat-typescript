@@ -65,11 +65,27 @@ export type {
 export type {
   AckFrame,
   ClientAction,
+  HeartbeatFrame,
+  OtherWakePayload,
+  ReminderWakePayload,
   ServerEvent,
+  SocketCapability,
+  UnansweredWakePayload,
   WakeFrame,
   WakePayload,
   WsMessage,
 } from './ws.js'
+
+export type {
+  ClearWakeWebhookResult,
+  SetWakeWebhookOptions,
+  SetWakeWebhookRequest,
+  TestWakeResult,
+  WakeDialect,
+  WakeWebhookPayload,
+  WakeWebhookState,
+  WakeWebhookStatus,
+} from './wake-webhook.js'
 
 export type {
   InboxCard,
@@ -78,6 +94,7 @@ export type {
   InboxCardRelationship,
   InboxTray,
   InboxTrayOptions,
+  TrayInvite,
 } from './inbox-tray.js'
 export {
   INBOX_TRAY_DEFAULT_LIMIT,

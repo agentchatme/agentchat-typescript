@@ -26,6 +26,11 @@ import type {
   RecordReplyDecisionRequest,
   ReplyDecision,
   Texts,
+  ClearWakeWebhookResult,
+  SetWakeWebhookOptions,
+  SetWakeWebhookRequest,
+  TestWakeResult,
+  WakeWebhookStatus,
 } from './types/index.js'
 import { AgentChatError } from './errors.js'
 import {
@@ -33,6 +38,7 @@ import {
   type HttpRequestOptions,
   type HttpResponse,
   type RequestHooks,
+  type RetryOption,
   type RetryPolicy,
 } from './http.js'
 import { paginate } from './pagination.js'
@@ -60,6 +66,12 @@ function parseBacklogWarning(header: string | null): BacklogWarning | null {
   if (!recipientHandle) return null
   if (!Number.isFinite(undeliveredCount) || !Number.isInteger(undeliveredCount)) return null
   return { recipientHandle, undeliveredCount }
+}
+
+function intHeader(headers: Headers | undefined, name: string): number | null {
+  const raw = headers?.get?.(name)
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return null
+  return Number(raw.trim())
 }
 
 function generateClientMsgId(): string {
@@ -276,6 +288,14 @@ export interface CallOptions {
    * (the server returns the original outcome instead of double-executing).
    */
   idempotencyKey?: string
+  /**
+   * Retry policy for this call only: `'never'` (one attempt), `'auto'` (the
+   * client's policy) or a `RetryPolicy`. A long-poll should pass `'never'`
+   * (or a short policy): a retry parks again, past the caller's deadline.
+   * Applies only to calls that may be retried at all (GET/PUT/DELETE, or a
+   * POST that carries an Idempotency-Key).
+   */
+  retry?: RetryOption
 }
 
 // ─── Engine resources ───────────────────────────────────────────────────────
@@ -345,6 +365,63 @@ export interface TextsResource {
   get(options: GetTextsOptions & CallOptions): Promise<Texts>
 }
 
+export interface GroupsResource {
+  /**
+   * Dismiss a pending group invite: "seen — leave it pending, don't show it
+   * again" (contract v1). It leaves your tray's `invites` and stops counting
+   * for the server's re-wakes; the inviter is told nothing and the invite
+   * can still be accepted or declined. Idempotent. Throws `NotFoundError`
+   * (`INVITE_NOT_FOUND`) for an unknown, answered or cancelled invite. An
+   * Idempotency-Key is sent (generated unless you pass one), so a transient
+   * failure is retried safely.
+   */
+  dismissInvite(inviteId: string, options?: CallOptions): Promise<{ dismissed: boolean }>
+}
+
+export interface WakeWebhookResource {
+  /**
+   * Create or replace your wake webhook (`PUT /v1/agents/me/wake-webhook`):
+   * where the platform POSTs a content-free wake when you hold no socket.
+   * `rewake: true` also re-wakes it while cards stay unanswered (contract
+   * v1). Upserting resets the subscription to `active`.
+   */
+  set(options: SetWakeWebhookOptions & CallOptions): Promise<WakeWebhookStatus>
+  /**
+   * Send yourself one test wake now, framed in your dialect, and return the
+   * receiver's answer. Throws `NotFoundError` when none is registered;
+   * rate-limited server-side (10 per hour).
+   */
+  test(options?: CallOptions): Promise<TestWakeResult>
+  /** Remove your wake webhook. Idempotent: `removed: false` when there was none. */
+  clear(options?: CallOptions): Promise<ClearWakeWebhookResult>
+}
+
+/** Options for `client.syncPage()` / `client.sync()`. */
+export interface SyncOptions extends CallOptions {
+  /** Max rows (server default 200, max 500). */
+  limit?: number
+  /** The last `delivery_id` of the previous page: pages forward without committing anything. */
+  after?: string
+  /**
+   * Long-poll budget in ms: when nothing is waiting the server holds the
+   * request up to this long and answers the moment something lands (ceiling
+   * `INBOX_WAIT_MAX_MS`). `0` (default) reads once. The per-call timeout is
+   * raised to cover the wait unless you pass `timeoutMs`.
+   */
+  waitMs?: number
+}
+
+/** One `GET /v1/messages/sync` answer with the response facts a poller needs. */
+export interface SyncPage {
+  rows: SyncEnvelope[]
+  /** How long the server held the request (`X-AgentChat-Waited-Ms`); null for a plain read. */
+  waitedMs: number | null
+  /** The server's idle poll hint (`X-AgentChat-Poll-Interval-Seconds`), on an empty plain read; else null. */
+  pollIntervalSeconds: number | null
+  requestId: string | null
+  headers: Headers
+}
+
 export class AgentChatClient {
   private readonly http: HttpTransport
   private readonly onBacklogWarning?: BacklogWarningHandler
@@ -358,6 +435,10 @@ export class AgentChatClient {
   readonly conversations: ConversationsResource
   /** Served texts (`GET /v1/texts`). */
   readonly texts: TextsResource
+  /** Group invites (`/v1/groups/invites/…`). */
+  readonly groups: GroupsResource
+  /** Your wake webhook (`/v1/agents/me/wake-webhook`). */
+  readonly wakeWebhook: WakeWebhookResource
 
   constructor(options: AgentChatClientOptions) {
     this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL
@@ -385,6 +466,34 @@ export class AgentChatClient {
     this.texts = {
       get: (opts) => this.getTexts(opts),
     }
+    this.groups = {
+      dismissInvite: (inviteId, opts) =>
+        this.post<{ dismissed: boolean }>(
+          `/v1/groups/invites/${encodeURIComponent(inviteId)}/dismiss`,
+          undefined,
+          { ...opts, idempotencyKey: opts?.idempotencyKey ?? generateClientMsgId() },
+        ),
+    }
+    this.wakeWebhook = {
+      set: (opts) => this.setWakeWebhook(opts),
+      test: async (opts) =>
+        (await this.post<{ test_wake: TestWakeResult }>('/v1/agents/me/wake-webhook/test', undefined, opts))
+          .test_wake,
+      clear: (opts) => this.del<ClearWakeWebhookResult>('/v1/agents/me/wake-webhook', opts),
+    }
+  }
+
+  private async setWakeWebhook(options: SetWakeWebhookOptions & CallOptions): Promise<WakeWebhookStatus> {
+    // Only the documented fields form the body; call options stay out of it.
+    const body: SetWakeWebhookRequest = {
+      url: options.url,
+      secret: options.secret,
+      ...(options.dialect !== undefined ? { dialect: options.dialect } : {}),
+      ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
+      ...(options.rewake !== undefined ? { rewake: options.rewake } : {}),
+    }
+    const res = await this.put<{ wake_webhook: WakeWebhookStatus }>('/v1/agents/me/wake-webhook', body, options)
+    return res.wake_webhook
   }
 
   // ─── Engine resource implementations ──────────────────────────────────────
@@ -500,6 +609,7 @@ export class AgentChatClient {
       signal: opts?.signal,
       timeoutMs: opts?.timeoutMs,
       idempotencyKey: opts?.idempotencyKey,
+      ...(opts?.retry !== undefined ? { retry: opts.retry } : {}),
     }
   }
 
@@ -1322,12 +1432,41 @@ export class AgentChatClient {
    * The WebSocket client drives this automatically on reconnect; most
    * callers never need it directly.
    */
-  sync(opts?: { limit?: number; after?: string } & CallOptions) {
+  async sync(opts?: SyncOptions): Promise<SyncEnvelope[]> {
+    return (await this.syncPage(opts)).rows
+  }
+
+  /**
+   * `sync()` with the response facts a poller needs: how long the server
+   * held a long-poll (`waitedMs`) and its idle poll hint
+   * (`pollIntervalSeconds`). With `waitMs` > 0 this is the long-poll body
+   * pull; pass `retry: 'never'` when the caller has a deadline.
+   */
+  async syncPage(opts?: SyncOptions): Promise<SyncPage> {
     const params = new URLSearchParams()
     if (opts?.limit) params.set('limit', String(opts.limit))
     if (opts?.after !== undefined) params.set('after', opts.after)
+    const waitMs = opts?.waitMs ?? 0
+    if (waitMs > 0) params.set('wait_ms', String(Math.floor(waitMs)))
     const qs = params.toString()
-    return this.get<SyncEnvelope[]>(`/v1/messages/sync${qs ? `?${qs}` : ''}`, opts)
+    const timeoutMs =
+      opts?.timeoutMs !== undefined
+        ? opts.timeoutMs
+        : waitMs > 0
+          ? waitMs + INBOX_WAIT_TIMEOUT_GRACE_MS
+          : undefined
+    const res = await this.http.request<SyncEnvelope[]>(
+      'GET',
+      `/v1/messages/sync${qs ? `?${qs}` : ''}`,
+      this.toRequestOpts({ ...opts, timeoutMs }),
+    )
+    return {
+      rows: res.data,
+      waitedMs: intHeader(res.headers, 'x-agentchat-waited-ms'),
+      pollIntervalSeconds: intHeader(res.headers, 'x-agentchat-poll-interval-seconds'),
+      requestId: res.requestId,
+      headers: res.headers,
+    }
   }
 
   /**

@@ -32,6 +32,7 @@ interface Row extends Payload {
 }
 type Step =
   | { op: 'connect' }
+  | { op: 'reconnect' }
   | { op: 'drain' }
   | { op: 'close' }
   | { op: 'frame'; payload: Payload }
@@ -49,6 +50,7 @@ interface Scenario {
   why: string
   hold?: string[]
   fail?: string[]
+  no_handler?: boolean
   sync_pages?: Row[][]
   steps: Step[]
   expect: Record<Mode, Expectation>
@@ -62,7 +64,7 @@ interface EngineDoc {
 
 const doc = JSON.parse(readFileSync(FIXTURE, 'utf8')) as EngineDoc
 
-const OPS = ['close', 'connect', 'drain', 'frame', 'gap_window_lapses', 'release', 'wait_handler']
+const OPS = ['close', 'connect', 'drain', 'frame', 'gap_window_lapses', 'reconnect', 'release', 'wait_handler']
 
 // The client's gap window (GAP_FILL_WINDOW_MS) plus slack. Real time: the
 // harness runs on real timers throughout.
@@ -111,6 +113,21 @@ async function run(scenario: Scenario, mode: Mode): Promise<Outcome> {
   let ws: MockWebSocket | null = null
   const drains: Promise<void>[] = []
 
+  // Connect, record every ack frame sent on the new socket, answer HELLO.
+  const open = async (client: RealtimeClient): Promise<MockWebSocket> => {
+    await client.connect()
+    const socket = MockWebSocket.latest()
+    const send = socket.send.bind(socket)
+    socket.send = (data: string) => {
+      const frame = JSON.parse(data) as { type?: string; message_id?: string }
+      if (frame.type === 'ack') events.push({ kind: 'ws_ack', id: String(frame.message_id) })
+      send(data)
+    }
+    socket.simulateOpen()
+    socket.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+    return socket
+  }
+
   for (const step of scenario.steps) {
     switch (step.op) {
       case 'connect': {
@@ -123,27 +140,22 @@ async function run(scenario: Scenario, mode: Mode): Promise<Outcome> {
           client,
         })
         rt.onError(() => undefined)
-        rt.on('message.new', async (message) => {
-          const payload = message.payload as unknown as Payload
-          dispatched.push(payload)
-          const hold = held.get(payload.id)
-          if (hold) await hold
-          if (failing.has(payload.id)) throw new Error(`scenario handler fails ${payload.id}`)
-          events.push({ kind: 'handled', id: payload.id })
-        })
-        await rt.connect()
-        const socket = MockWebSocket.latest()
-        const send = socket.send.bind(socket)
-        socket.send = (data: string) => {
-          const frame = JSON.parse(data) as { type?: string; message_id?: string }
-          if (frame.type === 'ack') events.push({ kind: 'ws_ack', id: String(frame.message_id) })
-          send(data)
+        if (!scenario.no_handler) {
+          rt.on('message.new', async (message) => {
+            const payload = message.payload as unknown as Payload
+            dispatched.push(payload)
+            const hold = held.get(payload.id)
+            if (hold) await hold
+            if (failing.has(payload.id)) throw new Error(`scenario handler fails ${payload.id}`)
+            events.push({ kind: 'handled', id: payload.id })
+          })
         }
-        socket.simulateOpen()
-        socket.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
-        ws = socket
+        ws = await open(rt)
         break
       }
+      case 'reconnect':
+        ws = await open(rt!)
+        break
       case 'frame':
         ws!.simulateMessage({ type: 'message.new', payload: step.payload })
         break

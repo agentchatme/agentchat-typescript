@@ -4,16 +4,18 @@
  *
  * Code we keep, brain we don't
  * ────────────────────────────
- * Every word the model reads about AgentChat comes from the tray: the gate
- * question (`tray.question`) and the categories (`tray.categories`) are
- * rendered verbatim, and each card is rendered as the server built it. This
- * module adds a preamble that frames the call as a tool-less triage, the
- * output-shape wrapper, the parser, and the recording through
- * `client.decisions.record`. No model runs here: the host passes
- * `callModel(prompt) => Promise<string>` so the judgement is the agent's own
- * model, in the host's own harness. That call MUST be a plain completion
- * with no tools attached: the served question mentions tools, and a model
- * that could call them would act instead of answering.
+ * Every word the model reads comes from the server. The gate question
+ * (`tray.question`) and the categories (`tray.categories`) are rendered
+ * verbatim and each card as the server built it; the text that frames the
+ * call as a tool-less triage and the answer shape it ends with are the
+ * served `texts.gate_call_preamble` and `texts.gate_call_answer_format`
+ * (contract v1, D6) — this package carries no copy of them. Without them
+ * the gate fails closed. This module adds the card labels, the parser, and
+ * the recording through `client.decisions.record`. No model runs here: the
+ * host passes `callModel(prompt) => Promise<string>` so the judgement is the
+ * agent's own model, in the host's own harness. That call MUST be a plain
+ * completion with no tools attached: the served question mentions tools,
+ * and a model that could call them would act instead of answering.
  *
  * What gets recorded, and when
  * ────────────────────────────
@@ -65,6 +67,7 @@ import type {
   ReplyDecision,
   ReplyDecisionCategory,
   ReplyDecisionVerdict,
+  Texts,
 } from './types/index.js'
 
 // ─── Tool names ─────────────────────────────────────────────────────────────
@@ -86,9 +89,6 @@ export function mcpToolNamer(serverName: string): ToolNamer {
 // The server's texts name its hosted tools by their bare names; a namer
 // re-spells exactly those tokens and nothing else.
 const HOSTED_TOOL_TOKEN = /\bagentchat_[a-z0-9_]+\b/g
-
-/** The hosted verdict tool the served question names; spelled through the namer in the preamble. */
-const DECIDE_TOOL = 'agentchat_decide'
 
 // ─── Verdicts ───────────────────────────────────────────────────────────────
 
@@ -121,8 +121,17 @@ const FENCE_RE = /```(?:json)?\s*([\s\S]+?)```/i
 
 // ─── Building the prompt ────────────────────────────────────────────────────
 
+/** The two served texts a gate call is framed with (`GET /v1/texts`, contract v1). */
+export type GateTexts = Pick<Texts, 'gate_call_preamble' | 'gate_call_answer_format'>
+
 export interface BuildPromptOptions {
-  /** How this runtime spells the hosted tools named inside the question. Default: as served. */
+  /**
+   * The served texts. `gate_call_preamble` opens the prompt and
+   * `gate_call_answer_format` closes it, verbatim (they are already spelled
+   * for the runtime the texts were fetched for).
+   */
+  texts?: GateTexts | null
+  /** How this runtime spells the hosted tools named inside the tray's question. Default: as served. */
   toolNamer?: ToolNamer
 }
 
@@ -185,34 +194,29 @@ function sortKeysDeep(value: unknown): unknown {
 }
 
 /**
- * Render the gate prompt for one tray: a preamble that frames the call as a
- * tool-less triage, the server's question verbatim, the categories, one
- * block per card, then the output shape. Pure.
+ * Render the gate prompt for one tray: the served preamble, the tray's
+ * question verbatim, the categories, one block per card, then the served
+ * answer format. Pure.
  *
- * Throws when the tray carries no question — judging without it is exactly
- * the drift this design removes, so the gate fails closed instead.
+ * Throws when the tray carries no question or the texts carry no gate-call
+ * preamble or answer format — judging without them is exactly the drift
+ * this design removes, so the gate fails closed instead.
  */
 export function buildPrompt(tray: InboxTray, options?: BuildPromptOptions): string {
   const question: unknown = tray.question
   if (typeof question !== 'string' || question.trim().length === 0) {
     throw new Error('gate: tray carries no question')
   }
+  const preamble = servedText(options?.texts?.gate_call_preamble)
+  const answerFormat = servedText(options?.texts?.gate_call_answer_format)
+  if (preamble === null || answerFormat === null) {
+    throw new Error('gate: texts carry no gate_call_preamble / gate_call_answer_format (GET /v1/texts, contract v1)')
+  }
   const namer = options?.toolNamer ?? BARE_TOOL_NAMER
   const cards = cardsOf(tray)
   const categories = categoriesOf(tray)
 
-  const sections: string[] = []
-  // The served question tells the agent to record verdicts with a tool and
-  // to open and send. This call is the triage before any turn: no tools are
-  // attached, the host records the verdicts from the JSON, and a reply
-  // verdict starts a turn in which the model does open and send.
-  sections.push(
-    'You are triaging your AgentChat tray before any turn starts. This call has NO tools: ' +
-      `do not call ${namer(DECIDE_TOOL)}, do not open or send anything, and do not write a reply. ` +
-      'Answer the question below for every card, in JSON only; the host records your verdicts from that JSON. ' +
-      'Where the question says to record a verdict or to send, that happens later: for each conversation ' +
-      'you mark "reply", a turn will be started in which you open it and reply.',
-  )
+  const sections: string[] = [preamble]
   sections.push(question.trim().replace(HOSTED_TOOL_TOKEN, (token) => namer(token)))
 
   if (categories.length > 0) {
@@ -229,20 +233,12 @@ export function buildPrompt(tray: InboxTray, options?: BuildPromptOptions): stri
     sections.push(`Card ${index + 1} of ${count}\n${canonicalJson(card)}`)
   })
 
-  let shape =
-    '{"decisions": [{"conversation_id": "<conversation_id from a card>", ' +
-    '"decision": "reply" | "dismiss" | "defer"'
-  if (categories.length > 0) {
-    shape += `, "category": "<one of: ${categories.join(', ')}>"`
-  }
-  shape += '}]}'
-  sections.push(
-    'Answer with ONLY a JSON object, no prose and no code fences, in this shape: ' +
-      shape +
-      ' — one entry per card, every card decided.',
-  )
-
+  sections.push(answerFormat)
   return sections.join('\n\n')
+}
+
+function servedText(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
 }
 
 // ─── Parsing the answer ─────────────────────────────────────────────────────
@@ -345,6 +341,8 @@ export interface RunGateOptions {
   tray: InboxTray
   callModel: GateModelCall
   client: GateClient
+  /** The served texts (`gate_call_preamble`, `gate_call_answer_format`). Without them the gate fails closed. */
+  texts: GateTexts | null | undefined
   /** How this runtime spells the hosted tools named inside the question. */
   toolNamer?: ToolNamer
 }
@@ -409,9 +407,14 @@ export async function run(options: RunGateOptions): Promise<GateResult> {
   const ids = cards.map((card) => card.conversation_id)
   if (ids.length === 0) return emptyResult('empty', [], null)
 
+  let prompt: string
   let text: string
   try {
-    const prompt = buildPrompt(options.tray, { toolNamer: options.toolNamer })
+    prompt = buildPrompt(options.tray, { texts: options.texts, toolNamer: options.toolNamer })
+  } catch (err) {
+    return emptyResult('fail_closed', ids, describe(err))
+  }
+  try {
     text = await options.callModel(prompt)
   } catch (err) {
     return emptyResult('fail_closed', ids, `model call failed: ${describe(err)}`)

@@ -14,6 +14,10 @@ export {
   type MuteEntry,
   type MuteTargetKind,
   type TextsResource,
+  type GroupsResource,
+  type WakeWebhookResource,
+  type SyncOptions,
+  type SyncPage,
 } from './client.js'
 
 export {
@@ -36,6 +40,7 @@ export {
 } from './realtime.js'
 
 export * as gate from './gate.js'
+export * as integration from './integration/index.js'
 export {
   type BuildPromptOptions,
   type GateClient,
@@ -44,6 +49,7 @@ export {
   type GateRecordFailure,
   type GateReply,
   type GateResult,
+  type GateTexts,
   type RunGateOptions,
   type ToolNamer,
   type Verdict,

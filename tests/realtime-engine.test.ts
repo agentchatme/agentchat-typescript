@@ -466,6 +466,189 @@ describe('RealtimeClient — stored rows older than the live anchor', () => {
   })
 })
 
+describe('RealtimeClient — a repeat while the first copy is still with the handlers', () => {
+  // After a reconnect the server pushes its stored backlog on the socket
+  // and the REST drain brings the same rows. With a slow handler the second
+  // copy arrives before the first one finished, so the dedup cache (filled
+  // only on success) cannot catch it.
+
+  function deferred() {
+    let resolve!: () => void
+    let reject!: (err: Error) => void
+    const promise = new Promise<void>((res, rej) => {
+      resolve = res
+      reject = rej
+    })
+    return { promise, resolve, reject }
+  }
+
+  it.each([false, true])(
+    'a REST drain row is not dispatched again and the drain never waits for the first copy (ackOnReceipt=%s)',
+    async (ackOnReceipt) => {
+      const sync = vi
+        .fn()
+        .mockResolvedValueOnce([syncRow('c', 1), syncRow('d', 1)])
+        .mockResolvedValueOnce([syncRow('c', 1)])
+        .mockResolvedValue([])
+      const syncAck = vi.fn(async () => ({ acked: 1 }))
+      const client = { getMessages: vi.fn(), sync, syncAck } as unknown as AgentChatClient
+      const rt = new RealtimeClient({
+        apiKey: 'k',
+        webSocket: MockWebSocketCtor,
+        reconnect: false,
+        autoDrainOnConnect: false,
+        ackOnReceipt,
+        client,
+      })
+      const slow = deferred()
+      const calls: string[] = []
+      rt.on('message.new', async (m) => {
+        calls.push(String(m.payload.id))
+        if (m.payload.id === 'msg_c_1') await slow.promise
+      })
+      await rt.connect()
+      const ws = MockWebSocket.latest()
+      ws.simulateOpen()
+      ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+
+      // The live copy (the server's backlog push) carries the row's id.
+      ws.simulateMessage({ type: 'message.new', payload: syncRow('c', 1) })
+      // The drain finishes while that handler still runs: the repeat is not
+      // dispatched, the next row (another conversation) is, and the cursor
+      // stops at the repeat instead of waiting for it.
+      await rt.drainOfflineEnvelopes()
+      expect(calls).toEqual(['msg_c_1', 'msg_d_1'])
+      expect(syncAck).not.toHaveBeenCalled()
+
+      slow.resolve()
+      await settle()
+      expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_c_1'])
+      // The next drain re-offers the row: a dedup hit now, so it is covered.
+      await rt.drainOfflineEnvelopes()
+      expect(calls).toEqual(['msg_c_1', 'msg_d_1'])
+      expect(syncAck).toHaveBeenCalledWith(syncRow('c', 1).delivery_id)
+      rt.disconnect()
+    },
+  )
+
+  it('a live repeat of a first copy that failed is never acked', async () => {
+    const { rt, ws } = await connected()
+    rt.onError(() => undefined)
+    const slow = deferred()
+    const calls: string[] = []
+    rt.on('message.new', async (m) => {
+      calls.push(String(m.payload.id))
+      await slow.promise
+    })
+
+    ws.simulateMessage(messageNew('c', 5))
+    ws.simulateMessage(messageNew('c', 7)) // keeps the ordering state live
+    ws.simulateMessage(messageNew('c', 5)) // the repeat adopts the running first copy
+    await settle()
+    slow.reject(new Error('model call failed'))
+    await settle()
+    expect(calls).toEqual(['msg_5'])
+    expect(sentFrames(ws, 'ack')).toEqual([])
+    rt.disconnect()
+  })
+
+  it('a re-offer on a later connection is dispatched afresh while the first copy still runs', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false })
+    const stuck = deferred()
+    const calls: string[] = []
+    rt.on('message.new', async (m) => {
+      calls.push(String(m.payload.id))
+      if (calls.length === 1) await stuck.promise // a handler that never finishes
+    })
+    await rt.connect()
+    const ws1 = MockWebSocket.latest()
+    ws1.simulateOpen()
+    ws1.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+    ws1.simulateMessage(messageNew('c', 1))
+    await settle()
+    ws1.simulateClose(1006, 'abnormal', false)
+
+    await rt.connect()
+    const ws2 = MockWebSocket.latest()
+    ws2.simulateOpen()
+    ws2.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+    ws2.simulateMessage(messageNew('c', 1)) // the server re-offers the unacked message
+    await settle()
+    expect(calls).toEqual(['msg_1', 'msg_1'])
+    expect(sentFrames(ws2, 'ack').map((f) => f.message_id)).toEqual(['msg_1'])
+    rt.disconnect()
+  })
+
+  it('a live repeat is acked only after the first copy succeeded, without a second dispatch', async () => {
+    const { rt, ws } = await connected()
+    const slow = deferred()
+    const calls: string[] = []
+    rt.on('message.new', async (m) => {
+      calls.push(String(m.payload.id))
+      await slow.promise
+    })
+
+    ws.simulateMessage(messageNew('c', 5))
+    ws.simulateMessage(messageNew('c', 7)) // keeps the ordering state live
+    ws.simulateMessage(messageNew('c', 5)) // below the anchor, first copy still running
+    await settle()
+    expect(calls).toEqual(['msg_5'])
+    expect(sentFrames(ws, 'ack')).toEqual([])
+
+    slow.resolve()
+    await settle()
+    expect(calls).toEqual(['msg_5'])
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_5', 'msg_5'])
+    rt.disconnect()
+  })
+
+  it('a failed first copy leaves the repeat unacked, and a later copy is dispatched again', async () => {
+    const sync = vi.fn().mockResolvedValueOnce([syncRow('c', 1)]).mockResolvedValue([])
+    const syncAck = vi.fn(async () => ({ acked: 1 }))
+    const client = { getMessages: vi.fn(), sync, syncAck } as unknown as AgentChatClient
+    const rt = new RealtimeClient({
+      apiKey: 'k',
+      webSocket: MockWebSocketCtor,
+      reconnect: false,
+      autoDrainOnConnect: false,
+      client,
+    })
+    rt.onError(() => undefined)
+    const slow = deferred()
+    const calls: string[] = []
+    let failNext = true
+    rt.on('message.new', async (m) => {
+      calls.push(String(m.payload.id))
+      if (failNext) {
+        failNext = false
+        await slow.promise
+      }
+    })
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+
+    ws.simulateMessage({ type: 'message.new', payload: syncRow('c', 1) })
+    const drain = rt.drainOfflineEnvelopes()
+    await settle()
+    slow.reject(new Error('model call failed'))
+    await drain
+    await settle()
+    // Neither copy is acknowledged: the server re-offers the message.
+    expect(calls).toEqual(['msg_c_1'])
+    expect(syncAck).not.toHaveBeenCalled()
+    expect(sentFrames(ws, 'ack')).toEqual([])
+
+    // The re-offer is a fresh attempt, handed to the handler again.
+    ws.simulateMessage({ type: 'message.new', payload: syncRow('c', 1) })
+    await settle()
+    expect(calls).toEqual(['msg_c_1', 'msg_c_1'])
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_c_1'])
+    rt.disconnect()
+  })
+})
+
 describe('RealtimeClient — a guest in a host process', () => {
   it('runs two instances side by side; closing one leaves the other untouched', async () => {
     vi.useFakeTimers()

@@ -70,8 +70,8 @@ export type DisconnectHandler = (info: DisconnectInfo) => void
  * - `connecting` — a socket is opening, or its HELLO awaits `hello.ok`.
  * - `ready` — `hello.ok` received; frames flow.
  * - `backoff` — the socket closed; the next attempt is scheduled with
- *   exponential backoff, or after the server's own delay when it answered
- *   "over the connect budget" (HTTP 429 at the upgrade, close 1013).
+ *   exponential backoff, or after the server's own delay when it closed the
+ *   socket "over the connect budget" (close 1013 with a retry hint).
  * - `blocked` — the server rejected the credential during the handshake; a
  *   fresh attempt is scheduled every 10–15 minutes until one is accepted.
  * - `stopped` — `disconnect()` was called.
@@ -580,8 +580,8 @@ export class RealtimeClient {
   // The current socket is being closed to negotiate `ack` (see maybeRenegotiateAck).
   private renegotiating = false
   // The current socket's upgrade was answered with an HTTP status instead of
-  // 101 (Node `ws` only; a browser-shaped socket cannot see it).
-  private upgradeRejection: { status: number; retryAfter: string | null } | null = null
+  // 101 (Node `ws` only; a browser-shaped socket cannot see it): ordinary backoff.
+  private upgradeRejection: { status: number } | null = null
   /** One error per long outage, then silent until a stable connection. */
   private longOutageAnnounced = false
   /** One error per run of rejected handshakes, then silent until hello.ok. */
@@ -884,22 +884,15 @@ export class RealtimeClient {
       }
       ws.on('ping', alive)
       ws.on('pong', alive)
-      // An upgrade answered with an HTTP status (429 + Retry-After when the
-      // connect budget is spent, D8). With a listener here `ws` leaves the
-      // request to us: note the answer, then end the attempt — its close
-      // event comes next and the close funnel reads the note.
+      // An upgrade answered with an HTTP status instead of 101 (not an
+      // AgentChat answer today; a proxy's 429 or 5xx). With a listener here
+      // `ws` leaves the request to us: note the answer, then end the attempt
+      // — its close event comes next, and the close funnel takes the
+      // ordinary backoff for it, never `blocked`.
       ws.on('unexpected-response', ((req: unknown, res: unknown) => {
-        const response = res as {
-          statusCode?: number
-          headers?: Record<string, string | string[] | undefined>
-          resume?: () => void
-        }
+        const response = res as { statusCode?: number; resume?: () => void }
         if (current()) {
-          const header = response.headers?.['retry-after']
-          this.upgradeRejection = {
-            status: typeof response.statusCode === 'number' ? response.statusCode : 0,
-            retryAfter: typeof header === 'string' ? header : Array.isArray(header) ? (header[0] ?? null) : null,
-          }
+          this.upgradeRejection = { status: typeof response.statusCode === 'number' ? response.statusCode : 0 }
         }
         try { response.resume?.() } catch { /* drain only */ }
         try {
@@ -1221,19 +1214,22 @@ export class RealtimeClient {
       return
     }
 
-    // Over the connect budget (D8): an upgrade answered 429, or a close 1013.
-    // Back off for the server's delay — never `blocked`, whatever the reason
-    // text says.
+    // An upgrade answered with an HTTP status (429 included; no AgentChat
+    // server answers that way): the ordinary backoff, never `blocked`.
+    if (rejection !== null) {
+      this.scheduleReconnect()
+      return
+    }
+
+    // Over the connect budget (D8): a close 1013 with the server's retry
+    // hint. Back off for the server's delay — never `blocked`, whatever the
+    // reason text says.
     if (info.initiator === 'server') {
-      const budgetDelay =
-        rejection !== null
-          ? connectBudgetDelayMs({ kind: 'upgrade', status: rejection.status, retryAfter: rejection.retryAfter })
-          : connectBudgetDelayMs({ kind: 'close', code: info.code, reason: info.reason })
+      const budgetDelay = connectBudgetDelayMs({ code: info.code, reason: info.reason })
       if (budgetDelay !== null) {
         this.emitError(
           new ConnectionError(
-            `the server refused the connection: connect budget exceeded ` +
-              `(${rejection !== null ? `HTTP ${rejection.status}` : `close ${info.code}`}); ` +
+            `the server refused the connection: connect budget exceeded (close ${info.code}); ` +
               `retrying in ${Math.round(budgetDelay / 1000)}s`,
           ),
         )

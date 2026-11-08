@@ -71,10 +71,11 @@ server and against a contract v1 server.
   makes the client reconnect once, quietly, so the next HELLO negotiates it.
 - A per-call `retry` never makes a POST / PATCH without an Idempotency-Key
   retryable (a retried verdict would be recorded twice).
-- Over the connect budget (HTTP 429 with `Retry-After` at the upgrade, or a
-  close 1013 carrying `retry_after=<s>`) the client waits the server's delay
-  plus up to 10% (never less); it never goes `blocked`. A 1013 without the hint (the slow-consumer
-  `overload` close) keeps the ordinary backoff.
+- Over the connect budget (a close 1013 carrying `retry_after=<s>`) the
+  client waits the server's delay plus up to 10% (never less); it never goes
+  `blocked`. A 1013 without the hint (the slow-consumer `overload` close)
+  keeps the ordinary backoff, and so does an upgrade answered with an HTTP
+  status (429 included).
 - With `rewake` negotiated, `wake` frames are validated by reason
   (`reminder`, `unanswered`) and unknown reasons are passed through; without
   it the 1.2 rule and the 1.2 `WakePayload` type are unchanged.

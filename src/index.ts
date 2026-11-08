@@ -103,10 +103,9 @@ export { parseRetryAfter } from './http-retry-after.js'
 export {
   connectBudgetDelayMs,
   CONNECT_BUDGET_CLOSE_CODE,
-  CONNECT_BUDGET_DEFAULT_DELAY_MS,
   CONNECT_BUDGET_MAX_DELAY_MS,
   CONNECT_BUDGET_MIN_DELAY_MS,
-  type ConnectBudgetEvent,
+  type ConnectBudgetClose,
 } from './connect-budget.js'
 
 export {

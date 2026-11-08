@@ -255,9 +255,7 @@ describe('wake frames (contract v1)', () => {
 
 interface BudgetCase {
   name: string
-  event:
-    | { kind: 'close'; code: number; reason: string }
-    | { kind: 'upgrade'; status: number; retry_after: string | null; now?: string }
+  event: { kind: 'close'; code: number; reason: string }
   expect: { delay_ms: number | null; blocked: boolean }
 }
 
@@ -269,7 +267,6 @@ describe('connect budget (D8) — the socket backs off for the server delay, nev
     async (_name, c) => {
       vi.useFakeTimers()
       vi.spyOn(Math, 'random').mockReturnValue(0.5)
-      if (c.event.kind === 'upgrade' && c.event.now) vi.setSystemTime(new Date(c.event.now))
       const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockNodeWebSocketCtor, reconnectInterval: 10 })
       const errors: Error[] = []
       const blocked = vi.fn()
@@ -277,13 +274,8 @@ describe('connect budget (D8) — the socket backs off for the server delay, nev
       rt.on('blocked', blocked)
       await rt.connect()
       const ws = MockWebSocket.latest() as MockNodeWebSocket
-      if (c.event.kind === 'close') {
-        ws.simulateOpen()
-        ws.simulateClose(c.event.code, c.event.reason, true)
-      } else {
-        ws.simulateUpgradeAnswer(c.event.status, c.event.retry_after ?? undefined)
-        expect(ws.terminated).toBe(true)
-      }
+      ws.simulateOpen()
+      ws.simulateClose(c.event.code, c.event.reason, true)
       expect(rt.state).toBe('backoff')
       expect(blocked).not.toHaveBeenCalled()
       expect(errors.some((e) => /connect budget exceeded/.test(e.message))).toBe(true)
@@ -310,13 +302,30 @@ describe('connect budget (D8) — the socket backs off for the server delay, nev
       await rt.connect()
       const ws = MockWebSocket.latest()
       ws.simulateOpen()
-      if (c.event.kind === 'close') ws.simulateClose(c.event.code, c.event.reason, false)
+      ws.simulateClose(c.event.code, c.event.reason, false)
       expect(rt.state).toBe('backoff')
       await vi.advanceTimersByTimeAsync(10) // the ordinary backoff's first step
       expect(MockWebSocket.instances).toHaveLength(2)
       rt.disconnect()
     },
   )
+
+  it('an upgrade answered 429 (no AgentChat server does): the ordinary backoff, never blocked, Retry-After ignored', async () => {
+    vi.useFakeTimers()
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockNodeWebSocketCtor, reconnectInterval: 10 })
+    const blocked = vi.fn()
+    rt.onError(() => undefined)
+    rt.on('blocked', blocked)
+    await rt.connect()
+    const ws = MockWebSocket.latest() as MockNodeWebSocket
+    ws.simulateUpgradeAnswer(429, '3600')
+    expect(ws.terminated).toBe(true)
+    expect(rt.state).toBe('backoff')
+    await vi.advanceTimersByTimeAsync(10)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(blocked).not.toHaveBeenCalled()
+    rt.disconnect()
+  })
 
   it('an upgrade answered with another status takes the ordinary backoff', async () => {
     vi.useFakeTimers()

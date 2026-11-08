@@ -32,9 +32,10 @@ interface VerdictCase {
 const tray = json<InboxTray>('tray.sample.json')
 
 describe('conformance fixtures — canonical form', () => {
-  it('ships exactly the five named files', () => {
+  it('ships exactly the six named files', () => {
     expect(readdirSync(FIXTURES).sort()).toEqual([
       'ack-frame.json',
+      'engine-scenarios.json',
       'gate-prompt.expected.txt',
       'tray.sample.json',
       'verdict-parse.cases.json',
@@ -42,7 +43,13 @@ describe('conformance fixtures — canonical form', () => {
     ])
   })
 
-  it.each(['tray.sample.json', 'verdict-parse.cases.json', 'wake-frame.json', 'ack-frame.json'])(
+  it.each([
+    'tray.sample.json',
+    'verdict-parse.cases.json',
+    'wake-frame.json',
+    'ack-frame.json',
+    'engine-scenarios.json',
+  ])(
     '%s has sorted keys, two-space indent and one trailing newline',
     (name) => {
       const text = raw(name)

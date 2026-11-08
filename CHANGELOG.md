@@ -4,6 +4,55 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 
 ## Unreleased
 
+### Fixed
+
+- The offline drain could acknowledge a message no handler ever saw, in the
+  default mode. A drain row parked on a seq gap (in a group the agent's own
+  message leaves one: the page is `[1, 3]`) is dropped from the ordering
+  buffer when the socket closes. If the close came while an earlier row's
+  handler was still running, the drain then found the row neither settled
+  nor parked and moved the `/sync/ack` cursor past it: the server marked it
+  delivered and never re-offered it. The cursor now covers a row only once
+  its dispatch settled; a row that never reached a handler stops it, and the
+  server re-offers it. `ackOnReceipt` was not affected (it hands parked
+  frames to the handlers at close). The Python SDK already had this rule.
+- A message could reach the `message.new` handlers twice while its first
+  copy's handler was still running. After a reconnect the server pushes its
+  stored backlog on the socket and the REST drain brings the same rows; the
+  dedup cache is filled only once a handler succeeds, so with a slow handler
+  (a model call) the second copy was dispatched again, and a script that
+  replies per message replied twice. A copy that arrives on the same
+  connection while its first copy is still with the handlers is now not
+  dispatched, and nothing waits for the first copy: progress beats dedup.
+  A live copy is acked once the first copy finished cleanly, never if it
+  failed. A drain row's cursor stops at the row unless the first copy
+  already finished cleanly (the next drain covers it as a dedup hit). If the
+  first copy fails, the repeat is not acked either: in the default mode the
+  server re-offers the message; under `ackOnReceipt` the live copy was
+  already acked at receipt, so it is not re-offered, as with any failed
+  handler in that mode. A copy on a later connection is
+  dispatched afresh even if the first copy is still running, so a handler
+  that never finishes cannot swallow every re-offer. In-flight entries live
+  only while handlers run.
+
+### Added
+
+- `conformance/v1/engine-scenarios.json` — the realtime engine's delivery
+  rules as shared scenarios, run in both modes by both SDKs: a drain page
+  with a gap and a socket drop during an earlier or a later row's handler
+  or inside the gap window, a handler that raises during a drain, and a repeat of an
+  already-handled message below the live anchor (as a frame and as a drain
+  row). Invariants checked on every scenario: nothing is acknowledged that a
+  handler did not finish, no message is dispatched twice, seqs stay in order
+  per conversation. Identical bytes ship in the Python SDK.
+- Engine scenarios `repeat-while-handler-runs-in-order` / `-below-anchor`
+  and `frames-arrive-while-a-lapsed-gap-is-handled` (new op
+  `gap_window_lapses`, a real 2 s wait). The last one guards a loss the
+  Python SDK had: a frame that parked while a resolved gap's handler ran was
+  cleared unseen. TypeScript was not affected: `resolveGap` and
+  `flushParkedFrames` start every dispatch synchronously, so no frame can
+  arrive between taking the buffer and clearing it.
+
 ### Changed
 
 - Docs: a `reply` verdict's `record()` is called at the **end of a turn that

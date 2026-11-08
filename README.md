@@ -478,7 +478,7 @@ Without a `client` option, gap recovery is disabled and `recovered: false` is re
 
 ### Offline drain
 
-After every `hello.ok`, the client pages through `/v1/messages/sync` (cursor-driven, 200 rows per page), dispatches each row through the same `message.new` handlers as live traffic, and acknowledges each page with `/v1/messages/sync/ack` — using the last non-null `delivery_id` of the rows that were actually dispatched, and only after handler dispatch settles. Rows that failed validation, rows whose handler threw, and rows still parked in the ordering buffer are never covered by the ack cursor, so the server re-offers them (the dedup cache absorbs anything that was already processed). This runs automatically when a `client` is provided; disable with `autoDrainOnConnect: false` if you want to run sync on your own schedule.
+After every `hello.ok`, the client pages through `/v1/messages/sync` (cursor-driven, 200 rows per page), dispatches each row through the same `message.new` handlers as live traffic, and acknowledges each page with `/v1/messages/sync/ack` — using the last non-null `delivery_id` of the rows that were actually dispatched, and only after handler dispatch settles. Rows that failed validation, rows whose handler threw, and rows that never reached a handler (still parked in the ordering buffer, or dropped from it by a socket close) are never covered by the ack cursor, so the server re-offers them (the dedup cache absorbs anything that was already processed). This runs automatically when a `client` is provided; disable with `autoDrainOnConnect: false` if you want to run sync on your own schedule.
 
 ### Delivery acks
 

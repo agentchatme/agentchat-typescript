@@ -712,6 +712,64 @@ describe('RealtimeClient — offline drain on reconnect', () => {
     expect(seen).toEqual([1, 3])
   })
 
+  // A group where the agent's own message is seq 2: the drain page is [1, 3]
+  // (a sender has no envelope for its own message), so 3 parks behind the
+  // gap. The handler for 1 is slow (it calls a model) and the socket drops
+  // while it runs. The close clears the ordering buffer; the drain is still
+  // awaiting row 1's settlement and must not then cover row 3, which no
+  // handler ever saw.
+  it.each([
+    // Default: the close drops parked row 3 unacked; it comes back later.
+    { ackOnReceipt: false, seen: [1], coveredRows: 1 },
+    // Ack-on-receipt: the close hands parked frames to the handlers first.
+    { ackOnReceipt: true, seen: [1, 3], coveredRows: 2 },
+  ])(
+    'never acks a parked row the socket close cleared while an earlier handler ran (ackOnReceipt=$ackOnReceipt)',
+    async ({ ackOnReceipt, seen: expectedSeen, coveredRows }) => {
+      const rows = [syncRow('g', 1), syncRow('g', 3)]
+      const sync = vi.fn().mockResolvedValueOnce(rows).mockResolvedValue([])
+      const syncAck = vi.fn(async () => ({ acked: 1 }))
+
+      const rt = new RealtimeClient({
+        apiKey: 'k',
+        webSocket: MockWebSocketCtor,
+        reconnect: false,
+        ackOnReceipt,
+        client: mockClient({ sync, syncAck }),
+      })
+      const seen: number[] = []
+      const finished: number[] = []
+      let release!: () => void
+      rt.on('message.new', async (evt) => {
+        const seq = (evt.payload as { seq: number }).seq
+        seen.push(seq)
+        if (seq === 1) await new Promise<void>((r) => (release = r))
+        finished.push(seq)
+      })
+
+      await rt.connect()
+      const ws = MockWebSocket.latest()
+      ws.simulateOpen()
+      ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+      await settle()
+      // Row 1's handler is running; row 3 is parked on the gap.
+      expect(seen).toEqual([1])
+      expect(syncAck).not.toHaveBeenCalled()
+
+      ws.simulateClose(1006, 'abnormal', false)
+      await settle()
+      release()
+      await settle()
+
+      expect(seen).toEqual(expectedSeen)
+      expect(syncAck).toHaveBeenCalledTimes(1)
+      expect(syncAck).toHaveBeenCalledWith(rows[coveredRows - 1]!.delivery_id)
+      // Whatever the cursor covers, a handler finished.
+      for (const row of rows.slice(0, coveredRows)) expect(finished).toContain(row.seq)
+      rt.disconnect()
+    },
+  )
+
   it('dedups a row redelivered on the next drain but still acks it', async () => {
     const row = syncRow('c', 1)
     // The server re-offers the same envelope on every drain until acked —

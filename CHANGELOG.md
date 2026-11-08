@@ -21,12 +21,19 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   stored backlog on the socket and the REST drain brings the same rows; the
   dedup cache is filled only once a handler succeeds, so with a slow handler
   (a model call) the second copy was dispatched again, and a script that
-  replies per message replied twice. A copy whose first copy is still with
-  the handlers is now not dispatched: it takes that outcome. Success acks it
-  (an ack frame for a live copy, the cursor for a drain row); a failure
-  leaves it unacked so the server re-offers it and it is tried again. Copies
-  wait on the first copy only where they waited on their own handler call
-  before, and the in-flight entries live only while handlers run.
+  replies per message replied twice. A copy that arrives on the same
+  connection while its first copy is still with the handlers is now not
+  dispatched, and nothing waits for the first copy: progress beats dedup.
+  A live copy is acked once the first copy finished cleanly, never if it
+  failed. A drain row's cursor stops at the row unless the first copy
+  already finished cleanly (the next drain covers it as a dedup hit). If the
+  first copy fails, the repeat is not acked either: in the default mode the
+  server re-offers the message; under `ackOnReceipt` the live copy was
+  already acked at receipt, so it is not re-offered, as with any failed
+  handler in that mode. A copy on a later connection is
+  dispatched afresh even if the first copy is still running, so a handler
+  that never finishes cannot swallow every re-offer. In-flight entries live
+  only while handlers run.
 
 ### Added
 
@@ -39,7 +46,7 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   handler did not finish, no message is dispatched twice, seqs stay in order
   per conversation. Identical bytes ship in the Python SDK.
 - Engine scenarios `repeat-while-handler-runs-in-order` / `-below-anchor`
-  and `frame-arrives-while-a-lapsed-gap-is-handled` (new op
+  and `frames-arrive-while-a-lapsed-gap-is-handled` (new op
   `gap_window_lapses`, a real 2 s wait). The last one guards a loss the
   Python SDK had: a frame that parked while a resolved gap's handler ran was
   cleared unseen. TypeScript was not affected: `resolveGap` and

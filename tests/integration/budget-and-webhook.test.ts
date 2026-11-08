@@ -48,7 +48,7 @@ interface WebhookDoc {
   body: string
   payload: Record<string, unknown>
   secret: string
-  standard_webhooks_secret: string
+  standard_webhooks_secret_base64: string
   now: number
   tolerance_s: number
   reasons: string[]
@@ -63,6 +63,8 @@ interface WebhookDoc {
 }
 
 const webhook = json<WebhookDoc>('wake-webhook.cases.json')
+// Built at run time: no secret-shaped literal is committed (secret scanners read `whsec_…` as a live key).
+const standardWebhooksSecret = ['whsec', webhook.standard_webhooks_secret_base64].join('_')
 
 describe('conformance — wake-webhook.cases.json', () => {
   it('the body is the payload, and the payload is a v1 wake', () => {
@@ -71,7 +73,7 @@ describe('conformance — wake-webhook.cases.json', () => {
   })
 
   it.each(webhook.cases.map((c) => [c.name, c] as const))('%s', async (_name, c) => {
-    const secret = c.secret ?? (c.dialect === 'standard-webhooks' ? webhook.standard_webhooks_secret : webhook.secret)
+    const secret = c.secret ?? (c.dialect === 'standard-webhooks' ? standardWebhooksSecret : webhook.secret)
     const run = () =>
       verifyWakeWebhook({
         dialect: c.dialect,
@@ -92,6 +94,30 @@ describe('conformance — wake-webhook.cases.json', () => {
       expect((error as WakeWebhookVerificationError).reason).toBe(c.expect.reason)
       expect(webhook.reasons).toContain(c.expect.reason)
     }
+  })
+
+  it('accepts the whsec_ form of a standard-webhooks secret (its base64 body is the key)', async () => {
+    const c = webhook.cases.find((x) => x.name === 'standard-webhooks-signed')!
+    expect(standardWebhooksSecret.startsWith('whsec_')).toBe(true)
+    await expect(
+      verifyWakeWebhook({
+        dialect: 'standard-webhooks',
+        body: webhook.body,
+        headers: c.headers,
+        secret: standardWebhooksSecret,
+        now: () => webhook.now * 1000,
+      }),
+    ).resolves.toMatchObject({ type: 'agentchat.wake' })
+    // The same base64 text used raw (no whsec_ prefix) is a different key.
+    await expect(
+      verifyWakeWebhook({
+        dialect: 'standard-webhooks',
+        body: webhook.body,
+        headers: c.headers,
+        secret: webhook.standard_webhooks_secret_base64,
+        now: () => webhook.now * 1000,
+      }),
+    ).rejects.toMatchObject({ reason: 'bad_signature' })
   })
 
   it('takes a fetch Headers object and raw bytes', async () => {

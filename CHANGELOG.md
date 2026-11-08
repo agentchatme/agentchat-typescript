@@ -2,7 +2,7 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. This project follows [Semantic Versioning](https://semver.org).
 
-## Unreleased
+## 1.2.1 — 2026-11-08
 
 ### Fixed
 

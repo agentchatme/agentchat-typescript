@@ -286,13 +286,13 @@ export interface ReceiveLoopOptions {
    * cycle fails closed for its cards (nothing recorded; the next wake asks
    * again) and the call's `signal` aborts.
    */
-  readonly gateCallTimeoutMs?: number /* 0 = no deadline */
+  readonly gateCallTimeoutMs?: number /* 0 or Infinity = no deadline */
   /**
    * A cycle's deadline (`CYCLE_TIMEOUT_MS`, 10 min), not counting time
    * inside turn admissions and runs. A cycle past it is abandoned (it stops
    * acting at its next step), reported once, and the loop takes wakes again.
    */
-  readonly cycleTimeoutMs?: number /* 0 = no watchdog */
+  readonly cycleTimeoutMs?: number /* 0 or Infinity = no watchdog */
   /**
    * singleRun: dismiss an invite still pending after two completed runs that
    * left it (default `true`), so an ignored invite does not cost a run on
@@ -313,7 +313,13 @@ export interface ReceiveLoopStatus {
   readonly started: boolean
   readonly stopped: boolean
   readonly handle: string | null
-  readonly socket: { readonly state: RealtimeState; readonly ackNegotiated: boolean; readonly capabilities: string[] } | null
+  readonly socket: {
+    readonly state: RealtimeState
+    readonly ackNegotiated: boolean
+    readonly capabilities: string[]
+    /** Backpressure refuses new messages (handlers behind); alarm if it stays true. */
+    readonly intakePaused: boolean
+  } | null
   readonly coalescer: { readonly state: CoalescerState; readonly wakes: number; readonly absorbed: number; readonly cycles: number }
   readonly texts: {
     readonly version: string | null
@@ -420,6 +426,8 @@ export class ReceiveLoop {
   private lastCycle: CycleSummary | null = null
   private readonly recentCycles: CycleSummary[] = []
   private cycleToken = 0
+  /** The running cycle's controller: aborted by stop() too, so a gate mid-way records nothing more. */
+  private cycleAbort: AbortController | null = null
   private readonly gateCallTimeoutMs: number
   private readonly cycleTimeoutMs: number
   private lastError: string | null = null
@@ -532,6 +540,9 @@ export class ReceiveLoop {
     this.coalescer.stop()
     this.clearMoreTimer()
     this.abort.abort()
+    // A gate mid-way records no further verdict; its cards stay on the tray
+    // and the next start gates them.
+    this.cycleAbort?.abort()
     for (const { handle } of this.waiting.splice(0)) this.tracker.end(handle)
     for (const off of this.unsubscribe.splice(0)) {
       try {
@@ -577,6 +588,7 @@ export class ReceiveLoop {
               state: this.realtime.state,
               ackNegotiated: this.realtime.ackNegotiated,
               capabilities: [...this.realtime.capabilities].sort(),
+              intakePaused: this.realtime.intakePaused,
             },
       coalescer: { state: this.coalescer.state, ...counters },
       texts: {
@@ -650,6 +662,7 @@ export class ReceiveLoop {
     if (this.stopped) return
     const token = ++this.cycleToken
     const controller = new AbortController()
+    this.cycleAbort = controller
     const startedAt = this.now()
     let excludedMs = 0
     let excludedSince: number | null = null
@@ -695,6 +708,7 @@ export class ReceiveLoop {
     })
     const result = await Promise.race([work.then(() => 'done' as const), overdue])
     if (timer !== null) this._clearTimeout(timer)
+    if (this.cycleAbort === controller) this.cycleAbort = null
     if (result === 'done') return
     // Abandoned: it acts no more (every step checks `stale()`), its pending
     // calls see an aborted signal, and the coalescer takes wakes again.
@@ -1270,7 +1284,7 @@ export function replyPrompt(texts: Pick<Texts, 'wake_instruction'>, conversation
 /** A timeout option: undefined → the default, 0 → disabled (Infinity), a positive number → itself. */
 function timeoutOption(value: number | undefined, fallback: number, name: string): number {
   if (value === undefined) return fallback
-  if (value === 0) return Number.POSITIVE_INFINITY
+  if (value === 0 || value === Number.POSITIVE_INFINITY) return Number.POSITIVE_INFINITY
   if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new RangeError(`ReceiveLoop: ${name} must be 0 (off) or a positive number`)
   return value
 }

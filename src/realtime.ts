@@ -647,6 +647,10 @@ export class RealtimeClient {
   private queuedJobs = 0
   // Messages were left un-taken because the queue was full; fetched again once it drains.
   private shedding = false
+  // A backpressure refetch reconnect is under way: intake stays refused until
+  // the new socket's hello.ok (a frame read off the closing socket could
+  // overtake one the server is about to re-offer).
+  private refetchPending = false
   // A drain was asked for while one ran: run once more when it ends.
   private drainAgain = false
   private disposed = false
@@ -825,6 +829,9 @@ export class RealtimeClient {
             Array.isArray(caps) ? caps.filter((c): c is string => typeof c === 'string' && offered.has(c)) : [],
           )
           this.ackMode = this.negotiated.has('ack')
+          // A refetch reconnect is complete: the server re-offers its backlog
+          // on this socket, in order; frames are taken in again.
+          this.refetchPending = false
           // A server that sends heartbeat frames makes the idle deadline
           // work on a socket that cannot see pings (contract v1, D7).
           if (
@@ -868,10 +875,7 @@ export class RealtimeClient {
       if (this.isMessageNew(message)) {
         // Backpressure: with the handlers this far behind, the frame is not
         // taken in — not acked, not dispatched — and the server keeps it.
-        if (this.queueFull()) {
-          this.startShedding()
-          return
-        }
+        if (this.refuseIntake()) return
         // Ack-on-receipt: the frame is parsed, the machine has it. Sent
         // before ordering so a frame parked on a seq gap is already
         // delivered; the post-dispatch ack is suppressed for this mode.
@@ -903,7 +907,8 @@ export class RealtimeClient {
         // lowercases it, so it must be a string here.
         reason: String(event.reason ?? ''),
         wasClean: event.wasClean,
-        initiator: 'server',
+        // A quiet reconnect's polite close was this client's own decision.
+        initiator: this.quietReconnect !== null ? 'client' : 'server',
       })
     }
 
@@ -1053,9 +1058,8 @@ export class RealtimeClient {
       // cursor stops at the first of them and the drain ends here.
       let injected = envelopes.length
       for (const [index, envelope] of envelopes.entries()) {
-        if (this.queueFull()) {
+        if (this.refuseIntake()) {
           injected = index
-          this.startShedding()
           break
         }
         this.processOrderedMessage(envelope)
@@ -1657,6 +1661,16 @@ export class RealtimeClient {
   }
 
   /**
+   * `true` while backpressure refuses new messages: from the moment the
+   * handler queue filled (`maxQueuedMessages`) until it is back to half and,
+   * without a REST client, the reconnect that fetches what was left is up.
+   * A host can alarm when it stays true (handlers that hang).
+   */
+  get intakePaused(): boolean {
+    return this.shedding || this.refetchPending
+  }
+
+  /**
    * The capabilities this connection's `hello.ok` accepted (`ack`,
    * `heartbeat`, `rewake`, …). Empty before `hello.ok` and after a close.
    */
@@ -1688,6 +1702,7 @@ export class RealtimeClient {
     this.authenticated = false
     this.ackMode = false
     this.negotiated = new Set()
+    this.refetchPending = false
     this.setState('stopped')
     for (const handler of this.stoppedHandlers) {
       try { handler() } catch { /* user hook must not break flow */ }
@@ -1915,6 +1930,19 @@ export class RealtimeClient {
     return this.shedding || this.queuedJobs >= this.options.maxQueuedMessages
   }
 
+  /**
+   * Whether a new message is refused at intake. A full queue (or an episode
+   * under way) refuses and starts/continues the episode; a refetch reconnect
+   * under way refuses quietly — the new socket re-offers everything stored.
+   */
+  private refuseIntake(): boolean {
+    if (this.queueFull()) {
+      this.startShedding()
+      return true
+    }
+    return this.refetchPending
+  }
+
   /** The queue is full: messages are left with the server from here (one notice per episode). */
   private startShedding(): void {
     if (this.shedding) return
@@ -1939,7 +1967,9 @@ export class RealtimeClient {
         this.emitError(err instanceof Error ? err : new ConnectionError('sync drain failed'))
       })
     } else if (this.ws !== null && this.authenticated) {
-      // No REST client: one quiet reconnect, and the server re-offers its backlog.
+      // No REST client: one quiet reconnect, and the server re-offers its
+      // backlog. Intake stays refused until the new socket is up.
+      this.refetchPending = true
       this.closePolitely('refetch', 'client reconnects to fetch messages it left with the server')
     }
   }

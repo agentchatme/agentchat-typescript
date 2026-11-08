@@ -509,3 +509,63 @@ describe('backpressure (maxQueuedMessages)', () => {
     rt.disconnect()
   })
 })
+
+describe('quiet reconnects: reported as the client\'s, intake held through a refetch', () => {
+  it('a polite renegotiation close reaches onDisconnect with initiator client', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor })
+    const closes: Array<{ initiator: string; code: number }> = []
+    rt.onDisconnect((info) => closes.push({ initiator: info.initiator, code: info.code }))
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack', 'heartbeat'] })
+    rt.on('message.new', () => undefined) // first handler after the HELLO: renegotiate
+    await settle()
+    ws.simulateClose(1000, 'client reconnects to negotiate delivery acks', true)
+    expect(closes).toEqual([{ initiator: 'client', code: 1000 }])
+    rt.disconnect()
+  })
+
+  it('without a REST client, intake stays refused through the refetch reconnect until the new socket is up', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false, ackOnReceipt: true, maxQueuedMessages: 2 })
+    rt.onError(() => undefined)
+    const seen: string[] = []
+    const releases: Array<() => void> = []
+    rt.on('message.new', async (m) => {
+      seen.push(String(m.payload.id))
+      await new Promise<void>((r) => releases.push(r))
+    })
+    const frame = (n: number) => ({ type: 'message.new', payload: { id: `p${n}`, conversation_id: 'a', seq: n } })
+    const ws = await open(rt, { type: 'hello.ok', capabilities: ['ack'] })
+    ws.simulateMessage(frame(1))
+    ws.simulateMessage(frame(2)) // queued: the queue is full
+    ws.simulateMessage(frame(3)) // left with the server
+    expect(rt.intakePaused).toBe(true)
+    releases.shift()!() // back to half: the polite refetch close starts
+    await settle()
+    expect(ws.closed).not.toBeNull()
+    expect(rt.intakePaused).toBe(true)
+    ws.readyState = 1 // still delivering until the server answers the close
+    ws.simulateMessage(frame(4)) // not taken in: it would overtake p3
+    await settle()
+    expect(seen).toEqual(['p1', 'p2'])
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['p1', 'p2'])
+    ws.simulateClose(1000, 'bye', true)
+    const next = MockWebSocket.latest()
+    next.simulateOpen()
+    expect(rt.intakePaused).toBe(true)
+    next.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+    expect(rt.intakePaused).toBe(false)
+    releases.splice(0).forEach((r) => r()) // p2 finishes: the queue is empty again
+    await settle()
+    next.simulateMessage(frame(3)) // the server re-offers, in order
+    next.simulateMessage(frame(4))
+    for (let i = 0; i < 10 && seen.length < 4; i++) {
+      releases.splice(0).forEach((r) => r())
+      await settle()
+    }
+    expect(seen).toEqual(['p1', 'p2', 'p3', 'p4'])
+    releases.splice(0).forEach((r) => r())
+    rt.disconnect()
+  })
+})

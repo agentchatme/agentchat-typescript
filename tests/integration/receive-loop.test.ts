@@ -392,7 +392,7 @@ describe('ReceiveLoop — the socket', () => {
     expect(JSON.parse(ws.sent[0]!)).toMatchObject({ type: 'hello', api_key: 'ac_key', capabilities: ['ack', 'heartbeat', 'rewake'] })
     ws.simulateMessage(json('hello-ok.v1.json'))
     await until(() => loop.status().coalescer.cycles === 1, 'the connect cycle')
-    expect(loop.status().socket).toEqual({ state: 'ready', ackNegotiated: true, capabilities: ['ack', 'heartbeat', 'rewake'] })
+    expect(loop.status().socket).toEqual({ state: 'ready', ackNegotiated: true, capabilities: ['ack', 'heartbeat', 'rewake'], intakePaused: false })
 
     const frame = (id: string, sender: string) => ({ type: 'message.new', payload: { id, conversation_id: 'conv_x', sender, seq: Number(id.slice(-1)) } })
     ws.simulateMessage(frame('msg_own1', 'example-relay'))
@@ -1026,5 +1026,35 @@ describe('ReceiveLoop — invite turns need known calls to dismiss', () => {
     await until(() => loop.status().counters.outcomes.invite_silent_unconfirmed === 1)
     expect(dismissInvite).not.toHaveBeenCalled()
     await loop.stop()
+  })
+})
+
+describe('ReceiveLoop — stop() mid-gate, Infinity deadlines', () => {
+  it('stop() during the gate records no further verdict; the cards stay for the next start', async () => {
+    const OPS = sample.conversations[2]!
+    const { client, state, record } = fakeClient()
+    state.tray = trayOf([DIRECT, CREW, OPS])
+    let entered = 0
+    record.mockImplementation(async (conversationId: string, opts: { decision: string }) => {
+      entered += 1
+      await new Promise((r) => setTimeout(r, 30))
+      return { id: 'd', conversation_id: conversationId, decision: opts.decision } as unknown as ReplyDecision
+    })
+    const callModel = vi.fn(
+      answer([DIRECT, CREW, OPS].map((c) => ({ conversation_id: c.conversation_id, decision: 'dismiss' }))),
+    )
+    const { loop } = gateLoop({ client, callModel })
+    loop.wake()
+    await until(() => entered === 1, 'the first verdict under way')
+    await loop.stop()
+    await new Promise((r) => setTimeout(r, 80))
+    expect(record).toHaveBeenCalledTimes(1)
+  })
+
+  it('Infinity turns a deadline off, like 0; a negative value is an error', () => {
+    const { client } = fakeClient()
+    expect(() => gateLoop({ client, gateCallTimeoutMs: Number.POSITIVE_INFINITY, cycleTimeoutMs: Number.POSITIVE_INFINITY })).not.toThrow()
+    expect(() => gateLoop({ client, gateCallTimeoutMs: 0, cycleTimeoutMs: 0 })).not.toThrow()
+    expect(() => gateLoop({ client, cycleTimeoutMs: -1 })).toThrow(RangeError)
   })
 })

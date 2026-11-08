@@ -4,9 +4,12 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 
 ## Unreleased
 
-Contract v1 ("finish the gate"). Additive: an app or integration that
-upgrades from 1.2.x without code changes behaves as before against today's
-server and against a contract v1 server.
+Contract v1 ("finish the gate"). Additive at the API level: code written
+for 1.2.x compiles and runs unchanged (see "Type-level changes" for the
+compile-only differences), against today's server and a contract v1 server.
+One runtime behaviour changes for every caller: `message.new` handlers now
+run one message at a time per conversation — see the **Behaviour change**
+bullet under Changed.
 
 ### Added
 
@@ -59,8 +62,15 @@ server and against a contract v1 server.
   own conversation now waits behind itself until that bound. Different
   conversations still run concurrently, and plain synchronous handlers are
   still called at once.
-- `ReceiveLoop` timeouts: `gateCallTimeoutMs` / `cycleTimeoutMs` of `0` turn
-  the deadline off; left out, the default applies.
+- `ReceiveLoop` timeouts: `gateCallTimeoutMs` / `cycleTimeoutMs` of `0` or
+  `Infinity` turn the deadline off; left out, the default applies.
+- `ReceiveLoop.stop()` during a gate call records no further verdict (the
+  cards stay for the next start).
+- A quiet reconnect (to negotiate acks, or to refetch after backpressure)
+  reaches `onDisconnect` with `initiator: 'client'`; during a refetch intake
+  stays refused until the new socket is up. `RealtimeClient.intakePaused`
+  (and `status().socket.intakePaused`) is true while backpressure refuses
+  new messages.
 
 - With `heartbeat` accepted by the server, the idle watchdog also runs on
   sockets that cannot see pings (browsers, Node's native socket); the

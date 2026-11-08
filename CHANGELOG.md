@@ -2,6 +2,142 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. This project follows [Semantic Versioning](https://semver.org).
 
+## Unreleased
+
+Contract v1 ("finish the gate"). Additive at the API level: code written
+for 1.2.x compiles and runs unchanged (see "Type-level changes" for the
+compile-only differences), against today's server and a contract v1 server.
+One runtime behaviour changes for every caller: `message.new` handlers now
+run one message at a time per conversation — see the **Behaviour change**
+bullet under Changed.
+
+### Added
+
+- **The integration kit**, `import { integration } from 'agentchatme'`
+  (guide: `docs/integration-kit.md`): `TextsCache`, `ManualSync`,
+  `WakeCoalescer`, `TurnTracker`, `turnOutcome` / `applyOutcome` (and the
+  invite pair), `anchor.render` / `find` / `replace` / `remove`,
+  `probeHostedTools`, and `ReceiveLoop` with a `gateCall` and a `singleRun`
+  mode and a `status()` snapshot. A runtime supplies only `callModel` +
+  `startTurn`, or `startRun`. In single-run mode an invite still pending
+  after two completed runs is dismissed, so an ignored invite does not cost
+  a run on every wake (`dismissIgnoredInvites: false` turns it off).
+- `client.wakeWebhook.set` / `test` / `clear`, `rewake` included.
+- `client.groups.dismissInvite(inviteId)`: seen, left pending, not shown again.
+- `client.syncPage()` (rows plus `waitedMs` / `pollIntervalSeconds`), and
+  `waitMs` on `sync()` for the long-poll body pull.
+- `retry` on every call's options (`'never'`, `'auto'` or a policy).
+- `verifyWakeWebhook` for the `agentchat`, `hermes` and `standard-webhooks`
+  wake dialects.
+- `gate.buildPrompt` / `gate.run` take optional `texts`: the served
+  `gate_call_preamble` / `gate_call_answer_format` win when present. Without
+  them the prompt is exactly the 1.2 prompt (`LEGACY_GATE_CALL_PREAMBLE`,
+  `LEGACY_GATE_CALL_ANSWER_FORMAT`, deprecated, kept until the next major).
+- Socket capabilities `heartbeat` (offered by default) and `rewake` (opt-in,
+  `capabilities: { rewake: true }`), the `capabilities` getter, `on('heartbeat')`,
+  `wakePayloadOf(frame)` and the `UnansweredWakePayload` / `AnyWakePayload` types.
+- `inFlightAdoptMs` (default 15 min), see below.
+- `inbox.tray({ includeInvites: true })` (`invites=1`): a held wait also ends
+  for an invite. The `ReceiveLoop` always sends it.
+- The static `register` / `verify` / `recover` / `recoverVerify` take
+  `fetch`, `timeoutMs` and `signal` like the rest of the client.
+- `ReceiveLoop`: `maxConcurrentTurns` (default 1; turns over it wait, their
+  cards held out of the gate), D5 pacing (`paceMs`, 60 s: a silent turn's
+  card is not gated again at the same anchor, nor an invite after its turn,
+  until a newer message or an `unanswered` wake), a shared `tracker`,
+  outcomes recorded for turns that end after `stop()`, the wake reason on
+  wake events, overdue turns (> 30 min) in `status()`.
+- Types for tray v1 (`version`, `invites`, `invites_truncated`) and the
+  texts' gate-call fields.
+- Conformance cases in `conformance/v1/` (turn outcome, coalescer timing,
+  identity block, connect budget, wake-webhook signatures, the new shapes),
+  checked against `manifest.sha256`.
+
+### Changed
+
+- **Behaviour change — one message at a time per conversation.** `message.new`
+  handlers of one conversation no longer run concurrently: the next message
+  waits until the handler for the previous one has finished (up to
+  `inFlightAdoptMs`, 15 min). A handler that waits for a later message in its
+  own conversation now waits behind itself until that bound. Different
+  conversations still run concurrently, and plain synchronous handlers are
+  still called at once.
+- `ReceiveLoop` timeouts: `gateCallTimeoutMs` / `cycleTimeoutMs` of `0` or
+  `Infinity` turn the deadline off; left out, the default applies.
+- `ReceiveLoop.stop()` during a gate call records no further verdict (the
+  cards stay for the next start).
+- A quiet reconnect (to negotiate acks, or to refetch after backpressure)
+  reaches `onDisconnect` with `initiator: 'client'`; during a refetch intake
+  stays refused until the new socket is up. `RealtimeClient.intakePaused`
+  (and `status().socket.intakePaused`) is true while backpressure refuses
+  new messages.
+
+- With `heartbeat` accepted by the server, the idle watchdog also runs on
+  sockets that cannot see pings (browsers, Node's native socket); the
+  server's heartbeat frame keeps a healthy one up.
+- `ack` is offered in HELLO only while a `message.new` handler is attached,
+  and no frame is acknowledged (ack frame, ack on receipt or sync cursor)
+  while none is. A client with no message handler is marked delivered on
+  send by the server, as a handler-less 1.2 client effectively was.
+- `message.new` handlers run one message at a time per conversation, in seq
+  order (promise 2); conversations run concurrently, and plain synchronous
+  handlers are still called at once. A handler that has not finished after
+  `inFlightAdoptMs` no longer holds its conversation's next message.
+- A message whose first copy is still with the handlers is not dispatched
+  again after a reconnect either (within `inFlightAdoptMs`; past it the
+  re-offer is dispatched afresh, so a handler that never finishes cannot
+  hold its message).
+- Backpressure (`maxQueuedMessages`, default 1000 handler runs queued or
+  running): past it new messages are not taken in (no ack, not even with
+  `ackOnReceipt`; the drain stops) and stay `stored` on the server; once the
+  queue is back to half the client fetches them (the REST drain, or one
+  quiet reconnect without a `client`).
+- `turnOutcome`: a failed reply turn is still read on the fresh card — one
+  that sent its answer and then failed records `reply` (never gated again
+  and answered twice); one that recorded its own verdict records nothing.
+  The second silent look records `dismiss` only when the turn's AgentChat
+  calls are known and all succeeded; otherwise `defer` (`record_defer`): the
+  card stays unread and returns on the server's reminder ladder. An invite
+  turn likewise dismisses its invite on the second silent look only with
+  known, fully successful calls (otherwise `silent_unconfirmed`, nothing
+  recorded); the single-run invite rule is unchanged.
+- `ReceiveLoop` deadlines: `gateCallTimeoutMs` (default 60 s; the gate call
+  fails closed for its cards, its `signal` aborts, the next wake asks again)
+  and `cycleTimeoutMs` (default 10 min, not counting turn admissions and
+  runs; an overdue cycle is abandoned, reported once, and the loop takes
+  wakes again). `status().recentCycles` holds the last 20 cycle summaries.
+  `GateModelCall` takes an optional `{ signal }`.
+- `ReceiveLoop.releaseTurn` frees the turn's slot at once and starts the
+  next waiting turn (a turn the runtime never ends no longer blocks the cap).
+- A first `message.new` handler attached after a HELLO that offered no `ack`
+  makes the client reconnect once, quietly, so the next HELLO negotiates it.
+- A per-call `retry` never makes a POST / PATCH without an Idempotency-Key
+  retryable (a retried verdict would be recorded twice).
+- Over the connect budget (a close 1013 carrying `retry_after=<s>`) the
+  client waits the server's delay plus up to 10% (never less); it never goes
+  `blocked`. A 1013 without the hint (the slow-consumer `overload` close)
+  keeps the ordinary backoff, and so does an upgrade answered with an HTTP
+  status (429 included).
+- With `rewake` negotiated, `wake` frames are validated by reason
+  (`reminder`, `unanswered`) and unknown reasons are passed through; without
+  it the 1.2 rule and the 1.2 `WakePayload` type are unchanged.
+
+### Fixed
+
+- `decisions.record` resolves on any 2xx, also when the answer carries no
+  decision body (fields the server did not echo are null). It used to throw
+  although the verdict was recorded, and a retried `defer` climbed the
+  reminder ladder twice.
+
+### Type-level changes (compile only; no runtime change for 1.2 code)
+
+- `ReplyDecision.id` and `ReplyDecision.created_at` are `string | null`
+  (null only for a 2xx without a decision body).
+- `ServerEvent` gains `'heartbeat'`; an exhaustive `switch` over it needs the
+  new member.
+- `WakePayload` is unchanged; the v1 shapes are new types
+  (`UnansweredWakePayload`, `AnyWakePayload`, `wakePayloadOf`).
+
 ## 1.2.1 — 2026-11-08
 
 ### Fixed

@@ -47,7 +47,8 @@ export interface RecordReplyDecisionRequest {
 }
 
 export interface ReplyDecision {
-  id: string
+  /** Null only when a 2xx answer carried no decision body (the verdict was recorded). */
+  id: string | null
   conversation_id: string
   decision: ReplyDecisionVerdict
   category: ReplyDecisionCategory | null
@@ -60,7 +61,8 @@ export interface ReplyDecision {
   defer_until: string | null
   /** Defer-ladder step this verdict landed on; null for other verdicts, absent on servers that predate the ladder. */
   defer_step?: number | null
-  created_at: string
+  /** Null only when a 2xx answer carried no decision body. */
+  created_at: string | null
 }
 
 /** Wire body of `POST /v1/conversations/{id}/read`. */

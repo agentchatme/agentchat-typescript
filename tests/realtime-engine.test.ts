@@ -34,6 +34,9 @@ async function connected(options: Partial<ConstructorParameters<typeof RealtimeC
     reconnect: false,
     ...options,
   })
+  // The usual order: a message handler is attached before the socket opens,
+  // so the HELLO offers acks. Tests add their own handlers alongside.
+  rt.on('message.new', () => undefined)
   await rt.connect()
   const ws = MockWebSocket.latest()
   ws.simulateOpen()
@@ -552,13 +555,13 @@ describe('RealtimeClient — a repeat while the first copy is still with the han
     rt.disconnect()
   })
 
-  it('a re-offer on a later connection is dispatched afresh while the first copy still runs', async () => {
+  it('a re-offer on a later connection adopts the first copy still running: no second dispatch', async () => {
     const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false })
-    const stuck = deferred()
+    const slow = deferred()
     const calls: string[] = []
     rt.on('message.new', async (m) => {
       calls.push(String(m.payload.id))
-      if (calls.length === 1) await stuck.promise // a handler that never finishes
+      if (calls.length === 1) await slow.promise // a slow handler (a model call)
     })
     await rt.connect()
     const ws1 = MockWebSocket.latest()
@@ -574,9 +577,72 @@ describe('RealtimeClient — a repeat while the first copy is still with the han
     ws2.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
     ws2.simulateMessage(messageNew('c', 1)) // the server re-offers the unacked message
     await settle()
+    expect(calls).toEqual(['msg_1'])
+    expect(sentFrames(ws2, 'ack')).toEqual([])
+
+    slow.resolve()
+    await settle()
+    expect(calls).toEqual(['msg_1'])
+    // The first copy's ack and the adopted copy's ack, both on the live socket.
+    expect(sentFrames(ws2, 'ack').map((f) => f.message_id)).toEqual(['msg_1', 'msg_1'])
+    rt.disconnect()
+  })
+
+  it('a re-offer after the first copy failed is dispatched again', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false })
+    rt.onError(() => undefined)
+    const slow = deferred()
+    const calls: string[] = []
+    rt.on('message.new', async (m) => {
+      calls.push(String(m.payload.id))
+      if (calls.length === 1) await slow.promise
+    })
+    await rt.connect()
+    const ws1 = MockWebSocket.latest()
+    ws1.simulateOpen()
+    ws1.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+    ws1.simulateMessage(messageNew('c', 1))
+    await settle()
+    ws1.simulateClose(1006, 'abnormal', false)
+    slow.reject(new Error('model call failed'))
+    await settle()
+
+    await rt.connect()
+    const ws2 = MockWebSocket.latest()
+    ws2.simulateOpen()
+    ws2.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+    ws2.simulateMessage(messageNew('c', 1))
+    await settle()
     expect(calls).toEqual(['msg_1', 'msg_1'])
     expect(sentFrames(ws2, 'ack').map((f) => f.message_id)).toEqual(['msg_1'])
     rt.disconnect()
+  })
+
+  it('no message handler attached: nothing is acked or remembered, in either mode', async () => {
+    for (const ackOnReceipt of [false, true]) {
+      MockWebSocket.reset()
+      const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false, ackOnReceipt })
+      // A handler that was there at HELLO (acks offered) and is gone when the frame arrives.
+      const off = rt.on('message.new', () => undefined)
+      await rt.connect()
+      const ws = MockWebSocket.latest()
+      ws.simulateOpen()
+      ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack'] })
+      off()
+      ws.simulateMessage(messageNew('c', 1))
+      await settle()
+      expect(sentFrames(ws, 'ack')).toEqual([])
+      // A handler attached later gets the re-offer: it was never deduped.
+      const calls: string[] = []
+      rt.on('message.new', (m) => {
+        calls.push(String(m.payload.id))
+      })
+      ws.simulateMessage(messageNew('c', 1))
+      await settle()
+      expect(calls).toEqual(['msg_1'])
+      expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_1'])
+      rt.disconnect()
+    }
   })
 
   it('a live repeat is acked only after the first copy succeeded, without a second dispatch', async () => {

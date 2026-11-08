@@ -1,6 +1,15 @@
-import type { WsMessage, Message, WakeFrame } from './types/index.js'
+import type {
+  AnyWakeFrame,
+  AnyWakePayload,
+  HeartbeatFrame,
+  Message,
+  SocketCapability,
+  WakeFrame,
+  WsMessage,
+} from './types/index.js'
 import type { AgentChatClient, SyncEnvelope } from './client.js'
 import { ConnectionError } from './errors.js'
+import { connectBudgetDelayMs } from './connect-budget.js'
 import { resolveWebSocket } from './ws-resolver.js'
 import {
   DEFAULT_CLIENT_IDENTITY,
@@ -16,8 +25,14 @@ import {
  * ack goes out before handlers run and completion no longer gates it.
  */
 export type MessageHandler = (message: WsMessage) => void | Promise<void>
-/** Handler for `wake` frames: a content-free "check AgentChat" signal. */
+/**
+ * Handler for `wake` frames: a content-free "check AgentChat" signal. With
+ * the `rewake` capability other reasons arrive too; read the payload with
+ * `wakePayloadOf(frame)`.
+ */
 export type WakeHandler = (frame: WakeFrame) => void | Promise<void>
+/** Handler for `heartbeat` frames (capability `heartbeat`): proof of life, nothing to do. */
+export type HeartbeatHandler = (frame: HeartbeatFrame) => void
 export type ErrorHandler = (error: Error) => void
 
 /**
@@ -55,7 +70,8 @@ export type DisconnectHandler = (info: DisconnectInfo) => void
  * - `connecting` — a socket is opening, or its HELLO awaits `hello.ok`.
  * - `ready` — `hello.ok` received; frames flow.
  * - `backoff` — the socket closed; the next attempt is scheduled with
- *   exponential backoff.
+ *   exponential backoff, or after the server's own delay when it closed the
+ *   socket "over the connect budget" (close 1013 with a retry hint).
  * - `blocked` — the server rejected the credential during the handshake; a
  *   fresh attempt is scheduled every 10–15 minutes until one is accepted.
  * - `stopped` — `disconnect()` was called.
@@ -227,13 +243,63 @@ export interface RealtimeOptions {
    * the default (100 000) survives one missed ping and trips on the second.
    *
    * Ping frames are visible only on a socket with `on('ping')` (Node `ws`).
-   * A browser-shaped socket cannot see them, so there the idle deadline is
-   * OFF unless set explicitly: only application frames would keep it alive,
-   * and an idle but healthy connection would otherwise be reopened every
-   * cycle. `0` disables it on any socket; the handshake deadline stays.
+   * A browser-shaped socket (browsers, Node's native socket) cannot see
+   * them; there the deadline runs on the server's `heartbeat` frame, sent
+   * on the same 45 s timer once `hello.ok` accepted the `heartbeat`
+   * capability (contract v1). Against a server that did not accept it the
+   * idle deadline is OFF on such a socket unless set explicitly: only
+   * application frames would keep it alive. `0` disables it on any socket;
+   * the handshake deadline stays.
    */
   livenessTimeoutMs?: number
+  /**
+   * How long a running `message.new` handler may hold things up, in ms.
+   * Handlers run one message at a time per conversation; a run that has not
+   * finished after this long no longer holds its conversation's next
+   * message back. And a re-offer of the same message on a LATER connection
+   * takes the running dispatch's outcome (no second dispatch) only within
+   * this time; past it, it is dispatched afresh. So a handler that never
+   * finishes cannot hold its message or its conversation forever. On the
+   * same connection a repeat always takes the running outcome. Default
+   * 900 000 (15 min).
+   */
+  inFlightAdoptMs?: number
+  /**
+   * Backpressure: how many `message.new` handler runs may be queued or
+   * running at once, across every conversation. Past it the client takes no
+   * new messages in: a live frame is neither acknowledged (not even with
+   * `ackOnReceipt`) nor dispatched, and the offline drain stops, so the
+   * server keeps them `stored`. Once the queue is back to half, the client
+   * fetches what it left (the REST drain when a `client` is configured, else
+   * one quiet reconnect, after which the server re-offers its backlog). A
+   * slow handler therefore cannot grow memory without limit. Default 1000.
+   */
+  maxQueuedMessages?: number
+  /**
+   * Socket capabilities to offer in HELLO besides `ack` (offered while a
+   * `message.new` handler is attached).
+   * The server echoes what it accepted (`capabilities` getter).
+   *
+   * - `heartbeat` (default `true`): the server sends a `heartbeat` frame on
+   *   its ping timer, which keeps the idle deadline working on sockets that
+   *   cannot see pings.
+   * - `rewake` (default `false`): the server sends `wake` frames with
+   *   `reason: "unanswered"` while cards on your tray stay unanswered, and
+   *   counts this socket as present, so the wake webhook does not re-wake
+   *   too. Offer it only when a `wake` handler acts on those frames (the
+   *   integration kit's `ReceiveLoop` does).
+   */
+  capabilities?: {
+    heartbeat?: boolean
+    rewake?: boolean
+  }
 }
+
+/** See `maxQueuedMessages`. */
+const DEFAULT_MAX_QUEUED_MESSAGES = 1_000
+
+/** See `inFlightAdoptMs`. */
+const DEFAULT_IN_FLIGHT_ADOPT_MS = 15 * 60_000
 
 /** Handshake deadline, `connect()` → `hello.ok`. See `handshakeTimeoutMs`. */
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 15_000
@@ -267,6 +333,9 @@ const LONG_OUTAGE_MAX_INTERVAL_MS = 5 * 60_000
  */
 const RECONNECT_JITTER_RATIO = 0.25
 
+/** The connect-budget wait is the server's delay plus up to this much (never less). */
+const BUDGET_JITTER_RATIO = 0.1
+
 /**
  * After the server rejects the credential, retry a fresh HELLO at this
  * cadence (±20% jitter → 10–15 min). A rejected key is not a dead end: keys
@@ -296,6 +365,15 @@ const SERVER_AUTH_CLOSE_REASONS: readonly string[] = ['invalid token']
  * before `hello.ok`, means the credential was rejected. Pure; exported so
  * integrations and tests share one definition.
  */
+/**
+ * A wake frame's payload typed as every shape it can have: the reminder, and
+ * on a socket that negotiated `rewake` the `unanswered` wake and reasons this
+ * SDK does not know yet. Discriminate on `reason`.
+ */
+export function wakePayloadOf(frame: WakeFrame | AnyWakeFrame): AnyWakePayload {
+  return frame.payload as AnyWakePayload
+}
+
 export function isAuthRejectionClose(code: number, reason: string): boolean {
   if (UNAMBIGUOUS_AUTH_CLOSE_CODES.has(code)) return true
   if (code !== AMBIGUOUS_AUTH_CLOSE_CODE) return false
@@ -307,7 +385,7 @@ export function isAuthRejectionClose(code: number, reason: string): boolean {
 // A Node `ws` socket is an EventEmitter and surfaces ping/pong frames; the
 // browser shape has neither `on` nor the frames.
 type PingCapableSocket = WebSocket & {
-  on(event: 'ping' | 'pong', listener: () => void): unknown
+  on(event: 'ping' | 'pong' | 'unexpected-response', listener: () => void): unknown
 }
 function isPingCapable(ws: WebSocket): ws is PingCapableSocket {
   return typeof (ws as { on?: unknown }).on === 'function'
@@ -433,6 +511,8 @@ function toError(reason: unknown, context: string): Error {
 interface InFlight {
   promise: Promise<boolean>
   generation: number
+  /** When its lane started the handlers; null while it still waits in the lane. */
+  startedAt: number | null
   settled: boolean
   ok: boolean
 }
@@ -475,6 +555,9 @@ export class RealtimeClient {
     ackOnReceipt: boolean
     webSocket?: typeof globalThis.WebSocket
     clientIdentity: AgentChatClientIdentity
+    offeredCapabilities: SocketCapability[]
+    inFlightAdoptMs: number
+    maxQueuedMessages: number
   }
   private handlers = new Map<string, Set<MessageHandler>>()
   private errorHandlers = new Set<ErrorHandler>()
@@ -505,6 +588,16 @@ export class RealtimeClient {
   // True only when the server echoed the 'ack' capability in hello.ok.
   // Per-connection: reset on every close and re-negotiated on every HELLO.
   private ackMode = false
+  // Every capability the server echoed in this connection's hello.ok.
+  private negotiated: ReadonlySet<string> = new Set()
+  // What this connection's HELLO offered, and whether it has been sent.
+  private offeredThisHello: SocketCapability[] = []
+  private helloSent = false
+  // The current socket is being closed for a quiet reconnect (maybeRenegotiateAck, jobDone).
+  private quietReconnect: 'renegotiate' | 'refetch' | null = null
+  // The current socket's upgrade was answered with an HTTP status instead of
+  // 101 (Node `ws` only; a browser-shaped socket cannot see it): ordinary backoff.
+  private upgradeRejection: { status: number } | null = null
   /** One error per long outage, then silent until a stable connection. */
   private longOutageAnnounced = false
   /** One error per run of rejected handshakes, then silent until hello.ok. */
@@ -515,19 +608,20 @@ export class RealtimeClient {
   // dispatch suppress its own redelivery.
   private dedupSeen = new Set<string>()
   // Dispatches still running, by message id. A second copy of an id that is
-  // here on the same connection (the server's reconnect backlog and the REST
-  // drain bring the same stored rows; a slow handler is still on the first)
-  // is not handed to the handlers again: it takes the first copy's outcome,
-  // and nothing ever waits for it. An entry lives exactly as long as its
-  // handlers run, so the map is bounded by the dispatches in flight.
+  // here (the server's reconnect backlog and the REST drain bring the same
+  // stored rows; a lost ack makes the server re-offer it after a reconnect;
+  // a slow handler is still on the first) is not handed to the handlers
+  // again: it takes the first copy's outcome, and nothing ever waits for it.
+  // On the same connection always; on a later one while the first copy has
+  // run less than `inFlightAdoptMs` — past that a re-offer is dispatched
+  // afresh, so a handler that never finishes cannot hold its message for
+  // good. An entry lives exactly as long as its handlers run, so the map is
+  // bounded by the dispatches in flight.
   private inFlight = new Map<string, InFlight>()
   // Drain rows that adopted an in-flight copy instead of being dispatched.
   // The cursor reads that copy's outcome; it never waits for it.
   private drainAdopted = new WeakMap<WsMessage, InFlight>()
-  // Bumped on every socket close. Copies adopt an in-flight first copy only
-  // on the same connection; a re-offer on a later one is dispatched afresh
-  // even while the first copy runs (a handler that never finishes must not
-  // swallow every re-offer).
+  // Bumped on every socket close; recorded on each dispatch for diagnostics.
   private generation = 0
   // Envelopes injected by the REST drain, as opposed to live WS frames.
   // Drain rows are acknowledged via the REST sync/ack cursor, never via a
@@ -545,6 +639,20 @@ export class RealtimeClient {
   // reason about than interleaved read cursors.
   private drainInFlight = false
   private orderStates = new Map<string, OrderState>()
+  // Per-conversation serial lanes for message.new handlers (promise 2: one
+  // message at a time per conversation, in seq order). The tail of each
+  // lane; an idle lane has no entry, so the map holds busy lanes only.
+  private lanes = new Map<string, Promise<void>>()
+  // Handler runs queued or running across all lanes (backpressure).
+  private queuedJobs = 0
+  // Messages were left un-taken because the queue was full; fetched again once it drains.
+  private shedding = false
+  // A backpressure refetch reconnect is under way: intake stays refused until
+  // the new socket's hello.ok (a frame read off the closing socket could
+  // overtake one the server is about to re-offer).
+  private refetchPending = false
+  // A drain was asked for while one ran: run once more when it ends.
+  private drainAgain = false
   private disposed = false
 
   constructor(options: RealtimeOptions) {
@@ -581,6 +689,19 @@ export class RealtimeClient {
       ackOnReceipt: options.ackOnReceipt ?? false,
       webSocket: options.webSocket,
       clientIdentity: options.clientIdentity ?? DEFAULT_CLIENT_IDENTITY,
+      maxQueuedMessages:
+        typeof options.maxQueuedMessages === 'number' && Number.isInteger(options.maxQueuedMessages) && options.maxQueuedMessages >= 1
+          ? options.maxQueuedMessages
+          : DEFAULT_MAX_QUEUED_MESSAGES,
+      inFlightAdoptMs:
+        typeof options.inFlightAdoptMs === 'number' && Number.isFinite(options.inFlightAdoptMs) && options.inFlightAdoptMs >= 0
+          ? options.inFlightAdoptMs
+          : DEFAULT_IN_FLIGHT_ADOPT_MS,
+      offeredCapabilities: [
+        'ack',
+        ...(options.capabilities?.heartbeat === false ? [] : (['heartbeat'] as const)),
+        ...(options.capabilities?.rewake === true ? (['rewake'] as const) : []),
+      ],
     }
   }
 
@@ -638,6 +759,10 @@ export class RealtimeClient {
     this.ws = ws
     this.authenticated = false
     this.ackMode = false
+    this.negotiated = new Set()
+    this.offeredThisHello = []
+    this.helloSent = false
+    this.upgradeRejection = null
     this.livenessMs =
       this.options.livenessTimeoutMs ?? (isPingCapable(ws) ? DEFAULT_LIVENESS_TIMEOUT_MS : 0)
     this.armHandshakeDeadline()
@@ -661,7 +786,7 @@ export class RealtimeClient {
           JSON.stringify({
             type: 'hello',
             api_key: this.options.apiKey,
-            capabilities: ['ack'],
+            capabilities: this.helloCapabilities(),
             client: this.options.clientIdentity.name,
             ...(this.options.clientIdentity.version
               ? { client_version: this.options.clientIdentity.version }
@@ -697,7 +822,25 @@ export class RealtimeClient {
           // (marks envelopes delivered on send); sending ack frames to it
           // would just be unknown frames.
           const caps = (message as { capabilities?: unknown }).capabilities
-          this.ackMode = Array.isArray(caps) && caps.includes('ack')
+          // A capability holds when this HELLO offered it AND the server
+          // accepted it (an echo of something not offered counts for nothing).
+          const offered = new Set<string>(this.offeredThisHello)
+          this.negotiated = new Set(
+            Array.isArray(caps) ? caps.filter((c): c is string => typeof c === 'string' && offered.has(c)) : [],
+          )
+          this.ackMode = this.negotiated.has('ack')
+          // A refetch reconnect is complete: the server re-offers its backlog
+          // on this socket, in order; frames are taken in again.
+          this.refetchPending = false
+          // A server that sends heartbeat frames makes the idle deadline
+          // work on a socket that cannot see pings (contract v1, D7).
+          if (
+            this.negotiated.has('heartbeat') &&
+            this.livenessMs === 0 &&
+            this.options.livenessTimeoutMs === null
+          ) {
+            this.livenessMs = DEFAULT_LIVENESS_TIMEOUT_MS
+          }
           this.clearHandshakeTimer()
           // The idle deadline takes over from the handshake deadline.
           this.touchLiveness()
@@ -730,10 +873,13 @@ export class RealtimeClient {
       // other event type (presence, group.deleted, message.read, system
       // messages without a seq) passes straight through.
       if (this.isMessageNew(message)) {
+        // Backpressure: with the handlers this far behind, the frame is not
+        // taken in — not acked, not dispatched — and the server keeps it.
+        if (this.refuseIntake()) return
         // Ack-on-receipt: the frame is parsed, the machine has it. Sent
         // before ordering so a frame parked on a seq gap is already
         // delivered; the post-dispatch ack is suppressed for this mode.
-        if (this.options.ackOnReceipt) {
+        if (this.options.ackOnReceipt && this.hasMessageHandler()) {
           const messageId = this.extractMessageId(message)
           if (messageId !== null) this.sendAckFrame(messageId)
         }
@@ -761,7 +907,8 @@ export class RealtimeClient {
         // lowercases it, so it must be a string here.
         reason: String(event.reason ?? ''),
         wasClean: event.wasClean,
-        initiator: 'server',
+        // A quiet reconnect's polite close was this client's own decision.
+        initiator: this.quietReconnect !== null ? 'client' : 'server',
       })
     }
 
@@ -774,6 +921,23 @@ export class RealtimeClient {
       }
       ws.on('ping', alive)
       ws.on('pong', alive)
+      // An upgrade answered with an HTTP status instead of 101 (not an
+      // AgentChat answer today; a proxy's 429 or 5xx). With a listener here
+      // `ws` leaves the request to us: note the answer, then end the attempt
+      // — its close event comes next, and the close funnel takes the
+      // ordinary backoff for it, never `blocked`.
+      ws.on('unexpected-response', ((req: unknown, res: unknown) => {
+        const response = res as { statusCode?: number; resume?: () => void }
+        if (current()) {
+          this.upgradeRejection = { status: typeof response.statusCode === 'number' ? response.statusCode : 0 }
+        }
+        try { response.resume?.() } catch { /* drain only */ }
+        try {
+          const terminate = (ws as { terminate?: () => void }).terminate
+          if (typeof terminate === 'function') terminate.call(ws)
+          else (req as { destroy?: () => void }).destroy?.()
+        } catch { /* already closed */ }
+      }) as () => void)
     }
   }
 
@@ -822,10 +986,16 @@ export class RealtimeClient {
   async drainOfflineEnvelopes(): Promise<void> {
     const client = this.options.client
     if (!client) return
-    if (this.drainInFlight) return
+    if (this.drainInFlight) {
+      this.drainAgain = true
+      return
+    }
     this.drainInFlight = true
     try {
-      await this.runDrain(client)
+      do {
+        this.drainAgain = false
+        await this.runDrain(client)
+      } while (this.drainAgain && !this.disposed && !this.shedding)
     } finally {
       this.drainInFlight = false
     }
@@ -884,9 +1054,17 @@ export class RealtimeClient {
         this.restDrainOrigin.add(envelope)
         return envelope
       })
-      for (const envelope of envelopes) {
+      // Backpressure: rows past a full queue are not handed over; the
+      // cursor stops at the first of them and the drain ends here.
+      let injected = envelopes.length
+      for (const [index, envelope] of envelopes.entries()) {
+        if (this.refuseIntake()) {
+          injected = index
+          break
+        }
         this.processOrderedMessage(envelope)
       }
+      const shed = injected < envelopes.length
 
       if (!acksFrozen) {
         let ackCursor: string | null = null
@@ -943,6 +1121,8 @@ export class RealtimeClient {
           }
         }
       }
+
+      if (shed) return
 
       if (invalidIndex >= 0) {
         this.emitError(
@@ -1040,12 +1220,17 @@ export class RealtimeClient {
    */
   private handleClose(info: DisconnectInfo): void {
     const duringHandshake = !this.authenticated
+    const rejection = this.upgradeRejection
+    const quietReconnect = this.quietReconnect
+    this.quietReconnect = null
+    this.upgradeRejection = null
+    this.negotiated = new Set()
     this.clearWatchdogs()
     // Cancel BEFORE clearing `authenticated`: a connection that dies young
     // must not clear the backoff counter — that is the whole point of the
     // stability window.
     this.cancelStabilityTimer()
-    this.noteConnectionEnded()
+    if (quietReconnect === null) this.noteConnectionEnded()
     this.authenticated = false
     this.ackMode = false
 
@@ -1062,7 +1247,11 @@ export class RealtimeClient {
     // the next drain. That includes REST drain rows: the drain's cursor
     // covers only rows that reached a handler, so a parked row dropped
     // here stops the cursor instead of being acked.
-    if (this.options.ackOnReceipt) this.flushParkedFrames('connection_closed')
+    // A renegotiation closes a socket the server marked on send: its parked
+    // frames will not be re-offered, so they are handed over too. A
+    // backpressure refetch keeps the default rule (unacked parked frames come
+    // back in order from the server).
+    if (this.options.ackOnReceipt || quietReconnect === 'renegotiate') this.flushParkedFrames('connection_closed')
 
     // Drop all per-conversation ordering state. Across the connection
     // break the application is responsible for calling /sync (or
@@ -1075,6 +1264,39 @@ export class RealtimeClient {
     this.generation++
 
     if (this.disposed) return
+
+    // A quiet reconnect (to negotiate acks, or to have the server re-offer
+    // what backpressure left with it): straight back, no backoff step, no notice.
+    if (quietReconnect !== null) {
+      this.retryNow()
+      return
+    }
+
+    // An upgrade answered with an HTTP status (429 included; no AgentChat
+    // server answers that way): the ordinary backoff, never `blocked`.
+    if (rejection !== null) {
+      this.scheduleReconnect()
+      return
+    }
+
+    // Over the connect budget (D8): a close 1013 with the server's retry
+    // hint. Back off for the server's delay — never `blocked`, whatever the
+    // reason text says.
+    if (info.initiator === 'server') {
+      const budgetDelay = connectBudgetDelayMs({ code: info.code, reason: info.reason })
+      if (budgetDelay !== null) {
+        this.emitError(
+          new ConnectionError(
+            `the server refused the connection: connect budget exceeded (close ${info.code}); ` +
+              `retrying in ${Math.round(budgetDelay / 1000)}s`,
+          ),
+        )
+        // Up to 10% longer (never shorter) than the server asked: a fleet
+        // limited together does not come back in the same instant.
+        this.scheduleReconnect(this.jitteredAbove(budgetDelay, BUDGET_JITTER_RATIO))
+        return
+      }
+    }
 
     // Only a close the SERVER sent, before hello.ok, with a code and reason
     // that mean rejection, is a rejection. Our own watchdog closes say
@@ -1112,7 +1334,8 @@ export class RealtimeClient {
     this.handleClose({ code, reason, wasClean: false, initiator: 'client' })
   }
 
-  private scheduleReconnect(): void {
+  /** `serverDelayMs`: the server said how long to wait (connect budget); it replaces the backoff step. */
+  private scheduleReconnect(serverDelayMs?: number): void {
     if (this.disposed) return
     if (this.reconnectTimer) return
     if (!this.options.reconnect) {
@@ -1135,7 +1358,7 @@ export class RealtimeClient {
       )
     }
 
-    const delay = this.computeReconnectDelay(attempt)
+    const delay = serverDelayMs ?? this.computeReconnectDelay(attempt)
     this.setState('backoff')
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
@@ -1222,6 +1445,11 @@ export class RealtimeClient {
     return Math.max(0, Math.floor(ms * factor))
   }
 
+  /** Jitter in [ms, ms × (1 + ratio)]: `ms` is a floor (a server-given delay is never shortened). */
+  private jitteredAbove(ms: number, ratio: number): number {
+    return Math.max(0, Math.floor(ms * (1 + Math.random() * ratio)))
+  }
+
   /** Jitter in [ms × (1 − ratio), ms]: `ms` is a ceiling. Thundering-herd-safe across a fleet. */
   private jitteredBelow(ms: number, ratio: number): number {
     const factor = 1 - Math.random() * ratio
@@ -1304,13 +1532,14 @@ export class RealtimeClient {
    *   are released.
    */
   on(event: 'wake', handler: WakeHandler): () => void
+  on(event: 'heartbeat', handler: HeartbeatHandler): () => void
   on(event: 'state', handler: StateHandler): () => void
   on(event: 'blocked', handler: BlockedHandler): () => void
   on(event: 'stopped', handler: StoppedHandler): () => void
   on(event: string, handler: MessageHandler): () => void
   on(
     event: string,
-    handler: MessageHandler | WakeHandler | StateHandler | BlockedHandler | StoppedHandler,
+    handler: MessageHandler | WakeHandler | HeartbeatHandler | StateHandler | BlockedHandler | StoppedHandler,
   ): () => void {
     // Lifecycle events live in their own sets: a server frame that happened
     // to be typed 'state' must never reach them through dispatch.
@@ -1332,7 +1561,9 @@ export class RealtimeClient {
     // A validated wake frame is a WsMessage whose payload is a WakePayload;
     // dispatchWake guarantees the shape before any 'wake' handler runs.
     const stored = handler as MessageHandler
+    const firstMessageHandler = event === 'message.new' && handlers.size === 0
     handlers.add(stored)
+    if (firstMessageHandler) this.maybeRenegotiateAck()
     return () => {
       handlers!.delete(stored)
       if (handlers!.size === 0) this.handlers.delete(event)
@@ -1430,6 +1661,24 @@ export class RealtimeClient {
   }
 
   /**
+   * `true` while backpressure refuses new messages: from the moment the
+   * handler queue filled (`maxQueuedMessages`) until it is back to half and,
+   * without a REST client, the reconnect that fetches what was left is up.
+   * A host can alarm when it stays true (handlers that hang).
+   */
+  get intakePaused(): boolean {
+    return this.shedding || this.refetchPending
+  }
+
+  /**
+   * The capabilities this connection's `hello.ok` accepted (`ack`,
+   * `heartbeat`, `rewake`, …). Empty before `hello.ok` and after a close.
+   */
+  get capabilities(): ReadonlySet<string> {
+    return this.negotiated
+  }
+
+  /**
    * Close the socket, cancel every timer, and release all handlers. The
    * only way into `stopped`, and the only way the client ever stops on
    * purpose: works from any state (`blocked` and a pending backoff
@@ -1452,6 +1701,8 @@ export class RealtimeClient {
     try { ws?.close(1000, 'client disconnect') } catch { /* already closed */ }
     this.authenticated = false
     this.ackMode = false
+    this.negotiated = new Set()
+    this.refetchPending = false
     this.setState('stopped')
     for (const handler of this.stoppedHandlers) {
       try { handler() } catch { /* user hook must not break flow */ }
@@ -1477,10 +1728,10 @@ export class RealtimeClient {
 
   private dispatch(message: WsMessage): void {
     if (this.isMessageNew(message)) {
-      // message.new rides the dedup + delivery-ack pipeline. Handlers are
-      // still invoked synchronously and in order here; only settlement
-      // (async handler completion → ack) is deferred. The returned promise
-      // never rejects.
+      // message.new rides the dedup + delivery-ack pipeline and its
+      // conversation's serial lane: one message at a time per conversation,
+      // in the order the ordering layer hands them over (seq order). The
+      // returned promise never rejects.
       void this.dispatchMessageNew(message)
       return
     }
@@ -1531,49 +1782,53 @@ export class RealtimeClient {
 
     let settlement: Promise<boolean>
 
-    const inFlight = messageId !== null ? this.inFlight.get(messageId) : undefined
-    const first = inFlight?.generation === this.generation ? inFlight : undefined
+    const running = messageId !== null ? this.inFlight.get(messageId) : undefined
+    const first =
+      running !== undefined &&
+      (running.generation === this.generation ||
+        // Still waiting in its lane: always the one to take; running: only
+        // within the bound, counted from when the handler started.
+        running.startedAt === null ||
+        Date.now() - running.startedAt < this.options.inFlightAdoptMs)
+        ? running
+        : undefined
+    const handlers = this.handlers.get('message.new')
 
-    if (messageId !== null && this.dedupHit(messageId)) {
+    if (first === undefined && (handlers === undefined || handlers.size === 0)) {
+      // No handler attached: nothing on this machine received the message.
+      // Not acked on any path (the drain cursor stops here too) and not
+      // remembered, so the server keeps offering it until a handler is there.
+      settlement = Promise.resolve(false)
+    } else if (messageId !== null && this.dedupHit(messageId)) {
       settlement = Promise.resolve(true)
       if (ackAfterDispatch) this.sendAckFrame(messageId)
     } else if (messageId !== null && first !== undefined) {
-      // The same message is already with the handlers on this connection.
-      // Take that outcome instead of dispatching it twice: success acks this
-      // copy too (like a dedup hit), a failure leaves it unacked. Nothing
-      // waits for it: the drain cursor reads `drainAdopted` instead.
+      // The same message is already with the handlers (this connection or an
+      // earlier one). Take that outcome instead of dispatching it twice:
+      // success acks this copy too (like a dedup hit), a failure leaves it
+      // unacked. Nothing waits for it: the drain cursor reads `drainAdopted`.
       if (isDrainRow) this.drainAdopted.set(message, first)
       settlement = first.promise.then((ok) => {
         if (ok && ackAfterDispatch) this.sendAckFrame(messageId)
         return ok
       })
     } else {
-      const handlers = this.handlers.get('message.new')
-      const pending: Array<Promise<unknown>> = []
-      if (handlers) {
-        for (const handler of handlers) {
-          try {
-            const result = handler(message)
-            if (isThenable(result)) pending.push(result)
-          } catch (err) {
-            pending.push(Promise.reject(err))
-          }
-        }
-      }
+      // The handlers attached now are the ones this message goes to, even if
+      // its turn in the lane comes later (disconnect() releases the handlers
+      // right after flushing parked frames into the lanes).
+      const snapshot = handlers ? [...handlers] : []
       const entry: InFlight = {
         promise: Promise.resolve(false),
         generation: this.generation,
+        startedAt: null,
         settled: false,
         ok: false,
       }
-      const own: Promise<boolean> = Promise.allSettled(pending).then((outcomes) => {
-        let ok = true
-        for (const outcome of outcomes) {
-          if (outcome.status === 'rejected') {
-            ok = false
-            this.emitError(toError(outcome.reason, 'message.new'))
-          }
-        }
+      const handled = this.runInLane(this.laneOf(message), () => {
+        entry.startedAt = Date.now()
+        return this.invokeMessageHandlers(message, snapshot)
+      })
+      const own: Promise<boolean> = handled.then((ok) => {
         // Leave the in-flight map in the same step the outcome is known
         // (and, on success, the id enters the dedup cache): a later copy
         // always finds one or the other, never neither.
@@ -1596,6 +1851,157 @@ export class RealtimeClient {
 
     if (isDrainRow) this.drainSettlements.set(message, settlement)
     return settlement
+  }
+
+  /**
+   * Invoke one message's handlers (in registration order, synchronously),
+   * then wait for every one of them. `true` when all finished without
+   * throwing. Synchronous when every handler is (so a lane of plain
+   * handlers never waits a tick); a promise otherwise. Never rejects.
+   */
+  private invokeMessageHandlers(message: WsMessage, handlers: readonly MessageHandler[]): boolean | Promise<boolean> {
+    if (handlers.length === 0) return false
+    const pending: Array<Promise<unknown>> = []
+    let ok = true
+    for (const handler of handlers) {
+      try {
+        const result = handler(message)
+        if (isThenable(result)) pending.push(result)
+      } catch (err) {
+        ok = false
+        this.emitError(toError(err, 'message.new'))
+      }
+    }
+    if (pending.length === 0) return ok
+    return Promise.allSettled(pending).then((outcomes) => {
+      for (const outcome of outcomes) {
+        if (outcome.status === 'rejected') {
+          ok = false
+          this.emitError(toError(outcome.reason, 'message.new'))
+        }
+      }
+      return ok
+    })
+  }
+
+  /** A message's serial lane: its conversation, or one lane for messages that name none. */
+  private laneOf(message: WsMessage): string {
+    const id = (message as { payload?: { conversation_id?: unknown } }).payload?.conversation_id
+    return typeof id === 'string' && id.length > 0 ? `c:${id}` : '-'
+  }
+
+  /**
+   * Run `task` when the lane is free: at once (synchronously) on an idle
+   * lane, else after the task before it has finished. At most one task per
+   * lane runs at a time; lanes run concurrently with each other.
+   */
+  private runInLane(key: string, task: () => boolean | Promise<boolean>): Promise<boolean> {
+    const previous = this.lanes.get(key)
+    this.queuedJobs += 1
+    if (previous === undefined) {
+      const now = task()
+      // Finished synchronously: the lane stays free.
+      if (!isThenable(now)) {
+        this.jobDone()
+        return Promise.resolve(now)
+      }
+      void now.then(
+        () => this.jobDone(),
+        () => this.jobDone(),
+      )
+      this.setLaneTail(key, this.heldAtMost(now))
+      return now
+    }
+    const result = previous.then(task)
+    void result.then(
+      () => this.jobDone(),
+      () => this.jobDone(),
+    )
+    this.setLaneTail(key, previous.then(() => this.heldAtMost(result)))
+    return result
+  }
+
+  /**
+   * New messages are not taken in: the queue is full, or a shedding episode
+   * is under way (until the queue is back to half — a frame accepted in
+   * between could overtake one left with the server in its conversation).
+   */
+  private queueFull(): boolean {
+    return this.shedding || this.queuedJobs >= this.options.maxQueuedMessages
+  }
+
+  /**
+   * Whether a new message is refused at intake. A full queue (or an episode
+   * under way) refuses and starts/continues the episode; a refetch reconnect
+   * under way refuses quietly — the new socket re-offers everything stored.
+   */
+  private refuseIntake(): boolean {
+    if (this.queueFull()) {
+      this.startShedding()
+      return true
+    }
+    return this.refetchPending
+  }
+
+  /** The queue is full: messages are left with the server from here (one notice per episode). */
+  private startShedding(): void {
+    if (this.shedding) return
+    this.shedding = true
+    this.emitError(
+      new ConnectionError(
+        `message handlers are behind: ${this.queuedJobs} messages queued (maxQueuedMessages ` +
+          `${this.options.maxQueuedMessages}); new messages stay on the server, unacknowledged, ` +
+          'and are fetched again once the handlers catch up',
+      ),
+    )
+  }
+
+  /** One handler run finished; once the queue is back to half, fetch what was left with the server. */
+  private jobDone(): void {
+    this.queuedJobs = Math.max(0, this.queuedJobs - 1)
+    if (!this.shedding || this.queuedJobs > Math.floor(this.options.maxQueuedMessages / 2)) return
+    this.shedding = false
+    if (this.disposed) return
+    if (this.options.client) {
+      void this.drainOfflineEnvelopes().catch((err) => {
+        this.emitError(err instanceof Error ? err : new ConnectionError('sync drain failed'))
+      })
+    } else if (this.ws !== null && this.authenticated) {
+      // No REST client: one quiet reconnect, and the server re-offers its
+      // backlog. Intake stays refused until the new socket is up.
+      this.refetchPending = true
+      this.closePolitely('refetch', 'client reconnects to fetch messages it left with the server')
+    }
+  }
+
+  /**
+   * How long one handler run holds its lane: until it finishes, or
+   * `inFlightAdoptMs` at most — a handler that never finishes must not stop
+   * its conversation for good (it keeps running; the next message goes on).
+   */
+  private heldAtMost(run: Promise<unknown>): Promise<void> {
+    const ms = this.options.inFlightAdoptMs
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms)
+      unref(timer)
+      run.then(
+        () => {
+          clearTimeout(timer)
+          resolve()
+        },
+        () => {
+          clearTimeout(timer)
+          resolve()
+        },
+      )
+    })
+  }
+
+  private setLaneTail(key: string, tail: Promise<void>): void {
+    this.lanes.set(key, tail)
+    void tail.then(() => {
+      if (this.lanes.get(key) === tail) this.lanes.delete(key)
+    })
   }
 
   /**
@@ -1633,6 +2039,61 @@ export class RealtimeClient {
     }
   }
 
+  /**
+   * The capabilities this HELLO offers. `ack` only while a `message.new`
+   * handler is attached: with no handler nothing on this machine receives a
+   * message, and an ack-mode socket that never acks would leave every
+   * envelope `stored` until the recipient backlog cap. Without `ack` the
+   * server marks envelopes delivered as it sends them, which is what a
+   * handler-less 1.2 client effectively got (it acked frames no handler saw).
+   * The next HELLO, after a handler is attached, offers it again.
+   */
+  private helloCapabilities(): SocketCapability[] {
+    const withAck = this.hasMessageHandler()
+    this.offeredThisHello = this.options.offeredCapabilities.filter((c) => c !== 'ack' || withAck)
+    this.helloSent = true
+    return this.offeredThisHello
+  }
+
+  /**
+   * The first `message.new` handler was attached after this socket's HELLO
+   * went out without `ack`: reconnect once, quietly (no error, no backoff
+   * step), so the next HELLO negotiates delivery acks. Frames parked on a
+   * seq gap are handed to the handlers first — this socket was marked on
+   * send, so nothing would re-offer them.
+   */
+  private maybeRenegotiateAck(): void {
+    if (this.disposed || this.ws === null || !this.helloSent) return
+    if (this.offeredThisHello.includes('ack')) return
+    const ws = this.ws
+    queueMicrotask(() => {
+      if (this.ws !== ws || this.disposed || !this.hasMessageHandler()) return
+      this.closePolitely('renegotiate', 'client reconnects to negotiate delivery acks')
+    })
+  }
+
+  /**
+   * A quiet reconnect: close the socket politely and keep reading its frames
+   * until it has closed; the close then reconnects at once (no backoff step,
+   * no notice). Its liveness watchdog still ends a pipe that never answers.
+   */
+  private closePolitely(kind: 'renegotiate' | 'refetch', reason: string): void {
+    const ws = this.ws
+    if (ws === null || this.quietReconnect !== null) return
+    this.quietReconnect = kind
+    try {
+      ws.close(1000, reason)
+    } catch {
+      // already closing: its close event takes the same path
+    }
+  }
+
+  /** A `message.new` handler is attached: only then has this machine received a message. */
+  private hasMessageHandler(): boolean {
+    const handlers = this.handlers.get('message.new')
+    return handlers !== undefined && handlers.size > 0
+  }
+
   private extractMessageId(message: WsMessage): string | null {
     const id = (message as { payload?: { id?: unknown } }).payload?.id
     return typeof id === 'string' && id.length > 0 ? id : null
@@ -1668,11 +2129,36 @@ export class RealtimeClient {
       return 'payload is not an object'
     }
     const p = payload as Record<string, unknown>
-    for (const key of ['reason', 'conversation_id', 'anchor_message_id', 'at'] as const) {
-      if (typeof p[key] !== 'string' || p[key] === '') return `${key} is not a non-empty string`
+    const text = (key: string): string | null =>
+      typeof p[key] !== 'string' || p[key] === '' ? `${key} is not a non-empty string` : null
+    const integerStep = typeof p.step === 'number' && Number.isInteger(p.step)
+    // Without `rewake` the server sends reminder wakes only, and handlers
+    // were written against that shape (`WakePayload`): the 1.2 rule, as it was.
+    if (!this.negotiated.has('rewake')) {
+      return (
+        text('reason') ??
+        text('conversation_id') ??
+        text('anchor_message_id') ??
+        text('at') ??
+        (integerStep ? null : 'step is not an integer')
+      )
     }
-    if (typeof p.step !== 'number' || !Number.isInteger(p.step)) return 'step is not an integer'
-    return null
+    const reasonProblem = text('reason') ?? text('at')
+    if (reasonProblem !== null) return reasonProblem
+    switch (p.reason) {
+      case 'reminder':
+        return text('conversation_id') ?? text('anchor_message_id') ?? (integerStep ? null : 'step is not an integer')
+      case 'unanswered': {
+        const ids = p.conversation_ids
+        if (!Array.isArray(ids) || !ids.every((id) => typeof id === 'string' && id.length > 0)) {
+          return 'conversation_ids is not a list of ids'
+        }
+        return integerStep ? null : 'step is not an integer'
+      }
+      default:
+        // A reason this SDK does not know yet: forward it; the handler reads the tray.
+        return p.step === undefined || integerStep ? null : 'step is not an integer'
+    }
   }
 
   // ─── Per-conversation seq ordering ───────────────────────────────────────
@@ -1833,6 +2319,9 @@ export class RealtimeClient {
       return
     }
 
+    // Gap-fill rows are never shed: they close a gap in front of frames
+    // already taken in, which would otherwise be handed over without them.
+
     // Insert fetched rows into the buffer (skip anything below our cursor —
     // shouldn't happen but defensive against server-side filtering changes).
     for (const row of fetched) {
@@ -1846,7 +2335,7 @@ export class RealtimeClient {
         payload: row as unknown as Record<string, unknown>,
       }
       // Ack-on-receipt: the fetch is this machine's receipt of the row.
-      if (this.options.ackOnReceipt) {
+      if (this.options.ackOnReceipt && this.hasMessageHandler()) {
         const messageId = this.extractMessageId(envelope)
         if (messageId !== null) this.sendAckFrame(messageId)
       }

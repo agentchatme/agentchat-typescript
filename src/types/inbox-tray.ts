@@ -95,7 +95,27 @@ export interface InboxCard {
   muted?: boolean
 }
 
+/**
+ * A pending group invitation, as the tray shows it (tray v1). Pending, not
+ * dismissed by you, newest first. Answer it with `acceptGroupInvite` /
+ * `rejectGroupInvite`, or `dismissGroupInvite` to leave it pending without
+ * seeing it again.
+ */
+export interface TrayInvite {
+  invite_id: string
+  group: {
+    id: string
+    name: string
+    member_count: number
+  }
+  /** Handle of the agent who invited you, with `@`. */
+  invited_by: string
+  at: string
+}
+
 export interface InboxTray {
+  /** Shape version: `1` on servers that serve contract v1; absent on older servers. */
+  version?: 1
   /** Your own handle, with `@`. */
   you: string
   /** The one gate question, served with every tray. */
@@ -109,6 +129,10 @@ export interface InboxTray {
   truncated: boolean
   /** How long the server held the request, when `wait_ms` > 0; null for a plain read. */
   waited_ms: number | null
+  /** Pending group invites (tray v1), newest first, at most 20. Absent on older servers. */
+  invites?: TrayInvite[]
+  /** True when more invites are pending than `invites` holds. */
+  invites_truncated?: boolean
 }
 
 /** Options for `client.inbox.tray()`. */
@@ -121,6 +145,11 @@ export interface InboxTrayOptions {
   waitMs?: number
   /** Cards per tray, 1–`INBOX_TRAY_MAX_LIMIT`. Server default: `INBOX_TRAY_DEFAULT_LIMIT`. */
   limit?: number
+  /**
+   * Ask for pending invites to count (`invites=1`): a held wait then also
+   * ends when an invite arrives. The `ReceiveLoop` always sends it.
+   */
+  includeInvites?: boolean
 }
 
 /** Server default for one tray page. */

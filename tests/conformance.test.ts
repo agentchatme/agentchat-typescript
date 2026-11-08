@@ -1,10 +1,11 @@
+import { createHash } from 'node:crypto'
 import { readFileSync, readdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { resolve, dirname } from 'node:path'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { RealtimeClient } from '../src/realtime.js'
 import { buildPrompt, canonicalJson, parseVerdicts, type Verdict } from '../src/gate.js'
-import type { InboxTray, WakeFrame } from '../src/types/index.js'
+import type { InboxTray, Texts, WakeFrame } from '../src/types/index.js'
 import { MockWebSocket, MockWebSocketCtor, sentFrames, settle } from './helpers/mock-websocket.js'
 
 // ─── The shared conformance fixtures ────────────────────────────────────────
@@ -30,26 +31,30 @@ interface VerdictCase {
 }
 
 const tray = json<InboxTray>('tray.sample.json')
+const texts = json<Texts>('texts.sample.json')
 
 describe('conformance fixtures — canonical form', () => {
-  it('ships exactly the six named files', () => {
-    expect(readdirSync(FIXTURES).sort()).toEqual([
-      'ack-frame.json',
-      'engine-scenarios.json',
-      'gate-prompt.expected.txt',
-      'tray.sample.json',
-      'verdict-parse.cases.json',
-      'wake-frame.json',
-    ])
+  const files = readdirSync(FIXTURES).sort()
+
+  it('ships exactly the files the manifest names, byte for byte', () => {
+    const manifest = raw('manifest.sha256')
+    const entries = manifest
+      .trimEnd()
+      .split('\n')
+      .map((line) => {
+        const match = /^([0-9a-f]{64}) {2}(\S+)$/.exec(line)
+        expect(match, `manifest line: ${line}`).not.toBeNull()
+        return { sha: match![1]!, name: match![2]! }
+      })
+    expect(entries.map((e) => e.name)).toEqual(files.filter((f) => f !== 'manifest.sha256'))
+    expect([...entries.map((e) => e.name)].sort()).toEqual(entries.map((e) => e.name))
+    for (const { sha, name } of entries) {
+      const digest = createHash('sha256').update(readFileSync(resolve(FIXTURES, name))).digest('hex')
+      expect(digest, `${name} differs from the manifest`).toBe(sha)
+    }
   })
 
-  it.each([
-    'tray.sample.json',
-    'verdict-parse.cases.json',
-    'wake-frame.json',
-    'ack-frame.json',
-    'engine-scenarios.json',
-  ])(
+  it.each(files.filter((f) => f.endsWith('.json')))(
     '%s has sorted keys, two-space indent and one trailing newline',
     (name) => {
       const text = raw(name)
@@ -57,8 +62,8 @@ describe('conformance fixtures — canonical form', () => {
     },
   )
 
-  it('gate-prompt.expected.txt ends with exactly one newline', () => {
-    const text = raw('gate-prompt.expected.txt')
+  it.each(files.filter((f) => !f.endsWith('.json')))('%s ends with exactly one newline', (name) => {
+    const text = raw(name)
     expect(text.endsWith('\n')).toBe(true)
     expect(text.endsWith('\n\n')).toBe(false)
   })
@@ -76,15 +81,62 @@ describe('conformance — tray.sample.json', () => {
   })
 })
 
+describe('conformance — texts.sample.json', () => {
+  it('is a v1 text set with the gate-call texts (D6)', () => {
+    expect(texts.version).toBe('1')
+    for (const field of [
+      'wake_instruction',
+      'invite_prompt',
+      'identity_line',
+      'identity_line_template',
+      'gate_call_preamble',
+      'gate_call_answer_format',
+    ] as const) {
+      expect(typeof texts[field]).toBe('string')
+      expect((texts[field] ?? '').length).toBeGreaterThan(0)
+    }
+    expect(texts.manual.sha256).toMatch(/^[0-9a-f]{64}$/)
+    expect(texts.identity_line_template).toContain('<handle>')
+  })
+})
+
 describe('conformance — gate prompt', () => {
-  it('renders tray.sample.json to gate-prompt.expected.txt', () => {
+  it('renders tray.sample.json with texts.sample.json to gate-prompt.expected.txt', () => {
+    expect(buildPrompt(tray, { texts }) + '\n').toBe(raw('gate-prompt.expected.txt'))
+  })
+
+  it('renders the same prompt without texts (the legacy wording, deprecated)', () => {
     expect(buildPrompt(tray) + '\n').toBe(raw('gate-prompt.expected.txt'))
   })
 
-  it('carries the server question verbatim, after the tool-less preamble', () => {
-    const prompt = buildPrompt(tray)
-    expect(prompt).toContain(`\n\n${tray.question}\n\n`)
-    expect(prompt.indexOf(tray.question)).toBeGreaterThan(0)
+  it('carries the served preamble first, then the server question verbatim, and the served answer format last', () => {
+    const prompt = buildPrompt(tray, { texts })
+    expect(prompt.startsWith(`${texts.gate_call_preamble}\n\n${tray.question}\n\n`)).toBe(true)
+    expect(prompt.endsWith(`\n\n${texts.gate_call_answer_format}`)).toBe(true)
+  })
+})
+
+describe('conformance — tray.v1.sample.json', () => {
+  const v1 = json<InboxTray>('tray.v1.sample.json')
+
+  it('is a v1 tray with invites, a muted card and a reminder card', () => {
+    expect(v1.version).toBe(1)
+    expect(v1.invites?.length).toBeGreaterThan(0)
+    expect(v1.invites_truncated).toBe(false)
+    for (const invite of v1.invites ?? []) {
+      expect(invite.invite_id).toMatch(/^gri_/)
+      expect(invite.invited_by.startsWith('@')).toBe(true)
+      expect(typeof invite.group.id).toBe('string')
+      expect(typeof invite.group.member_count).toBe('number')
+    }
+    expect(v1.conversations.some((c) => c.muted === true)).toBe(true)
+    expect(v1.conversations.some((c) => c.reminder?.step === 2)).toBe(true)
+  })
+
+  it('a v1 tray gates like any other: only conversations are cards', () => {
+    const prompt = buildPrompt(v1, { texts })
+    expect(prompt).toContain(`Your tray, as the server built it: ${v1.conversations.length} conversations.`)
+    expect(prompt).not.toContain('gri_')
   })
 })
 
@@ -110,6 +162,9 @@ describe('conformance — socket frames', () => {
       reconnect: false,
       ...options,
     })
+    // The usual order: a message handler is attached before the socket opens,
+    // so the HELLO offers acks. Tests add their own handlers alongside.
+    rt.on('message.new', () => undefined)
     await rt.connect()
     const ws = MockWebSocket.latest()
     ws.simulateOpen()

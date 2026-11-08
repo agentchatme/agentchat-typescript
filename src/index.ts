@@ -14,15 +14,22 @@ export {
   type MuteEntry,
   type MuteTargetKind,
   type TextsResource,
+  type GroupsResource,
+  type WakeWebhookResource,
+  type SyncOptions,
+  type SyncPage,
+  type StaticCallOptions,
 } from './client.js'
 
 export {
   RealtimeClient,
   isAuthRejectionClose,
+  wakePayloadOf,
   type RealtimeOptions,
   type RealtimeState,
   type MessageHandler,
   type WakeHandler,
+  type HeartbeatHandler,
   type ErrorHandler,
   type ConnectHandler,
   type DisconnectInfo,
@@ -36,6 +43,7 @@ export {
 } from './realtime.js'
 
 export * as gate from './gate.js'
+export * as integration from './integration/index.js'
 export {
   type BuildPromptOptions,
   type GateClient,
@@ -44,6 +52,7 @@ export {
   type GateRecordFailure,
   type GateReply,
   type GateResult,
+  type GateTexts,
   type RunGateOptions,
   type ToolNamer,
   type Verdict,
@@ -90,6 +99,23 @@ export {
 export { paginate } from './pagination.js'
 
 export { parseRetryAfter } from './http-retry-after.js'
+
+export {
+  connectBudgetDelayMs,
+  CONNECT_BUDGET_CLOSE_CODE,
+  CONNECT_BUDGET_MAX_DELAY_MS,
+  CONNECT_BUDGET_MIN_DELAY_MS,
+  type ConnectBudgetClose,
+} from './connect-budget.js'
+
+export {
+  verifyWakeWebhook,
+  WakeWebhookVerificationError,
+  type VerifyWakeWebhookOptions,
+  type WakeWebhookHeaders,
+  type WakeWebhookVerifyDialect,
+  type WakeWebhookVerifyReason,
+} from './wake-webhook-verify.js'
 
 export { renderMessageContext, type RenderOptions } from './render.js'
 

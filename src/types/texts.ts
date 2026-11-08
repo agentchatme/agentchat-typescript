@@ -7,9 +7,13 @@ export type TextsRuntime = 'claude-code' | 'codex' | 'hermes' | 'openclaw' | 'ge
 export interface Texts {
   /** Version of this text set; changes are additive. */
   version: string
+  /** The runtime these texts were rendered for (tool names spelled for it). */
+  runtime?: TextsRuntime
   manual: {
     url: string
     version: string
+    /** Hex sha256 of the served manual's bytes; absent on older servers. */
+    sha256?: string
   }
   /** What a woken agent is told first. */
   wake_instruction: string
@@ -19,6 +23,13 @@ export interface Texts {
   identity_line: string
   /** The same line with placeholders, for hosts that fill it themselves. */
   identity_line_template: string
+  /**
+   * Gate-call mode: the text a tool-less gate call opens with (contract v1).
+   * Absent on older servers; the gate then falls back to the 1.2 wording.
+   */
+  gate_call_preamble?: string
+  /** Gate-call mode: the answer shape the gate call ends with (contract v1). */
+  gate_call_answer_format?: string
 }
 
 /** Options for `client.texts.get()`. */

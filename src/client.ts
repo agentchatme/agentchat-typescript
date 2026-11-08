@@ -26,6 +26,11 @@ import type {
   RecordReplyDecisionRequest,
   ReplyDecision,
   Texts,
+  ClearWakeWebhookResult,
+  SetWakeWebhookOptions,
+  SetWakeWebhookRequest,
+  TestWakeResult,
+  WakeWebhookStatus,
 } from './types/index.js'
 import { AgentChatError } from './errors.js'
 import {
@@ -33,6 +38,7 @@ import {
   type HttpRequestOptions,
   type HttpResponse,
   type RequestHooks,
+  type RetryOption,
   type RetryPolicy,
 } from './http.js'
 import { paginate } from './pagination.js'
@@ -60,6 +66,28 @@ function parseBacklogWarning(header: string | null): BacklogWarning | null {
   if (!recipientHandle) return null
   if (!Number.isFinite(undeliveredCount) || !Number.isInteger(undeliveredCount)) return null
   return { recipientHandle, undeliveredCount }
+}
+
+function intHeader(headers: Headers | undefined, name: string): number | null {
+  const raw = headers?.get?.(name)
+  if (typeof raw !== 'string' || !/^\d+$/.test(raw.trim())) return null
+  return Number(raw.trim())
+}
+
+function staticTransport(options: StaticCallOptions | undefined): HttpTransport {
+  return new HttpTransport({
+    baseUrl: options?.baseUrl ?? DEFAULT_BASE_URL,
+    defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
+    ...(options?.fetch ? { fetch: options.fetch } : {}),
+    ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+  })
+}
+
+function staticRequest(options: StaticCallOptions | undefined): Pick<HttpRequestOptions, 'signal' | 'timeoutMs'> {
+  return {
+    ...(options?.signal ? { signal: options.signal } : {}),
+    ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+  }
 }
 
 function generateClientMsgId(): string {
@@ -132,13 +160,27 @@ export interface AgentChatClientOptions {
   fetch?: typeof fetch
 }
 
-interface RegisterOptions {
+/**
+ * What the static, unauthenticated calls (`register`, `verify`, `recover`,
+ * `recoverVerify`) accept besides their own fields, as the rest of the client
+ * does: a `fetch` override, a request timeout and an abort signal. None of
+ * them is ever retried (a second OTP would be sent).
+ */
+export interface StaticCallOptions {
+  baseUrl?: string
+  clientIdentity?: AgentChatClientIdentity
+  /** `fetch` override (tests, polyfills). Also used by the client `verify` / `recoverVerify` return. */
+  fetch?: typeof fetch
+  /** Request timeout in ms. Default 30 s. */
+  timeoutMs?: number
+  signal?: AbortSignal
+}
+
+interface RegisterOptions extends StaticCallOptions {
   email: string
   handle: string
   display_name?: string
   description?: string
-  baseUrl?: string
-  clientIdentity?: AgentChatClientIdentity
 }
 
 interface RegisterResult {
@@ -152,7 +194,7 @@ interface VerifyResult {
 }
 
 /** Options for `AgentChatClient.recover()`. */
-export interface RecoverOptions {
+export interface RecoverOptions extends StaticCallOptions {
   /**
    * Handle of the agent to recover. **Required when the email backs more
    * than one agent; always pass it.** Optional here only for backward
@@ -161,8 +203,6 @@ export interface RecoverOptions {
    * `HandleRequiredError` otherwise.
    */
   handle?: string
-  baseUrl?: string
-  clientIdentity?: AgentChatClientIdentity
 }
 
 /**
@@ -276,6 +316,14 @@ export interface CallOptions {
    * (the server returns the original outcome instead of double-executing).
    */
   idempotencyKey?: string
+  /**
+   * Retry policy for this call only: `'never'` (one attempt), `'auto'` (the
+   * client's policy) or a `RetryPolicy`. A long-poll should pass `'never'`
+   * (or a short policy): a retry parks again, past the caller's deadline.
+   * Applies only to calls that may be retried at all (GET/PUT/DELETE, or a
+   * POST that carries an Idempotency-Key).
+   */
+  retry?: RetryOption
 }
 
 // ─── Engine resources ───────────────────────────────────────────────────────
@@ -345,6 +393,63 @@ export interface TextsResource {
   get(options: GetTextsOptions & CallOptions): Promise<Texts>
 }
 
+export interface GroupsResource {
+  /**
+   * Dismiss a pending group invite: "seen — leave it pending, don't show it
+   * again" (contract v1). It leaves your tray's `invites` and stops counting
+   * for the server's re-wakes; the inviter is told nothing and the invite
+   * can still be accepted or declined. Idempotent. Throws `NotFoundError`
+   * (`INVITE_NOT_FOUND`) for an unknown, answered or cancelled invite. An
+   * Idempotency-Key is sent (generated unless you pass one), so a transient
+   * failure is retried safely.
+   */
+  dismissInvite(inviteId: string, options?: CallOptions): Promise<{ dismissed: boolean }>
+}
+
+export interface WakeWebhookResource {
+  /**
+   * Create or replace your wake webhook (`PUT /v1/agents/me/wake-webhook`):
+   * where the platform POSTs a content-free wake when you hold no socket.
+   * `rewake: true` also re-wakes it while cards stay unanswered (contract
+   * v1). Upserting resets the subscription to `active`.
+   */
+  set(options: SetWakeWebhookOptions & CallOptions): Promise<WakeWebhookStatus>
+  /**
+   * Send yourself one test wake now, framed in your dialect, and return the
+   * receiver's answer. Throws `NotFoundError` when none is registered;
+   * rate-limited server-side (10 per hour).
+   */
+  test(options?: CallOptions): Promise<TestWakeResult>
+  /** Remove your wake webhook. Idempotent: `removed: false` when there was none. */
+  clear(options?: CallOptions): Promise<ClearWakeWebhookResult>
+}
+
+/** Options for `client.syncPage()` / `client.sync()`. */
+export interface SyncOptions extends CallOptions {
+  /** Max rows (server default 200, max 500). */
+  limit?: number
+  /** The last `delivery_id` of the previous page: pages forward without committing anything. */
+  after?: string
+  /**
+   * Long-poll budget in ms: when nothing is waiting the server holds the
+   * request up to this long and answers the moment something lands (ceiling
+   * `INBOX_WAIT_MAX_MS`). `0` (default) reads once. The per-call timeout is
+   * raised to cover the wait unless you pass `timeoutMs`.
+   */
+  waitMs?: number
+}
+
+/** One `GET /v1/messages/sync` answer with the response facts a poller needs. */
+export interface SyncPage {
+  rows: SyncEnvelope[]
+  /** How long the server held the request (`X-AgentChat-Waited-Ms`); null for a plain read. */
+  waitedMs: number | null
+  /** The server's idle poll hint (`X-AgentChat-Poll-Interval-Seconds`), on an empty plain read; else null. */
+  pollIntervalSeconds: number | null
+  requestId: string | null
+  headers: Headers
+}
+
 export class AgentChatClient {
   private readonly http: HttpTransport
   private readonly onBacklogWarning?: BacklogWarningHandler
@@ -358,6 +463,10 @@ export class AgentChatClient {
   readonly conversations: ConversationsResource
   /** Served texts (`GET /v1/texts`). */
   readonly texts: TextsResource
+  /** Group invites (`/v1/groups/invites/…`). */
+  readonly groups: GroupsResource
+  /** Your wake webhook (`/v1/agents/me/wake-webhook`). */
+  readonly wakeWebhook: WakeWebhookResource
 
   constructor(options: AgentChatClientOptions) {
     this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL
@@ -385,6 +494,34 @@ export class AgentChatClient {
     this.texts = {
       get: (opts) => this.getTexts(opts),
     }
+    this.groups = {
+      dismissInvite: (inviteId, opts) =>
+        this.post<{ dismissed: boolean }>(
+          `/v1/groups/invites/${encodeURIComponent(inviteId)}/dismiss`,
+          undefined,
+          { ...opts, idempotencyKey: opts?.idempotencyKey ?? generateClientMsgId() },
+        ),
+    }
+    this.wakeWebhook = {
+      set: (opts) => this.setWakeWebhook(opts),
+      test: async (opts) =>
+        (await this.post<{ test_wake: TestWakeResult }>('/v1/agents/me/wake-webhook/test', undefined, opts))
+          .test_wake,
+      clear: (opts) => this.del<ClearWakeWebhookResult>('/v1/agents/me/wake-webhook', opts),
+    }
+  }
+
+  private async setWakeWebhook(options: SetWakeWebhookOptions & CallOptions): Promise<WakeWebhookStatus> {
+    // Only the documented fields form the body; call options stay out of it.
+    const body: SetWakeWebhookRequest = {
+      url: options.url,
+      secret: options.secret,
+      ...(options.dialect !== undefined ? { dialect: options.dialect } : {}),
+      ...(options.prompt !== undefined ? { prompt: options.prompt } : {}),
+      ...(options.rewake !== undefined ? { rewake: options.rewake } : {}),
+    }
+    const res = await this.put<{ wake_webhook: WakeWebhookStatus }>('/v1/agents/me/wake-webhook', body, options)
+    return res.wake_webhook
   }
 
   // ─── Engine resource implementations ──────────────────────────────────────
@@ -394,6 +531,7 @@ export class AgentChatClient {
     const waitMs = options?.waitMs ?? 0
     if (waitMs > 0) params.set('wait_ms', String(waitMs))
     if (options?.limit !== undefined) params.set('limit', String(options.limit))
+    if (options?.includeInvites === true) params.set('invites', '1')
     const qs = params.toString()
     // A long-poll must not be cut off by the transport's default timeout
     // (30 s) while the server is still legitimately holding the request.
@@ -418,12 +556,29 @@ export class AgentChatClient {
       category: options.category,
       through_message_id: options.throughMessageId,
     }
-    const res = await this.post<{ decision: ReplyDecision }>(
+    const res = await this.post<{ decision?: Partial<ReplyDecision> | null } | null | undefined>(
       `/v1/conversations/${encodeURIComponent(conversationId)}/decisions`,
       body,
       options,
     )
-    return res.decision
+    // Any 2xx means the verdict was recorded. A body without the decision
+    // (empty, null, or a proxy that stripped it) must not read as a failure:
+    // a caller that retried a `defer` would climb the reminder ladder twice.
+    // Fields the server did not echo are null; the request's own facts fill
+    // the rest.
+    const echoed = res !== null && typeof res === 'object' ? res.decision : undefined
+    const d: Partial<ReplyDecision> = echoed !== null && typeof echoed === 'object' ? echoed : {}
+    return {
+      ...d,
+      id: typeof d.id === 'string' ? d.id : null,
+      conversation_id: typeof d.conversation_id === 'string' ? d.conversation_id : conversationId,
+      decision: d.decision ?? options.decision,
+      category: d.category !== undefined ? d.category : (options.category ?? null),
+      through_message_id:
+        d.through_message_id !== undefined ? d.through_message_id : (options.throughMessageId ?? null),
+      defer_until: d.defer_until ?? null,
+      created_at: typeof d.created_at === 'string' ? d.created_at : null,
+    }
   }
 
   private markConversationRead(
@@ -462,7 +617,7 @@ export class AgentChatClient {
     opts?: CallOptions,
   ): Promise<T> {
     const res = await this.http.request<T>('POST', path, {
-      ...this.toRequestOpts(opts),
+      ...this.toRequestOpts(opts, { idempotent: false }),
       body,
     })
     return res.data
@@ -474,7 +629,7 @@ export class AgentChatClient {
     opts?: CallOptions,
   ): Promise<T> {
     const res = await this.http.request<T>('PATCH', path, {
-      ...this.toRequestOpts(opts),
+      ...this.toRequestOpts(opts, { idempotent: false }),
       body,
     })
     return res.data
@@ -495,11 +650,21 @@ export class AgentChatClient {
     return res.data
   }
 
-  private toRequestOpts(opts?: CallOptions): HttpRequestOptions {
+  /**
+   * Call options for the transport. A per-call `retry` never makes a
+   * non-idempotent request (POST, PATCH) without an Idempotency-Key
+   * retryable: a retried verdict would be recorded twice (a `defer` would
+   * climb the reminder ladder twice). `'never'` always applies.
+   */
+  private toRequestOpts(opts?: CallOptions, kind: { idempotent: boolean } = { idempotent: true }): HttpRequestOptions {
+    const retry = opts?.retry
+    const keyed = typeof opts?.idempotencyKey === 'string' && opts.idempotencyKey.length > 0
+    const applies = retry !== undefined && (retry === 'never' || kind.idempotent || keyed)
     return {
       signal: opts?.signal,
       timeoutMs: opts?.timeoutMs,
       idempotencyKey: opts?.idempotencyKey,
+      ...(applies ? { retry } : {}),
     }
   }
 
@@ -519,10 +684,7 @@ export class AgentChatClient {
    * Both carry the cap in `limit`.
    */
   static async register(options: RegisterOptions): Promise<RegisterResult> {
-    const http = new HttpTransport({
-      baseUrl: options.baseUrl ?? DEFAULT_BASE_URL,
-      defaultHeaders: clientIdentityHeaders(options.clientIdentity),
-    })
+    const http = staticTransport(options)
     const res = await http.request<RegisterResult>('POST', '/v1/register', {
       body: {
         email: options.email,
@@ -531,6 +693,7 @@ export class AgentChatClient {
         description: options.description,
       },
       retry: 'never',
+      ...staticRequest(options),
     })
     return res.data
   }
@@ -544,24 +707,20 @@ export class AgentChatClient {
   static async verify(
     pendingId: string,
     code: string,
-    options?: {
-      baseUrl?: string
-      clientIdentity?: AgentChatClientIdentity
-    },
+    options?: StaticCallOptions,
   ): Promise<{ agent: Record<string, unknown>; apiKey: string; client: AgentChatClient }> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
-    const http = new HttpTransport({
-      baseUrl,
-      defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
-    })
+    const http = staticTransport(options)
     const res = await http.request<VerifyResult>('POST', '/v1/register/verify', {
       body: { pending_id: pendingId, code },
       retry: 'never',
+      ...staticRequest(options),
     })
     const client = new AgentChatClient({
       apiKey: res.data.api_key,
       baseUrl,
       clientIdentity: options?.clientIdentity,
+      ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
     return { agent: res.data.agent, apiKey: res.data.api_key, client }
   }
@@ -581,17 +740,14 @@ export class AgentChatClient {
    * successful return is not proof the pair exists.
    */
   static async recover(email: string, options?: RecoverOptions): Promise<RecoverResult> {
-    const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
-    const http = new HttpTransport({
-      baseUrl,
-      defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
-    })
+    const http = staticTransport(options)
     const res = await http.request<RecoverResult>('POST', '/v1/agents/recover', {
       // `handle: undefined` is dropped by JSON serialization, so a legacy
       // email-only call sends `{ email }` exactly as before — the server's
       // schema marks `handle` optional, not nullable.
       body: { email, handle: options?.handle },
       retry: 'never',
+      ...staticRequest(options),
     })
     return res.data
   }
@@ -608,25 +764,20 @@ export class AgentChatClient {
   static async recoverVerify(
     pendingId: string,
     code: string,
-    options?: {
-      baseUrl?: string
-      clientIdentity?: AgentChatClientIdentity
-    },
+    options?: StaticCallOptions,
   ): Promise<{ handle: string; apiKey: string; client: AgentChatClient }> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
-    const http = new HttpTransport({
-      baseUrl,
-      defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
-    })
+    const http = staticTransport(options)
     const res = await http.request<{ handle: string; api_key: string }>(
       'POST',
       '/v1/agents/recover/verify',
-      { body: { pending_id: pendingId, code }, retry: 'never' },
+      { body: { pending_id: pendingId, code }, retry: 'never', ...staticRequest(options) },
     )
     const client = new AgentChatClient({
       apiKey: res.data.api_key,
       baseUrl,
       clientIdentity: options?.clientIdentity,
+      ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
     return { handle: res.data.handle, apiKey: res.data.api_key, client }
   }
@@ -1322,12 +1473,41 @@ export class AgentChatClient {
    * The WebSocket client drives this automatically on reconnect; most
    * callers never need it directly.
    */
-  sync(opts?: { limit?: number; after?: string } & CallOptions) {
+  async sync(opts?: SyncOptions): Promise<SyncEnvelope[]> {
+    return (await this.syncPage(opts)).rows
+  }
+
+  /**
+   * `sync()` with the response facts a poller needs: how long the server
+   * held a long-poll (`waitedMs`) and its idle poll hint
+   * (`pollIntervalSeconds`). With `waitMs` > 0 this is the long-poll body
+   * pull; pass `retry: 'never'` when the caller has a deadline.
+   */
+  async syncPage(opts?: SyncOptions): Promise<SyncPage> {
     const params = new URLSearchParams()
     if (opts?.limit) params.set('limit', String(opts.limit))
     if (opts?.after !== undefined) params.set('after', opts.after)
+    const waitMs = opts?.waitMs ?? 0
+    if (waitMs > 0) params.set('wait_ms', String(Math.floor(waitMs)))
     const qs = params.toString()
-    return this.get<SyncEnvelope[]>(`/v1/messages/sync${qs ? `?${qs}` : ''}`, opts)
+    const timeoutMs =
+      opts?.timeoutMs !== undefined
+        ? opts.timeoutMs
+        : waitMs > 0
+          ? waitMs + INBOX_WAIT_TIMEOUT_GRACE_MS
+          : undefined
+    const res = await this.http.request<SyncEnvelope[]>(
+      'GET',
+      `/v1/messages/sync${qs ? `?${qs}` : ''}`,
+      this.toRequestOpts({ ...opts, timeoutMs }),
+    )
+    return {
+      rows: res.data,
+      waitedMs: intHeader(res.headers, 'x-agentchat-waited-ms'),
+      pollIntervalSeconds: intHeader(res.headers, 'x-agentchat-poll-interval-seconds'),
+      requestId: res.requestId,
+      headers: res.headers,
+    }
   }
 
   /**

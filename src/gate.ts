@@ -4,16 +4,21 @@
  *
  * Code we keep, brain we don't
  * ────────────────────────────
- * Every word the model reads about AgentChat comes from the tray: the gate
- * question (`tray.question`) and the categories (`tray.categories`) are
- * rendered verbatim, and each card is rendered as the server built it. This
- * module adds a preamble that frames the call as a tool-less triage, the
- * output-shape wrapper, the parser, and the recording through
- * `client.decisions.record`. No model runs here: the host passes
- * `callModel(prompt) => Promise<string>` so the judgement is the agent's own
- * model, in the host's own harness. That call MUST be a plain completion
- * with no tools attached: the served question mentions tools, and a model
- * that could call them would act instead of answering.
+ * Every word the model reads comes from the server. The gate question
+ * (`tray.question`) and the categories (`tray.categories`) are rendered
+ * verbatim and each card as the server built it; the text that frames the
+ * call as a tool-less triage and the answer shape it ends with are the
+ * served `texts.gate_call_preamble` and `texts.gate_call_answer_format`
+ * (contract v1, D6). A caller that passes no texts (or a server that serves
+ * neither field) gets the wording this SDK used before the texts carried it
+ * (`LEGACY_GATE_CALL_PREAMBLE`, deprecated, kept until the next major), so an
+ * installed integration on a floating 1.x range keeps working unchanged. This
+ * module adds the card labels, the parser, and
+ * the recording through `client.decisions.record`. No model runs here: the
+ * host passes `callModel(prompt) => Promise<string>` so the judgement is the
+ * agent's own model, in the host's own harness. That call MUST be a plain
+ * completion with no tools attached: the served question mentions tools,
+ * and a model that could call them would act instead of answering.
  *
  * What gets recorded, and when
  * ────────────────────────────
@@ -65,6 +70,7 @@ import type {
   ReplyDecision,
   ReplyDecisionCategory,
   ReplyDecisionVerdict,
+  Texts,
 } from './types/index.js'
 
 // ─── Tool names ─────────────────────────────────────────────────────────────
@@ -87,8 +93,50 @@ export function mcpToolNamer(serverName: string): ToolNamer {
 // re-spells exactly those tokens and nothing else.
 const HOSTED_TOOL_TOKEN = /\bagentchat_[a-z0-9_]+\b/g
 
-/** The hosted verdict tool the served question names; spelled through the namer in the preamble. */
-const DECIDE_TOOL = 'agentchat_decide'
+// ─── Legacy gate-call wording ───────────────────────────────────────────────
+//
+// What this SDK said before the served texts carried `gate_call_preamble`
+// and `gate_call_answer_format` (contract v1, D6). Used only when the caller
+// passes no texts, or the texts lack a field — so integrations released
+// against 1.2.x (which call `gate.run` without texts) produce exactly the
+// prompt they always did (conformance `gate-prompt.expected.txt`). The
+// served texts win whenever they are there.
+
+/** The hosted verdict tool the legacy preamble names; spelled through the namer. */
+const LEGACY_DECIDE_TOOL = 'agentchat_decide'
+
+/**
+ * @deprecated The served `texts.gate_call_preamble` replaces it. Kept, byte
+ * for byte, for callers that pass no texts; removed in the next major.
+ */
+export function LEGACY_GATE_CALL_PREAMBLE(namer: ToolNamer = BARE_TOOL_NAMER): string {
+  return (
+    'You are triaging your AgentChat tray before any turn starts. This call has NO tools: ' +
+    `do not call ${namer(LEGACY_DECIDE_TOOL)}, do not open or send anything, and do not write a reply. ` +
+    'Answer the question below for every card, in JSON only; the host records your verdicts from that JSON. ' +
+    'Where the question says to record a verdict or to send, that happens later: for each conversation ' +
+    'you mark "reply", a turn will be started in which you open it and reply.'
+  )
+}
+
+/**
+ * @deprecated The served `texts.gate_call_answer_format` replaces it. Kept,
+ * byte for byte, for callers that pass no texts; removed in the next major.
+ */
+export function LEGACY_GATE_CALL_ANSWER_FORMAT(categories: readonly string[]): string {
+  let shape =
+    '{"decisions": [{"conversation_id": "<conversation_id from a card>", ' +
+    '"decision": "reply" | "dismiss" | "defer"'
+  if (categories.length > 0) {
+    shape += `, "category": "<one of: ${categories.join(', ')}>"`
+  }
+  shape += '}]}'
+  return (
+    'Answer with ONLY a JSON object, no prose and no code fences, in this shape: ' +
+    shape +
+    ' — one entry per card, every card decided.'
+  )
+}
 
 // ─── Verdicts ───────────────────────────────────────────────────────────────
 
@@ -121,8 +169,18 @@ const FENCE_RE = /```(?:json)?\s*([\s\S]+?)```/i
 
 // ─── Building the prompt ────────────────────────────────────────────────────
 
+/** The two served texts a gate call is framed with (`GET /v1/texts`, contract v1). */
+export type GateTexts = Pick<Texts, 'gate_call_preamble' | 'gate_call_answer_format'>
+
 export interface BuildPromptOptions {
-  /** How this runtime spells the hosted tools named inside the question. Default: as served. */
+  /**
+   * The served texts. `gate_call_preamble` opens the prompt and
+   * `gate_call_answer_format` closes it, verbatim (they are already spelled
+   * for the runtime the texts were fetched for). Optional: a field that is
+   * absent falls back to the legacy wording this SDK always used.
+   */
+  texts?: GateTexts | null
+  /** How this runtime spells the hosted tools named inside the tray's question. Default: as served. */
   toolNamer?: ToolNamer
 }
 
@@ -185,9 +243,11 @@ function sortKeysDeep(value: unknown): unknown {
 }
 
 /**
- * Render the gate prompt for one tray: a preamble that frames the call as a
- * tool-less triage, the server's question verbatim, the categories, one
- * block per card, then the output shape. Pure.
+ * Render the gate prompt for one tray: the preamble, the tray's question
+ * verbatim, the categories, one block per card, then the answer format.
+ * Pure. The preamble and the answer format are the served texts when given
+ * (`texts.gate_call_preamble`, `texts.gate_call_answer_format`), else the
+ * legacy wording (deprecated; unchanged from 1.2).
  *
  * Throws when the tray carries no question — judging without it is exactly
  * the drift this design removes, so the gate fails closed instead.
@@ -200,19 +260,11 @@ export function buildPrompt(tray: InboxTray, options?: BuildPromptOptions): stri
   const namer = options?.toolNamer ?? BARE_TOOL_NAMER
   const cards = cardsOf(tray)
   const categories = categoriesOf(tray)
+  const preamble = servedText(options?.texts?.gate_call_preamble) ?? LEGACY_GATE_CALL_PREAMBLE(namer)
+  const answerFormat =
+    servedText(options?.texts?.gate_call_answer_format) ?? LEGACY_GATE_CALL_ANSWER_FORMAT(categories)
 
-  const sections: string[] = []
-  // The served question tells the agent to record verdicts with a tool and
-  // to open and send. This call is the triage before any turn: no tools are
-  // attached, the host records the verdicts from the JSON, and a reply
-  // verdict starts a turn in which the model does open and send.
-  sections.push(
-    'You are triaging your AgentChat tray before any turn starts. This call has NO tools: ' +
-      `do not call ${namer(DECIDE_TOOL)}, do not open or send anything, and do not write a reply. ` +
-      'Answer the question below for every card, in JSON only; the host records your verdicts from that JSON. ' +
-      'Where the question says to record a verdict or to send, that happens later: for each conversation ' +
-      'you mark "reply", a turn will be started in which you open it and reply.',
-  )
+  const sections: string[] = [preamble]
   sections.push(question.trim().replace(HOSTED_TOOL_TOKEN, (token) => namer(token)))
 
   if (categories.length > 0) {
@@ -229,20 +281,12 @@ export function buildPrompt(tray: InboxTray, options?: BuildPromptOptions): stri
     sections.push(`Card ${index + 1} of ${count}\n${canonicalJson(card)}`)
   })
 
-  let shape =
-    '{"decisions": [{"conversation_id": "<conversation_id from a card>", ' +
-    '"decision": "reply" | "dismiss" | "defer"'
-  if (categories.length > 0) {
-    shape += `, "category": "<one of: ${categories.join(', ')}>"`
-  }
-  shape += '}]}'
-  sections.push(
-    'Answer with ONLY a JSON object, no prose and no code fences, in this shape: ' +
-      shape +
-      ' — one entry per card, every card decided.',
-  )
-
+  sections.push(answerFormat)
   return sections.join('\n\n')
+}
+
+function servedText(value: unknown): string | null {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : null
 }
 
 // ─── Parsing the answer ─────────────────────────────────────────────────────
@@ -331,12 +375,13 @@ function normalizeCategory(value: unknown, allowed: ReadonlySet<string>): ReplyD
 
 /**
  * The host's model call. Receives the rendered prompt, returns the model's
- * raw text. MUST be a plain completion with no tools attached: the served
+ * raw text. `signal` (when given, e.g. by the `ReceiveLoop`'s gate-call
+ * deadline) aborts when the answer is no longer wanted. MUST be a plain completion with no tools attached: the served
  * question names hosted tools, and a model that could call them would act
  * instead of answering (no JSON → fail closed, or a tool call AND JSON →
  * a verdict recorded twice).
  */
-export type GateModelCall = (prompt: string) => Promise<string>
+export type GateModelCall = (prompt: string, options?: { signal?: AbortSignal }) => Promise<string>
 
 /** The one client surface the gate needs; `AgentChatClient` satisfies it. */
 export type GateClient = Pick<AgentChatClient, 'decisions'>
@@ -345,8 +390,17 @@ export interface RunGateOptions {
   tray: InboxTray
   callModel: GateModelCall
   client: GateClient
+  /** The served texts (`gate_call_preamble`, `gate_call_answer_format`). Absent: the legacy wording (deprecated). */
+  texts?: GateTexts | null
   /** How this runtime spells the hosted tools named inside the question. */
   toolNamer?: ToolNamer
+  /**
+   * Stops the gate: once aborted, no further verdict is recorded and no reply
+   * is handed back (the cards not yet recorded count as undecided). The
+   * model call gets it too. The `ReceiveLoop` passes its cycle's signal, so
+   * an abandoned cycle records nothing more.
+   */
+  signal?: AbortSignal
 }
 
 export type GateOutcome =
@@ -409,13 +463,20 @@ export async function run(options: RunGateOptions): Promise<GateResult> {
   const ids = cards.map((card) => card.conversation_id)
   if (ids.length === 0) return emptyResult('empty', [], null)
 
+  let prompt: string
   let text: string
   try {
-    const prompt = buildPrompt(options.tray, { toolNamer: options.toolNamer })
-    text = await options.callModel(prompt)
+    prompt = buildPrompt(options.tray, { texts: options.texts, toolNamer: options.toolNamer })
+  } catch (err) {
+    return emptyResult('fail_closed', ids, describe(err))
+  }
+  if (options.signal?.aborted) return emptyResult('fail_closed', ids, 'the gate was stopped')
+  try {
+    text = options.signal ? await options.callModel(prompt, { signal: options.signal }) : await options.callModel(prompt)
   } catch (err) {
     return emptyResult('fail_closed', ids, `model call failed: ${describe(err)}`)
   }
+  if (options.signal?.aborted) return emptyResult('fail_closed', ids, 'the gate was stopped')
 
   const verdicts = parseVerdicts(text, options.tray)
   if (verdicts === null || verdicts.length === 0) {
@@ -430,6 +491,11 @@ export async function run(options: RunGateOptions): Promise<GateResult> {
   for (const verdict of verdicts) {
     const card = byId.get(verdict.conversation_id)
     if (!card) continue // unreachable: parseVerdicts only keeps ids on the tray
+    if (options.signal?.aborted) {
+      // Stopped: nothing more is recorded or handed back; the rest stay on the tray.
+      decided.delete(verdict.conversation_id)
+      continue
+    }
     if (verdict.decision === 'reply') {
       reply.push(deferredReply(options.client, card, verdict.category))
       continue
@@ -446,6 +512,10 @@ export async function run(options: RunGateOptions): Promise<GateResult> {
     }
   }
 
+  if (options.signal?.aborted) {
+    reply.length = 0
+    for (const v of verdicts) if (v.decision === 'reply') decided.delete(v.conversation_id)
+  }
   return {
     outcome: 'decided',
     reply,

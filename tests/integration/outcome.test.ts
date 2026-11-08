@@ -108,9 +108,19 @@ describe('applyOutcome / applyInviteOutcome', () => {
         category: 'no_action_needed',
       }),
     ).toBe(true)
+    expect(
+      await applyOutcome(client, {
+        action: 'record_defer',
+        reason: 'silent_again',
+        conversationId: 'c3',
+        throughMessageId: 'msg_3',
+        category: null,
+      }),
+    ).toBe(true)
     expect(record.mock.calls).toEqual([
       ['c1', { decision: 'reply', category: 'open_request', throughMessageId: 'msg_1' }],
       ['c2', { decision: 'dismiss', category: 'no_action_needed' }],
+      ['c3', { decision: 'defer', throughMessageId: 'msg_3' }],
     ])
   })
 

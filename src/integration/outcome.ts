@@ -8,11 +8,12 @@
  *
  * | After the turn                                        | Host does                              |
  * |-------------------------------------------------------|----------------------------------------|
- * | runtime reports failure (or has not confirmed the end) | nothing; the card stays (server re-wakes) |
+ * | runtime has not confirmed the end                      | nothing; the turn keeps its card          |
+ * | runtime reports failure                                | the card rules below that need no look (gone, own verdict, answer sent); otherwise nothing, the card stays (server re-wakes) |
  * | the turn recorded its own verdict (card gone, or `your_last_decision` moved) | nothing |
  * | the card shows the answer went out                    | `reply` through the anchor the gate saw |
  * | 0 AgentChat calls, or all failed (when countable)     | nothing (it could not look)            |
- * | it looked, sent nothing, recorded nothing             | 1st time nothing; 2nd time for the same anchor `dismiss` (`no_action_needed`) |
+ * | it looked, sent nothing, recorded nothing             | 1st time nothing; 2nd time for the same anchor `dismiss` (`no_action_needed`) when its AgentChat calls are known and all succeeded, else `defer` |
  *
  * `turnOutcome` is the pure decision (conformance `turn-outcome.cases.json`);
  * `applyOutcome` makes the one recording call. Invites follow the same rule
@@ -80,6 +81,14 @@ export type TurnOutcome =
       throughMessageId: string | null
       category: 'no_action_needed'
     }
+  | {
+      /** The second silent look when the turn's AgentChat calls are unknown or some failed: unread, back on the reminder ladder. */
+      action: 'record_defer'
+      reason: 'silent_again'
+      conversationId: string
+      throughMessageId: string | null
+      category: null
+    }
 
 export interface TurnOutcomeInput {
   turn: TurnEnd
@@ -105,9 +114,12 @@ export function turnOutcome(input: TurnOutcomeInput): TurnOutcome {
   })
   const turn = input.turn
   if (turn.status === 'still_running') return none('turn_running')
-  if (turn.status !== 'completed') return none('turn_failed')
+  const failed = turn.status !== 'completed'
   const tray = input.freshTray
-  if (tray === null || tray === undefined) return none('card_unknown')
+  // A failed turn is still read on the fresh card: one that sent its answer
+  // and then failed (an error or its time limit after the send) must not be
+  // gated again, or the peer gets the answer twice.
+  if (tray === null || tray === undefined) return none(failed ? 'turn_failed' : 'card_unknown')
 
   const fresh = cardsOf(tray as InboxTray).find((card) => card.conversation_id === conversationId)
   if (!fresh) return none(tray.truncated === true ? 'card_unknown' : 'card_left_tray')
@@ -125,15 +137,30 @@ export function turnOutcome(input: TurnOutcomeInput): TurnOutcome {
     }
   }
 
-  if (couldNotLook(turn.agentchatCalls)) return none('could_not_look')
+  if (failed) return none('turn_failed')
+  const calls = turn.status === 'completed' ? turn.agentchatCalls : null
+  if (couldNotLook(calls)) return none('could_not_look')
   if ((input.silentBefore ?? 0) <= 0) return none('silent_first')
-  return {
-    action: 'record_dismiss',
-    reason: 'silent_again',
-    conversationId,
-    throughMessageId: anchor,
-    category: 'no_action_needed',
+  // Dismiss marks the conversation read: only when the turn's AgentChat calls
+  // are known and all succeeded. An unknown count (or a failed call) may mean
+  // the tools were unusable — defer instead: unread, back on the reminder ladder.
+  if (callsAllSucceeded(calls)) {
+    return {
+      action: 'record_dismiss',
+      reason: 'silent_again',
+      conversationId,
+      throughMessageId: anchor,
+      category: 'no_action_needed',
+    }
   }
+  return { action: 'record_defer', reason: 'silent_again', conversationId, throughMessageId: anchor, category: null }
+}
+
+function callsAllSucceeded(calls: AgentChatCallCount | null | undefined): boolean {
+  if (!calls || typeof calls !== 'object') return false
+  const made = Number(calls.made)
+  const failed = Number(calls.failed)
+  return Number.isFinite(made) && made > 0 && Number.isFinite(failed) && failed === 0
 }
 
 export type InviteOutcomeReason =
@@ -191,7 +218,7 @@ export type OutcomeClient = Pick<AgentChatClient, 'decisions'>
 export async function applyOutcome(client: OutcomeClient, outcome: TurnOutcome): Promise<boolean> {
   if (outcome.action === 'none') return false
   await client.decisions.record(outcome.conversationId, {
-    decision: outcome.action === 'record_reply' ? 'reply' : 'dismiss',
+    decision: outcome.action === 'record_reply' ? 'reply' : outcome.action === 'record_defer' ? 'defer' : 'dismiss',
     ...(outcome.category ? { category: outcome.category } : {}),
     ...(outcome.throughMessageId ? { throughMessageId: outcome.throughMessageId } : {}),
   })

@@ -72,6 +72,12 @@ server and against a contract v1 server.
   `ackOnReceipt`; the drain stops) and stay `stored` on the server; once the
   queue is back to half the client fetches them (the REST drain, or one
   quiet reconnect without a `client`).
+- `turnOutcome`: a failed reply turn is still read on the fresh card — one
+  that sent its answer and then failed records `reply` (never gated again
+  and answered twice); one that recorded its own verdict records nothing.
+  The second silent look records `dismiss` only when the turn's AgentChat
+  calls are known and all succeeded; otherwise `defer` (`record_defer`): the
+  card stays unread and returns on the server's reminder ladder.
 - `ReceiveLoop` deadlines: `gateCallTimeoutMs` (default 60 s; the gate call
   fails closed for its cards, its `signal` aborts, the next wake asks again)
   and `cycleTimeoutMs` (default 10 min, not counting turn admissions and

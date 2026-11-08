@@ -81,11 +81,12 @@ The loop reads the card again and decides from what actually happened (`integrat
 
 | After the turn | The loop |
 |---|---|
-| failed, or not confirmed ended | records nothing; the card stays |
-| the turn recorded its own verdict (card gone, or its last decision moved) | records nothing |
-| the card shows the answer went out | records `reply` through the message the gate saw |
+| not confirmed ended | records nothing; the turn keeps its card |
+| the turn recorded its own verdict (card gone, or its last decision moved) — failed or not | records nothing |
+| the card shows the answer went out — failed or not | records `reply` through the message the gate saw |
+| failed, otherwise | records nothing; the card stays (the server re-wakes) |
 | the turn made no AgentChat calls, or all failed | records nothing (it could not look) |
-| it looked, sent nothing, recorded nothing | nothing the first time; `dismiss` (`no_action_needed`) the second time for the same message |
+| it looked, sent nothing, recorded nothing | nothing the first time; the second time for the same message `dismiss` (`no_action_needed`) when its AgentChat calls are known and all succeeded, else `defer` (unread, back on the reminder ladder) |
 
 Invites follow the same rule: an invite still pending after two turns that looked is dismissed (seen, left pending, not shown again).
 

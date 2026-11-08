@@ -190,12 +190,43 @@ describe('ReceiveLoop — gate-call mode', () => {
     expect(record).not.toHaveBeenCalled()
     loop.wake() // the server's re-wake (D3)
     await until(() => t.started.length === 2)
-    t.ends[1]!({ status: 'completed', agentchatCalls: null })
+    t.ends[1]!({ status: 'completed', agentchatCalls: { made: 3, failed: 0 } })
     await until(() => record.mock.calls.length === 1)
     expect(record.mock.calls[0]).toEqual([
       DIRECT.conversation_id,
       { decision: 'dismiss', category: 'no_action_needed', throughMessageId: 'msg_nova0first00001a' },
     ])
+    await loop.stop()
+  })
+
+  it('with the AgentChat calls unknown, the second silent look records defer, not dismiss (the card stays unread)', async () => {
+    const { client, state, record } = fakeClient()
+    state.tray = trayOf([DIRECT])
+    const t = turns()
+    const { loop } = gateLoop({ client, callModel: answer([{ conversation_id: DIRECT.conversation_id, decision: 'reply' }]), startTurn: t.startTurn, paceMs: 0 })
+    loop.wake()
+    await until(() => t.started.length === 1)
+    t.ends[0]!({ status: 'completed', agentchatCalls: null })
+    await until(() => loop.status().counters.outcomes.silent_first === 1)
+    loop.wake()
+    await until(() => t.started.length === 2)
+    t.ends[1]!({ status: 'completed', agentchatCalls: null })
+    await until(() => record.mock.calls.length === 1)
+    expect(record.mock.calls[0]).toEqual([DIRECT.conversation_id, { decision: 'defer', throughMessageId: 'msg_nova0first00001a' }])
+    await loop.stop()
+  })
+
+  it('a turn that sent and then failed: reply is recorded, so the card is not gated again', async () => {
+    const { client, state, record } = fakeClient()
+    state.tray = trayOf([DIRECT])
+    const t = turns()
+    const { loop } = gateLoop({ client, callModel: answer([{ conversation_id: DIRECT.conversation_id, decision: 'reply' }]), startTurn: t.startTurn })
+    loop.wake()
+    await until(() => t.started.length === 1)
+    state.tray = trayOf([{ ...DIRECT, you_owe_reply: false, your_last_message_at: '2026-11-08T09:11:30.000Z' }])
+    t.ends[0]!({ status: 'failed', detail: 'the runtime hit its time limit after the send' })
+    await until(() => record.mock.calls.length === 1)
+    expect(record.mock.calls[0]![1]).toMatchObject({ decision: 'reply', throughMessageId: 'msg_nova0first00001a' })
     await loop.stop()
   })
 

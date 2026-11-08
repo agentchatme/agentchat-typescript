@@ -72,6 +72,12 @@ server and against a contract v1 server.
   `ackOnReceipt`; the drain stops) and stay `stored` on the server; once the
   queue is back to half the client fetches them (the REST drain, or one
   quiet reconnect without a `client`).
+- `ReceiveLoop` deadlines: `gateCallTimeoutMs` (default 60 s; the gate call
+  fails closed for its cards, its `signal` aborts, the next wake asks again)
+  and `cycleTimeoutMs` (default 10 min, not counting turn admissions and
+  runs; an overdue cycle is abandoned, reported once, and the loop takes
+  wakes again). `status().recentCycles` holds the last 20 cycle summaries.
+  `GateModelCall` takes an optional `{ signal }`.
 - `ReceiveLoop.releaseTurn` frees the turn's slot at once and starts the
   next waiting turn (a turn the runtime never ends no longer blocks the cap).
 - A first `message.new` handler attached after a HELLO that offered no `ack`

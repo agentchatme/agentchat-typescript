@@ -834,3 +834,80 @@ describe('ReceiveLoop — releaseTurn frees the slot', () => {
     await loop.stop()
   })
 })
+
+describe('ReceiveLoop — deadlines (gateCallTimeoutMs, cycleTimeoutMs) and recentCycles', () => {
+  it('a gate call past its deadline fails closed: nothing recorded, its signal aborts, the next wake asks again', async () => {
+    const { client, state, record } = fakeClient()
+    state.tray = trayOf([CREW])
+    const signals: AbortSignal[] = []
+    const callModel = vi.fn((_prompt: string, options?: { signal?: AbortSignal }) => {
+      if (options?.signal) signals.push(options.signal)
+      return new Promise<string>(() => undefined) // never answers
+    })
+    const { loop } = gateLoop({ client, callModel, gateCallTimeoutMs: 30 })
+    loop.wake()
+    await until(() => loop.status().lastCycle !== null, 'the timed-out cycle')
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'fail_closed', failure: 'model call failed: no answer within 30 ms' })
+    expect(signals[0]?.aborted).toBe(true)
+    expect(record).not.toHaveBeenCalled()
+    loop.wake()
+    await until(() => callModel.mock.calls.length === 2, 'the retry on the next wake')
+    await loop.stop()
+  })
+
+  it('a cycle stuck past cycleTimeoutMs is abandoned once, and the loop takes wakes again', async () => {
+    const { client, state } = fakeClient()
+    state.tray = trayOf([CREW])
+    let calls = 0
+    const readiness = vi.fn(() => {
+      calls += 1
+      return calls === 1 ? new Promise<never>(() => undefined) : { ready: true as const }
+    })
+    const callModel = vi.fn(answer([{ conversation_id: CREW.conversation_id, decision: 'dismiss' }]))
+    const { loop, events } = gateLoop({ client, callModel, readiness, cycleTimeoutMs: 40 })
+    loop.wake()
+    await until(() => loop.status().lastCycle !== null, 'the abandoned cycle')
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'abandoned' })
+    expect(events.filter((e) => e.type === 'error' && /abandoned/.test(e.error.message))).toHaveLength(1)
+    expect(loop.status().coalescer.state).not.toBe('running')
+    loop.wake()
+    await until(() => callModel.mock.calls.length === 1, 'a new cycle after the abandoned one')
+    await until(() => loop.status().lastCycle?.outcome === 'decided')
+    expect(loop.status().recentCycles.map((c) => c.outcome)).toEqual(['abandoned', 'decided'])
+    await loop.stop()
+  })
+
+  it('time inside a turn admission does not count against the cycle deadline', async () => {
+    const { client, state } = fakeClient()
+    state.tray = trayOf([DIRECT])
+    const startTurn = vi.fn(async (): Promise<TurnAdmission> => {
+      await new Promise((r) => setTimeout(r, 120)) // a slow runtime admitting the turn
+      return { started: true, done: new Promise<TurnEnd>(() => undefined) }
+    })
+    const { loop } = gateLoop({
+      client,
+      callModel: answer([{ conversation_id: DIRECT.conversation_id, decision: 'reply' }]),
+      startTurn,
+      cycleTimeoutMs: 60,
+    })
+    loop.wake()
+    await until(() => loop.status().lastCycle !== null, 'the cycle')
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'decided', turnsStarted: 1 })
+    await loop.stop()
+  })
+
+  it('recentCycles keeps the last 20, newest last', async () => {
+    const { client, state } = fakeClient()
+    state.tray = trayOf([])
+    const { loop } = gateLoop({ client })
+    for (let i = 0; i < 23; i++) {
+      loop.wake()
+      await until(() => loop.status().coalescer.cycles === i + 1 && loop.status().coalescer.state === 'idle')
+    }
+    const recent = loop.status().recentCycles
+    expect(recent).toHaveLength(20)
+    expect(recent.every((c) => c.outcome === 'empty')).toBe(true)
+    expect(recent.at(-1)).toBe(loop.status().lastCycle)
+    await loop.stop()
+  })
+})

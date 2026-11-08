@@ -375,12 +375,13 @@ function normalizeCategory(value: unknown, allowed: ReadonlySet<string>): ReplyD
 
 /**
  * The host's model call. Receives the rendered prompt, returns the model's
- * raw text. MUST be a plain completion with no tools attached: the served
+ * raw text. `signal` (when given, e.g. by the `ReceiveLoop`'s gate-call
+ * deadline) aborts when the answer is no longer wanted. MUST be a plain completion with no tools attached: the served
  * question names hosted tools, and a model that could call them would act
  * instead of answering (no JSON → fail closed, or a tool call AND JSON →
  * a verdict recorded twice).
  */
-export type GateModelCall = (prompt: string) => Promise<string>
+export type GateModelCall = (prompt: string, options?: { signal?: AbortSignal }) => Promise<string>
 
 /** The one client surface the gate needs; `AgentChatClient` satisfies it. */
 export type GateClient = Pick<AgentChatClient, 'decisions'>

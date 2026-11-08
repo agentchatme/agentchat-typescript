@@ -79,6 +79,21 @@ export const TURN_OVERDUE_MS = 30 * 60_000
 /** The truncated-tray self-wake after a cycle that made no progress: 1 s, doubling, at most 60 s. */
 const NO_PROGRESS_BACKOFF_MS = 1_000
 const NO_PROGRESS_BACKOFF_MAX_MS = 60_000
+/** The gate call's deadline: past it the cycle fails closed for its cards. */
+export const GATE_CALL_TIMEOUT_MS = 60_000
+/** A cycle's deadline, not counting time inside turns and runs: past it the cycle is abandoned. */
+export const CYCLE_TIMEOUT_MS = 10 * 60_000
+/** How many cycle summaries `status().recentCycles` keeps. */
+const RECENT_CYCLES = 20
+
+/** One cycle's clock and identity: abandoned cycles go stale and stop acting. */
+interface CycleRun {
+  readonly token: number
+  readonly signal: AbortSignal
+  stale(): boolean
+  /** Await work whose time does not count against the cycle deadline (turn admissions, runs). */
+  exclude<T>(work: () => Promise<T>): Promise<T>
+}
 
 export type ReceiveLoopMode = 'gateCall' | 'singleRun'
 
@@ -174,6 +189,8 @@ export type CycleOutcome =
   | 'run_completed'
   | 'run_failed'
   | 'run_not_started'
+  /** The cycle ran past `cycleTimeoutMs` and was abandoned; the next wake runs a new one. */
+  | 'abandoned'
 
 export interface CycleSummary {
   readonly at: string
@@ -263,6 +280,18 @@ export interface ReceiveLoopOptions {
   readonly paceMs?: number
   /** A tracker shared with other loops or the integration; default: the loop's own. */
   readonly tracker?: TurnTracker
+  /**
+   * The gate call's deadline (`GATE_CALL_TIMEOUT_MS`, 60 s). Past it the
+   * cycle fails closed for its cards (nothing recorded; the next wake asks
+   * again) and the call's `signal` aborts.
+   */
+  readonly gateCallTimeoutMs?: number
+  /**
+   * A cycle's deadline (`CYCLE_TIMEOUT_MS`, 10 min), not counting time
+   * inside turn admissions and runs. A cycle past it is abandoned (it stops
+   * acting at its next step), reported once, and the loop takes wakes again.
+   */
+  readonly cycleTimeoutMs?: number
   readonly quietMs?: number
   readonly maxMs?: number
   readonly onEvent?: (event: ReceiveLoopEvent) => void
@@ -286,6 +315,8 @@ export interface ReceiveLoopStatus {
     readonly lastError: string | null
   }
   readonly lastCycle: CycleSummary | null
+  /** The last cycles, newest last (at most 20). */
+  readonly recentCycles: CycleSummary[]
   /** Turns the tracker holds; `overdue` past 30 minutes (the runtime should have ended it). */
   readonly turns: Array<RunningTurn & { readonly overdue: boolean }>
   readonly counters: {
@@ -374,6 +405,10 @@ export class ReceiveLoop {
   private noProgressStreak = 0
   private moreTimer: TimerHandle | null = null
   private lastCycle: CycleSummary | null = null
+  private readonly recentCycles: CycleSummary[] = []
+  private cycleToken = 0
+  private readonly gateCallTimeoutMs: number
+  private readonly cycleTimeoutMs: number
   private lastError: string | null = null
   private readonly counts = {
     frames: 0,
@@ -406,6 +441,8 @@ export class ReceiveLoop {
     this._setTimeout = options.setTimeout ?? ((fn, ms) => setTimeout(fn, ms))
     this._clearTimeout = options.clearTimeout ?? ((h) => clearTimeout(h))
     this.maxTurns = maxTurns
+    this.gateCallTimeoutMs = positive(options.gateCallTimeoutMs, GATE_CALL_TIMEOUT_MS)
+    this.cycleTimeoutMs = positive(options.cycleTimeoutMs, CYCLE_TIMEOUT_MS)
     this.handle = options.handle ? normalizeHandle(options.handle) : null
     this.tracker = options.tracker ?? new TurnTracker({ now: this.now })
     // A released turn (here, or by another holder of a shared tracker) frees
@@ -536,6 +573,7 @@ export class ReceiveLoop {
         lastError: this.options.texts.lastError ?? null,
       },
       lastCycle: this.lastCycle,
+      recentCycles: [...this.recentCycles],
       turns: this.tracker.running().map((turn) => ({ ...turn, overdue: now - turn.startedAt > TURN_OVERDUE_MS })),
       counters: {
         ...this.counts,
@@ -596,11 +634,110 @@ export class ReceiveLoop {
 
   private async cycle(): Promise<void> {
     if (this.stopped) return
-    const summary =
-      this.options.mode === 'gateCall' ? await this.gateCallCycle() : await this.singleRunCycle()
+    const token = ++this.cycleToken
+    const controller = new AbortController()
+    const startedAt = this.now()
+    let excludedMs = 0
+    let excludedSince: number | null = null
+    let depth = 0
+    const run: CycleRun = {
+      token,
+      signal: controller.signal,
+      stale: () => this.cycleToken !== token || this.stopped,
+      exclude: async <T>(work: () => Promise<T>): Promise<T> => {
+        if (depth++ === 0) excludedSince = this.now()
+        try {
+          return await work()
+        } finally {
+          if (--depth === 0 && excludedSince !== null) {
+            excludedMs += this.now() - excludedSince
+            excludedSince = null
+          }
+        }
+      },
+    }
+    const work = (async () => {
+      const summary =
+        this.options.mode === 'gateCall' ? await this.gateCallCycle(run) : await this.singleRunCycle(run)
+      if (!run.stale() || this.stopped) this.finishCycle(summary)
+    })()
+    let timer: TimerHandle | null = null
+    const overdue = new Promise<'overdue'>((resolve) => {
+      const check = (): void => {
+        timer = null
+        const now = this.now()
+        const excluded = excludedMs + (excludedSince !== null ? now - excludedSince : 0)
+        const active = now - startedAt - excluded
+        if (active >= this.cycleTimeoutMs) {
+          resolve('overdue')
+          return
+        }
+        timer = this._setTimeout(check, Math.max(1, this.cycleTimeoutMs - active))
+        ;(timer as { unref?: () => void }).unref?.()
+      }
+      timer = this._setTimeout(check, this.cycleTimeoutMs)
+      ;(timer as { unref?: () => void }).unref?.()
+    })
+    const result = await Promise.race([work.then(() => 'done' as const), overdue])
+    if (timer !== null) this._clearTimeout(timer)
+    if (result === 'done') return
+    // Abandoned: it acts no more (every step checks `stale()`), its pending
+    // calls see an aborted signal, and the coalescer takes wakes again.
+    this.cycleToken += 1
+    controller.abort()
+    void work.catch(() => undefined)
+    const failure = `the cycle ran past ${this.cycleTimeoutMs} ms (not counting turns) and was abandoned; the next wake starts a new one`
+    this.fail(new Error(failure))
+    this.finishCycle(this.summary('abandoned', { failure }))
+  }
+
+  private finishCycle(summary: CycleSummary): void {
     this.lastCycle = summary
+    this.recentCycles.push(summary)
+    if (this.recentCycles.length > RECENT_CYCLES) this.recentCycles.shift()
     if (summary.failure !== null) this.lastError = summary.failure
     this.emit({ type: 'cycle', summary })
+  }
+
+  /** The runtime's model call, bounded by `gateCallTimeoutMs` (and the cycle's own abandonment). */
+  private boundedModelCall(run: CycleRun): GateModelCall {
+    return (prompt) =>
+      new Promise<string>((resolve, reject) => {
+        const controller = new AbortController()
+        const abort = (): void => {
+          controller.abort()
+          reject(new Error('the cycle was abandoned'))
+        }
+        if (run.signal.aborted) {
+          abort()
+          return
+        }
+        run.signal.addEventListener('abort', abort, { once: true })
+        const timer = this._setTimeout(() => {
+          run.signal.removeEventListener('abort', abort)
+          controller.abort()
+          reject(new Error(`no answer within ${this.gateCallTimeoutMs} ms`))
+        }, this.gateCallTimeoutMs)
+        ;(timer as { unref?: () => void }).unref?.()
+        let call: Promise<string>
+        try {
+          call = Promise.resolve(this.options.callModel!(prompt, { signal: controller.signal }))
+        } catch (err) {
+          call = Promise.reject(err)
+        }
+        call.then(
+          (text) => {
+            this._clearTimeout(timer)
+            run.signal.removeEventListener('abort', abort)
+            resolve(text)
+          },
+          (err: unknown) => {
+            this._clearTimeout(timer)
+            run.signal.removeEventListener('abort', abort)
+            reject(err)
+          },
+        )
+      })
   }
 
   private async readTray(): Promise<InboxTray | null> {
@@ -630,8 +767,9 @@ export class ReceiveLoop {
     }
   }
 
-  private async gateCallCycle(): Promise<CycleSummary> {
+  private async gateCallCycle(run: CycleRun): Promise<CycleSummary> {
     const tray = await this.readTray()
+    if (run.stale()) return this.summary('abandoned')
     if (tray === null) return this.summary('tray_failed', { failure: this.lastError })
     const cards = cardsOf(tray)
     const invites = trayInvites(tray)
@@ -648,8 +786,10 @@ export class ReceiveLoop {
     if (owedCards.length === 0 && owedInvites.length === 0) return this.summary('nothing_owed', base)
 
     const texts = await this.options.texts.ensure()
+    if (run.stale()) return this.summary('abandoned', base)
     if (texts === null) return this.summary('texts_missing', { ...base, failure: 'the served texts are not available' })
     const unready = await this.checkReady()
+    if (run.stale()) return this.summary('abandoned', base)
     if (unready !== null) return this.summary('tools_unavailable', { ...base, failure: unready })
 
     let gated = 0
@@ -670,7 +810,7 @@ export class ReceiveLoop {
       gated = gateCards.length
       const result = await runGate({
         tray: { ...tray, conversations: gateCards },
-        callModel: this.options.callModel!,
+        callModel: this.boundedModelCall(run),
         client: this.client,
         texts,
         ...(this.options.toolNamer ? { toolNamer: this.options.toolNamer } : {}),
@@ -685,15 +825,16 @@ export class ReceiveLoop {
       } else {
         outcome = 'decided'
         for (const reply of result.reply) {
-          if (this.stopped) break
-          tally[launchKey(await this.startReplyTurn(reply, texts))] += 1
+          if (run.stale()) break
+          tally[launchKey(await run.exclude(() => this.startReplyTurn(reply, texts)))] += 1
         }
       }
     }
     for (const invite of owedInvites) {
-      if (this.stopped) break
-      tally[launchKey(await this.startInviteTurn(invite, texts))] += 1
+      if (run.stale()) break
+      tally[launchKey(await run.exclude(() => this.startInviteTurn(invite, texts)))] += 1
     }
+    if (run.stale()) return this.summary('abandoned', base)
     if (tray.truncated === true && outcome === 'decided') {
       this.readTheRest(tally.recorded > 0 || tally.turnsStarted > 0)
     }
@@ -731,8 +872,9 @@ export class ReceiveLoop {
     }
   }
 
-  private async singleRunCycle(): Promise<CycleSummary> {
+  private async singleRunCycle(run: CycleRun): Promise<CycleSummary> {
     const tray = await this.readTray()
+    if (run.stale()) return this.summary('abandoned')
     let cards: number | null = null
     let invites: number | null = null
     let base = { cards: 0, invites: 0, heldByTurns: 0, truncated: false }
@@ -745,8 +887,10 @@ export class ReceiveLoop {
     }
     // A tray that could not be read is not an empty tray, and the wake was real: the run starts anyway.
     const texts = await this.options.texts.ensure()
+    if (run.stale()) return this.summary('abandoned', base)
     if (texts === null) return this.summary('texts_missing', { ...base, failure: 'the served texts are not available' })
     const unready = await this.checkReady()
+    if (run.stale()) return this.summary('abandoned', base)
     if (unready !== null) return this.summary('tools_unavailable', { ...base, failure: unready })
 
     const prompt =
@@ -758,7 +902,7 @@ export class ReceiveLoop {
     this.counts.runsStarted += 1
     let end: RunEnd
     try {
-      end = await this.options.startRun!({ prompt, texts, cards, invites, signal: this.abort.signal })
+      end = await run.exclude(() => this.options.startRun!({ prompt, texts, cards, invites, signal: this.abort.signal }))
     } catch (err) {
       end = { status: 'not_started', detail: err instanceof Error ? err.message : String(err) }
     }
@@ -1051,6 +1195,10 @@ export class ReceiveLoop {
 /** The prompt a reply turn starts with: the served wake instruction, then the conversation it is for. */
 export function replyPrompt(texts: Pick<Texts, 'wake_instruction'>, conversationId: string): string {
   return `${texts.wake_instruction.trim()}\n\nconversation_id: ${conversationId}`
+}
+
+function positive(value: number | undefined, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
 }
 
 function launchKey(launch: Launch): 'turnsStarted' | 'turnsRefused' | 'turnsQueued' {

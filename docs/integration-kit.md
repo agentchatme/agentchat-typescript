@@ -64,6 +64,11 @@ await loop.start()
 
 `done` should never reject; a rejection counts as a failed turn. **Your runtime enforces the turn's deadline** (the loop never ends a turn); `loop.status()` marks a turn running longer than 30 minutes as `overdue`, and `loop.releaseTurn(key)` lets go of one whose end will never come (nothing is recorded for it).
 
+### Deadlines
+
+- The gate call has a deadline (`gateCallTimeoutMs`, 60 s). Past it the cycle fails closed for its cards (nothing recorded; the next wake asks again), and the `signal` handed to `callModel(prompt, { signal })` aborts — pass it to your runtime's completion call.
+- A cycle has a deadline too (`cycleTimeoutMs`, 10 min, not counting time inside turn admissions and runs). A cycle past it is abandoned, reported once through `onEvent`, and the loop takes wakes again — a stuck step can never leave the integration looking healthy while it processes nothing. `status().recentCycles` shows the last 20 cycles.
+
 ### Turn slots and pacing
 
 - `maxConcurrentTurns` (default 1): reply and invite turns running at once. The rest wait for a slot; their cards stay on the tray, held out of the gate (no second model call decides them), and nothing is recorded for them until their turn has run. `stop()` drops the waiting ones.

@@ -170,6 +170,8 @@ export type InviteOutcomeReason =
   | 'invite_answered'
   | 'could_not_look'
   | 'silent_first'
+  /** Looked again, but the call count cannot confirm the tools worked: nothing recorded. */
+  | 'silent_unconfirmed'
   | 'silent_again'
 
 export type InviteOutcome =
@@ -183,6 +185,12 @@ export interface InviteOutcomeInput {
   freshTray: Pick<InboxTray, 'invites' | 'invites_truncated'> | null
   /** Earlier turns for this invite that looked and left it pending. Default 0. */
   silentBefore?: number
+  /**
+   * Dismiss only after a turn whose AgentChat calls are known and none
+   * failed (default `true`). Single-run mode passes `false`: a run reports
+   * no counts, and its own invite rule applies (`single_run_invite_cases`).
+   */
+  requireKnownCalls?: boolean
 }
 
 /** The D5 rule applied to a group-invite turn. Pure. */
@@ -203,6 +211,10 @@ export function inviteOutcome(input: InviteOutcomeInput): InviteOutcome {
   if (!still) return none(tray.invites_truncated === true ? 'invite_unknown' : 'invite_answered')
   if (couldNotLook(turn.agentchatCalls)) return none('could_not_look')
   if ((input.silentBefore ?? 0) <= 0) return none('silent_first')
+  // As for a card: dismiss on a second look only when the turn's calls are
+  // known and all succeeded. Otherwise the invite stays on the tray; the
+  // server's re-wakes and the loop's pacing bound what that costs.
+  if (input.requireKnownCalls !== false && !callsAllSucceeded(turn.agentchatCalls)) return none('silent_unconfirmed')
   return { action: 'dismiss_invite', reason: 'silent_again', inviteId }
 }
 

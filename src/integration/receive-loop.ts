@@ -936,7 +936,8 @@ export class ReceiveLoop {
       ? { status: 'completed', agentchatCalls: null }
       : { status: 'failed', ...(end.detail !== undefined ? { detail: end.detail } : {}) }
     for (const invite of invites) {
-      await this.settleInvite(invite, turn, fresh)
+      // A run reports no call counts: the single-run invite rule applies.
+      await this.settleInvite(invite, turn, fresh, { requireKnownCalls: false })
     }
   }
 
@@ -1100,10 +1101,15 @@ export class ReceiveLoop {
   }
 
   /** The D5 rule for one invite after a turn or a run, and the one call it asks for. */
-  private async settleInvite(invite: TrayInvite, end: TurnEnd, fresh: InboxTray | null): Promise<void> {
+  private async settleInvite(
+    invite: TrayInvite,
+    end: TurnEnd,
+    fresh: InboxTray | null,
+    rule: { requireKnownCalls?: boolean } = {},
+  ): Promise<void> {
     const key = `invite|${invite.invite_id}`
     const silentBefore = this.silent.get(key) ?? 0
-    const outcome = inviteOutcome({ turn: end, invite, freshTray: fresh, silentBefore })
+    const outcome = inviteOutcome({ turn: end, invite, freshTray: fresh, silentBefore, ...rule })
     this.count(`invite_${outcome.reason}`)
     if (outcome.reason === 'silent_first') this.remember(key, silentBefore + 1)
     if (outcome.reason === 'invite_answered') this.silent.delete(key)

@@ -998,3 +998,22 @@ describe('ReceiveLoop — dismissIgnoredInvites', () => {
     await loop.stop()
   })
 })
+
+describe('ReceiveLoop — invite turns need known calls to dismiss', () => {
+  it('two silent invite turns with unknown call counts dismiss nothing (silent_unconfirmed)', async () => {
+    const { client, state, dismissInvite } = fakeClient()
+    state.tray = trayOf([], { invites: [INVITE] })
+    const t = turns()
+    const { loop } = gateLoop({ client, startTurn: t.startTurn, paceMs: 0 })
+    loop.wake()
+    await until(() => t.started.length === 1)
+    t.ends[0]!({ status: 'completed', agentchatCalls: null })
+    await until(() => loop.status().counters.outcomes.invite_silent_first === 1)
+    loop.wake()
+    await until(() => t.started.length === 2)
+    t.ends[1]!({ status: 'completed', agentchatCalls: null })
+    await until(() => loop.status().counters.outcomes.invite_silent_unconfirmed === 1)
+    expect(dismissInvite).not.toHaveBeenCalled()
+    await loop.stop()
+  })
+})

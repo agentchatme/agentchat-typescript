@@ -546,10 +546,14 @@ interface SingleRunInviteCase {
   name: string
   why: string
   invite: TrayInvite
-  runs: Array<{ status: 'completed' | 'failed' | 'not_started'; fresh_tray: { invites: TrayInvite[]; invites_truncated: boolean } | null }>
+  runs: Array<{
+    status: 'completed' | 'failed' | 'not_started'
+    fresh_tray: { invites: TrayInvite[]; invites_truncated: boolean } | null
+    ended_at_ms: number
+  }>
   expect: Array<{ action: string; reason: string }>
 }
-const outcomeDoc = json<{ single_run_invite_cases: SingleRunInviteCase[] }>('turn-outcome.cases.json')
+const outcomeDoc = json<{ single_run_pace_ms: number; single_run_invite_cases: SingleRunInviteCase[] }>('turn-outcome.cases.json')
 
 describe('conformance — single-run invites (turn-outcome.cases.json)', () => {
   it.each(outcomeDoc.single_run_invite_cases.map((c) => [c.name, c] as const))('%s', async (_name, c) => {
@@ -571,6 +575,7 @@ describe('conformance — single-run invites (turn-outcome.cases.json)', () => {
     const client = { inbox: { tray }, decisions: { record }, groups: { dismissInvite }, baseUrl: 'https://api.agentchat.me' }
     const statuses = c.runs.map((r) => r.status)
     const outcomes: Array<{ action: string; reason: string }> = []
+    let clock = 0
     const loop = new ReceiveLoop({
       mode: 'singleRun',
       client: client as never,
@@ -578,12 +583,15 @@ describe('conformance — single-run invites (turn-outcome.cases.json)', () => {
       socket: null,
       quietMs: 0,
       maxMs: 0,
+      paceMs: outcomeDoc.single_run_pace_ms,
+      now: () => clock,
       startRun: async () => ({ status: statuses.shift()! }),
       onEvent: (e) => {
         if (e.type === 'invite_outcome') outcomes.push({ action: e.outcome.action, reason: e.outcome.reason })
       },
     })
     for (let i = 0; i < c.runs.length; i++) {
+      clock = c.runs[i]!.ended_at_ms // the loop's clock when the run ends
       loop.wake()
       await until(() => outcomes.length === i + 1, `the outcome after run ${i + 1}`)
     }
@@ -974,10 +982,11 @@ describe('ReceiveLoop — dismissIgnoredInvites', () => {
     await loop.stop()
   })
 
-  it('default (true): dismissed after the second completed run', async () => {
+  it('default (true): dismissed after the second completed run, a pacing window later', async () => {
     const { client, state, dismissInvite } = fakeClient()
     state.tray = trayOf([], { invites: [INVITE] })
     let runs = 0
+    let clock = 0
     const loop = new ReceiveLoop({
       mode: 'singleRun',
       client,
@@ -985,12 +994,14 @@ describe('ReceiveLoop — dismissIgnoredInvites', () => {
       socket: null,
       quietMs: 0,
       maxMs: 0,
+      now: () => clock,
       startRun: async () => {
         runs += 1
         return { status: 'completed' }
       },
     })
     for (let i = 1; i <= 2; i++) {
+      clock = (i - 1) * 61_000
       loop.wake()
       await until(() => runs === i && loop.status().coalescer.state === 'idle', `run ${i}`)
     }

@@ -286,13 +286,13 @@ export interface ReceiveLoopOptions {
    * cycle fails closed for its cards (nothing recorded; the next wake asks
    * again) and the call's `signal` aborts.
    */
-  readonly gateCallTimeoutMs?: number
+  readonly gateCallTimeoutMs?: number /* 0 = no deadline */
   /**
    * A cycle's deadline (`CYCLE_TIMEOUT_MS`, 10 min), not counting time
    * inside turn admissions and runs. A cycle past it is abandoned (it stops
    * acting at its next step), reported once, and the loop takes wakes again.
    */
-  readonly cycleTimeoutMs?: number
+  readonly cycleTimeoutMs?: number /* 0 = no watchdog */
   /**
    * singleRun: dismiss an invite still pending after two completed runs that
    * left it (default `true`), so an ignored invite does not cost a run on
@@ -401,7 +401,12 @@ export class ReceiveLoop {
   private readonly realtime: RealtimeClient | null
   private readonly unsubscribe: Array<() => void> = []
   private readonly silent = new Map<string, number>()
+  /** When a single-run invite's silent run was counted (D5 pacing in single-run mode). */
+  private readonly silentAt = new Map<string, number>()
+  private readonly paceMs: number
   private readonly waiting: Array<{ handle: TurnHandle; admit: () => Promise<boolean> }> = []
+  /** Conversations whose verdict a gate call is recording right now (an abandoned cycle's included). */
+  private readonly recordsInFlight = new Set<string>()
   /** Turns holding a slot (admitted, not yet ended or released). */
   private readonly slotted = new Set<TurnHandle>()
 
@@ -449,14 +454,15 @@ export class ReceiveLoop {
     this._setTimeout = options.setTimeout ?? ((fn, ms) => setTimeout(fn, ms))
     this._clearTimeout = options.clearTimeout ?? ((h) => clearTimeout(h))
     this.maxTurns = maxTurns
-    this.gateCallTimeoutMs = positive(options.gateCallTimeoutMs, GATE_CALL_TIMEOUT_MS)
-    this.cycleTimeoutMs = positive(options.cycleTimeoutMs, CYCLE_TIMEOUT_MS)
+    this.gateCallTimeoutMs = timeoutOption(options.gateCallTimeoutMs, GATE_CALL_TIMEOUT_MS, 'gateCallTimeoutMs')
+    this.cycleTimeoutMs = timeoutOption(options.cycleTimeoutMs, CYCLE_TIMEOUT_MS, 'cycleTimeoutMs')
     this.handle = options.handle ? normalizeHandle(options.handle) : null
     this.tracker = options.tracker ?? new TurnTracker({ now: this.now })
     // A released turn (here, or by another holder of a shared tracker) frees
     // its slot at once: the runtime may never end it.
     this.unsubscribe.push(this.tracker.onRelease((handle) => this.releaseSlot(handle)))
-    this.pacer = new Pacer(options.paceMs ?? PACE_MS, this.now)
+    this.paceMs = options.paceMs ?? PACE_MS
+    this.pacer = new Pacer(this.paceMs, this.now)
     this.coalescer = new WakeCoalescer({
       onCycle: () => this.cycle(),
       onError: (err) => this.fail(err),
@@ -671,6 +677,7 @@ export class ReceiveLoop {
     })()
     let timer: TimerHandle | null = null
     const overdue = new Promise<'overdue'>((resolve) => {
+      if (!Number.isFinite(this.cycleTimeoutMs)) return // the watchdog is off
       const check = (): void => {
         timer = null
         const now = this.now()
@@ -707,6 +714,29 @@ export class ReceiveLoop {
     this.emit({ type: 'cycle', summary })
   }
 
+  /**
+   * The gate's view of the client: a verdict in flight is known until it
+   * answers (its card is held out of the next gate). It is not aborted with
+   * an abandoned cycle: the server may already have taken it, and a second
+   * one could climb the defer ladder twice.
+   */
+  private recordingClient(run: CycleRun): Pick<AgentChatClient, 'decisions'> {
+    const decisions = this.client.decisions
+    return {
+      decisions: {
+        record: async (conversationId, options) => {
+          this.recordsInFlight.add(conversationId)
+          try {
+            return await decisions.record(conversationId, options)
+          } finally {
+            this.recordsInFlight.delete(conversationId)
+            if (run.stale()) this.afterTurnEnded() // a card held for it is read again
+          }
+        },
+      },
+    }
+  }
+
   /** The runtime's model call, bounded by `gateCallTimeoutMs` (and the cycle's own abandonment). */
   private boundedModelCall(run: CycleRun): GateModelCall {
     return (prompt) =>
@@ -721,12 +751,14 @@ export class ReceiveLoop {
           return
         }
         run.signal.addEventListener('abort', abort, { once: true })
-        const timer = this._setTimeout(() => {
-          run.signal.removeEventListener('abort', abort)
-          controller.abort()
-          reject(new Error(`no answer within ${this.gateCallTimeoutMs} ms`))
-        }, this.gateCallTimeoutMs)
-        ;(timer as { unref?: () => void }).unref?.()
+        const timer = Number.isFinite(this.gateCallTimeoutMs)
+          ? this._setTimeout(() => {
+              run.signal.removeEventListener('abort', abort)
+              controller.abort()
+              reject(new Error(`no answer within ${this.gateCallTimeoutMs} ms`))
+            }, this.gateCallTimeoutMs)
+          : null
+        if (timer !== null) (timer as { unref?: () => void }).unref?.()
         let call: Promise<string>
         try {
           call = Promise.resolve(this.options.callModel!(prompt, { signal: controller.signal }))
@@ -735,12 +767,12 @@ export class ReceiveLoop {
         }
         call.then(
           (text) => {
-            this._clearTimeout(timer)
+            if (timer !== null) this._clearTimeout(timer)
             run.signal.removeEventListener('abort', abort)
             resolve(text)
           },
           (err: unknown) => {
-            this._clearTimeout(timer)
+            if (timer !== null) this._clearTimeout(timer)
             run.signal.removeEventListener('abort', abort)
             reject(err)
           },
@@ -781,7 +813,10 @@ export class ReceiveLoop {
     if (tray === null) return this.summary('tray_failed', { failure: this.lastError })
     const cards = cardsOf(tray)
     const invites = trayInvites(tray)
-    const unheld = this.tracker.withoutRunning(cards)
+    // Held out of this gate: a running or waiting turn, or a verdict still
+    // being recorded (an abandoned cycle's last call): gating it again could
+    // record the same verdict twice (a second defer climbs the ladder).
+    const unheld = this.tracker.withoutRunning(cards).filter((card) => !this.recordsInFlight.has(card.conversation_id))
     const heldByTurns = cards.length - unheld.length
     if (heldByTurns > 0) this.heldWhileRunning = true
     const gateCards = unheld.filter((card) => !this.pacer.held(`conversation:${card.conversation_id}`, anchorFrom(card)))
@@ -819,8 +854,9 @@ export class ReceiveLoop {
       const result = await runGate({
         tray: { ...tray, conversations: gateCards },
         callModel: this.boundedModelCall(run),
-        client: this.client,
+        client: this.recordingClient(run),
         texts,
+        signal: run.signal,
         ...(this.options.toolNamer ? { toolNamer: this.options.toolNamer } : {}),
       })
       for (const verdict of result.verdicts) tally[verdict.decision] += 1
@@ -936,8 +972,8 @@ export class ReceiveLoop {
       ? { status: 'completed', agentchatCalls: null }
       : { status: 'failed', ...(end.detail !== undefined ? { detail: end.detail } : {}) }
     for (const invite of invites) {
-      // A run reports no call counts: the single-run invite rule applies.
-      await this.settleInvite(invite, turn, fresh, { requireKnownCalls: false })
+      // A run reports no call counts: the single-run invite rule applies, paced.
+      await this.concludeInvite(invite, turn, fresh, { requireKnownCalls: false, paced: true })
     }
   }
 
@@ -1097,27 +1133,46 @@ export class ReceiveLoop {
   private async recordInviteOutcome(handle: TurnHandle, invite: TrayInvite, end: TurnEnd): Promise<void> {
     const fresh = await this.readTray()
     if (!this.tracker.holds(handle)) return
-    await this.settleInvite(invite, end, fresh)
+    await this.concludeInvite(invite, end, fresh)
   }
 
   /** The D5 rule for one invite after a turn or a run, and the one call it asks for. */
-  private async settleInvite(
+  private async concludeInvite(
     invite: TrayInvite,
     end: TurnEnd,
     fresh: InboxTray | null,
-    rule: { requireKnownCalls?: boolean } = {},
+    rule: { requireKnownCalls?: boolean; paced?: boolean } = {},
   ): Promise<void> {
     const key = `invite|${invite.invite_id}`
     const silentBefore = this.silent.get(key) ?? 0
-    const outcome = inviteOutcome({ turn: end, invite, freshTray: fresh, silentBefore, ...rule })
+    let outcome = inviteOutcome({
+      turn: end,
+      invite,
+      freshTray: fresh,
+      silentBefore,
+      ...(rule.requireKnownCalls !== undefined ? { requireKnownCalls: rule.requireKnownCalls } : {}),
+    })
+    // D5 paces both modes: in single-run mode the run that would dismiss
+    // counts only when it ended at least paceMs after the first counted one.
+    const countedAt = this.silentAt.get(key)
+    if (rule.paced && outcome.reason === 'silent_again' && countedAt !== undefined && this.now() - countedAt < this.paceMs) {
+      outcome = { action: 'none', reason: 'silent_paced', inviteId: invite.invite_id }
+    }
     this.count(`invite_${outcome.reason}`)
-    if (outcome.reason === 'silent_first') this.remember(key, silentBefore + 1)
-    if (outcome.reason === 'invite_answered') this.silent.delete(key)
+    if (outcome.reason === 'silent_first') {
+      this.remember(key, silentBefore + 1)
+      this.silentAt.set(key, this.now())
+    }
+    if (outcome.reason === 'invite_answered') {
+      this.silent.delete(key)
+      this.silentAt.delete(key)
+    }
     let recorded = false
     if (outcome.action !== 'none') {
       try {
         recorded = await applyInviteOutcome(this.client, outcome)
         this.silent.delete(key)
+        this.silentAt.delete(key)
       } catch (err) {
         this.counts.outcomeRecordFailures += 1
         this.fail(err)
@@ -1157,6 +1212,7 @@ export class ReceiveLoop {
       const oldest = this.silent.keys().next().value
       if (oldest === undefined) break
       this.silent.delete(oldest)
+      this.silentAt.delete(oldest)
     }
   }
 
@@ -1211,8 +1267,12 @@ export function replyPrompt(texts: Pick<Texts, 'wake_instruction'>, conversation
   return `${texts.wake_instruction.trim()}\n\nconversation_id: ${conversationId}`
 }
 
-function positive(value: number | undefined, fallback: number): number {
-  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : fallback
+/** A timeout option: undefined → the default, 0 → disabled (Infinity), a positive number → itself. */
+function timeoutOption(value: number | undefined, fallback: number, name: string): number {
+  if (value === undefined) return fallback
+  if (value === 0) return Number.POSITIVE_INFINITY
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new RangeError(`ReceiveLoop: ${name} must be 0 (off) or a positive number`)
+  return value
 }
 
 function launchKey(launch: Launch): 'turnsStarted' | 'turnsRefused' | 'turnsQueued' {

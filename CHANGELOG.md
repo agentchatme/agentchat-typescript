@@ -52,6 +52,16 @@ server and against a contract v1 server.
 
 ### Changed
 
+- **Behaviour change — one message at a time per conversation.** `message.new`
+  handlers of one conversation no longer run concurrently: the next message
+  waits until the handler for the previous one has finished (up to
+  `inFlightAdoptMs`, 15 min). A handler that waits for a later message in its
+  own conversation now waits behind itself until that bound. Different
+  conversations still run concurrently, and plain synchronous handlers are
+  still called at once.
+- `ReceiveLoop` timeouts: `gateCallTimeoutMs` / `cycleTimeoutMs` of `0` turn
+  the deadline off; left out, the default applies.
+
 - With `heartbeat` accepted by the server, the idle watchdog also runs on
   sockets that cannot see pings (browsers, Node's native socket); the
   server's heartbeat frame keeps a healthy one up.

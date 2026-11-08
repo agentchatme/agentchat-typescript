@@ -90,14 +90,21 @@ describe('capabilities', () => {
     expect(bare.ackNegotiated).toBe(false)
     expect(MockWebSocket.instances).toHaveLength(1)
 
-    // The first message handler arrives late: one quiet reconnect, and the next HELLO offers acks.
+    // The first message handler arrives late: the socket is closed politely
+    // and still read until it has closed; then one quiet reconnect, and the
+    // next HELLO offers acks.
     const seen: string[] = []
     bare.on('message.new', (m) => {
       seen.push(String(m.payload.id))
     })
     await settle()
-    expect(MockWebSocket.instances).toHaveLength(2)
     expect(first.closed).toEqual({ code: 1000, reason: 'client reconnects to negotiate delivery acks' })
+    expect(MockWebSocket.instances).toHaveLength(1)
+    first.readyState = 1 // still open until the server answers the close
+    first.simulateMessage({ type: 'message.new', payload: { id: 'late1', conversation_id: 'c', seq: 1 } })
+    expect(seen).toEqual(['late1']) // frames are still read while it closes
+    first.simulateClose(1000, 'client reconnects to negotiate delivery acks', true)
+    expect(MockWebSocket.instances).toHaveLength(2)
     const second = MockWebSocket.latest()
     second.simulateOpen()
     expect(JSON.parse(second.sent[0]!)).toMatchObject({ capabilities: ['ack', 'heartbeat'] })
@@ -496,8 +503,9 @@ describe('backpressure (maxQueuedMessages)', () => {
     expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['n1'])
     releases.shift()!()
     await settle()
-    expect(MockWebSocket.instances).toHaveLength(2)
     expect(ws.closed).toEqual({ code: 1000, reason: 'client reconnects to fetch messages it left with the server' })
+    ws.simulateClose(1000, 'client reconnects to fetch messages it left with the server', true)
+    expect(MockWebSocket.instances).toHaveLength(2)
     rt.disconnect()
   })
 })

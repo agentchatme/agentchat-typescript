@@ -172,6 +172,8 @@ export type InviteOutcomeReason =
   | 'silent_first'
   /** Looked again, but the call count cannot confirm the tools worked: nothing recorded. */
   | 'silent_unconfirmed'
+  /** Single-run mode (the loop's call): a second ignoring run inside the pacing window does not count. */
+  | 'silent_paced'
   | 'silent_again'
 
 export type InviteOutcome =

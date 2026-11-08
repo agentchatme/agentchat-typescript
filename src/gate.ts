@@ -394,6 +394,13 @@ export interface RunGateOptions {
   texts?: GateTexts | null
   /** How this runtime spells the hosted tools named inside the question. */
   toolNamer?: ToolNamer
+  /**
+   * Stops the gate: once aborted, no further verdict is recorded and no reply
+   * is handed back (the cards not yet recorded count as undecided). The
+   * model call gets it too. The `ReceiveLoop` passes its cycle's signal, so
+   * an abandoned cycle records nothing more.
+   */
+  signal?: AbortSignal
 }
 
 export type GateOutcome =
@@ -463,11 +470,13 @@ export async function run(options: RunGateOptions): Promise<GateResult> {
   } catch (err) {
     return emptyResult('fail_closed', ids, describe(err))
   }
+  if (options.signal?.aborted) return emptyResult('fail_closed', ids, 'the gate was stopped')
   try {
-    text = await options.callModel(prompt)
+    text = options.signal ? await options.callModel(prompt, { signal: options.signal }) : await options.callModel(prompt)
   } catch (err) {
     return emptyResult('fail_closed', ids, `model call failed: ${describe(err)}`)
   }
+  if (options.signal?.aborted) return emptyResult('fail_closed', ids, 'the gate was stopped')
 
   const verdicts = parseVerdicts(text, options.tray)
   if (verdicts === null || verdicts.length === 0) {
@@ -482,6 +491,11 @@ export async function run(options: RunGateOptions): Promise<GateResult> {
   for (const verdict of verdicts) {
     const card = byId.get(verdict.conversation_id)
     if (!card) continue // unreachable: parseVerdicts only keeps ids on the tray
+    if (options.signal?.aborted) {
+      // Stopped: nothing more is recorded or handed back; the rest stay on the tray.
+      decided.delete(verdict.conversation_id)
+      continue
+    }
     if (verdict.decision === 'reply') {
       reply.push(deferredReply(options.client, card, verdict.category))
       continue
@@ -498,6 +512,10 @@ export async function run(options: RunGateOptions): Promise<GateResult> {
     }
   }
 
+  if (options.signal?.aborted) {
+    reply.length = 0
+    for (const v of verdicts) if (v.decision === 'reply') decided.delete(v.conversation_id)
+  }
   return {
     outcome: 'decided',
     reply,

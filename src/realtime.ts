@@ -511,7 +511,8 @@ function toError(reason: unknown, context: string): Error {
 interface InFlight {
   promise: Promise<boolean>
   generation: number
-  startedAt: number
+  /** When its lane started the handlers; null while it still waits in the lane. */
+  startedAt: number | null
   settled: boolean
   ok: boolean
 }
@@ -593,7 +594,7 @@ export class RealtimeClient {
   private offeredThisHello: SocketCapability[] = []
   private helloSent = false
   // The current socket is being closed for a quiet reconnect (maybeRenegotiateAck, jobDone).
-  private quietReconnect = false
+  private quietReconnect: 'renegotiate' | 'refetch' | null = null
   // The current socket's upgrade was answered with an HTTP status instead of
   // 101 (Node `ws` only; a browser-shaped socket cannot see it): ordinary backoff.
   private upgradeRejection: { status: number } | null = null
@@ -1217,7 +1218,7 @@ export class RealtimeClient {
     const duringHandshake = !this.authenticated
     const rejection = this.upgradeRejection
     const quietReconnect = this.quietReconnect
-    this.quietReconnect = false
+    this.quietReconnect = null
     this.upgradeRejection = null
     this.negotiated = new Set()
     this.clearWatchdogs()
@@ -1225,7 +1226,7 @@ export class RealtimeClient {
     // must not clear the backoff counter — that is the whole point of the
     // stability window.
     this.cancelStabilityTimer()
-    if (!quietReconnect) this.noteConnectionEnded()
+    if (quietReconnect === null) this.noteConnectionEnded()
     this.authenticated = false
     this.ackMode = false
 
@@ -1242,7 +1243,11 @@ export class RealtimeClient {
     // the next drain. That includes REST drain rows: the drain's cursor
     // covers only rows that reached a handler, so a parked row dropped
     // here stops the cursor instead of being acked.
-    if (this.options.ackOnReceipt || quietReconnect) this.flushParkedFrames('connection_closed')
+    // A renegotiation closes a socket the server marked on send: its parked
+    // frames will not be re-offered, so they are handed over too. A
+    // backpressure refetch keeps the default rule (unacked parked frames come
+    // back in order from the server).
+    if (this.options.ackOnReceipt || quietReconnect === 'renegotiate') this.flushParkedFrames('connection_closed')
 
     // Drop all per-conversation ordering state. Across the connection
     // break the application is responsible for calling /sync (or
@@ -1258,7 +1263,7 @@ export class RealtimeClient {
 
     // A quiet reconnect (to negotiate acks, or to have the server re-offer
     // what backpressure left with it): straight back, no backoff step, no notice.
-    if (quietReconnect) {
+    if (quietReconnect !== null) {
       this.retryNow()
       return
     }
@@ -1765,7 +1770,11 @@ export class RealtimeClient {
     const running = messageId !== null ? this.inFlight.get(messageId) : undefined
     const first =
       running !== undefined &&
-      (running.generation === this.generation || Date.now() - running.startedAt < this.options.inFlightAdoptMs)
+      (running.generation === this.generation ||
+        // Still waiting in its lane: always the one to take; running: only
+        // within the bound, counted from when the handler started.
+        running.startedAt === null ||
+        Date.now() - running.startedAt < this.options.inFlightAdoptMs)
         ? running
         : undefined
     const handlers = this.handlers.get('message.new')
@@ -1796,11 +1805,14 @@ export class RealtimeClient {
       const entry: InFlight = {
         promise: Promise.resolve(false),
         generation: this.generation,
-        startedAt: Date.now(),
+        startedAt: null,
         settled: false,
         ok: false,
       }
-      const handled = this.runInLane(this.laneOf(message), () => this.invokeMessageHandlers(message, snapshot))
+      const handled = this.runInLane(this.laneOf(message), () => {
+        entry.startedAt = Date.now()
+        return this.invokeMessageHandlers(message, snapshot)
+      })
       const own: Promise<boolean> = handled.then((ok) => {
         // Leave the in-flight map in the same step the outcome is known
         // (and, on success, the id enters the dedup cache): a later copy
@@ -1894,8 +1906,13 @@ export class RealtimeClient {
     return result
   }
 
+  /**
+   * New messages are not taken in: the queue is full, or a shedding episode
+   * is under way (until the queue is back to half — a frame accepted in
+   * between could overtake one left with the server in its conversation).
+   */
   private queueFull(): boolean {
-    return this.queuedJobs >= this.options.maxQueuedMessages
+    return this.shedding || this.queuedJobs >= this.options.maxQueuedMessages
   }
 
   /** The queue is full: messages are left with the server from here (one notice per episode). */
@@ -1923,8 +1940,7 @@ export class RealtimeClient {
       })
     } else if (this.ws !== null && this.authenticated) {
       // No REST client: one quiet reconnect, and the server re-offers its backlog.
-      this.quietReconnect = true
-      this.abandonSocket(1000, 'client reconnects to fetch messages it left with the server')
+      this.closePolitely('refetch', 'client reconnects to fetch messages it left with the server')
     }
   }
 
@@ -2022,9 +2038,24 @@ export class RealtimeClient {
     const ws = this.ws
     queueMicrotask(() => {
       if (this.ws !== ws || this.disposed || !this.hasMessageHandler()) return
-      this.quietReconnect = true
-      this.abandonSocket(1000, 'client reconnects to negotiate delivery acks')
+      this.closePolitely('renegotiate', 'client reconnects to negotiate delivery acks')
     })
+  }
+
+  /**
+   * A quiet reconnect: close the socket politely and keep reading its frames
+   * until it has closed; the close then reconnects at once (no backoff step,
+   * no notice). Its liveness watchdog still ends a pipe that never answers.
+   */
+  private closePolitely(kind: 'renegotiate' | 'refetch', reason: string): void {
+    const ws = this.ws
+    if (ws === null || this.quietReconnect !== null) return
+    this.quietReconnect = kind
+    try {
+      ws.close(1000, reason)
+    } catch {
+      // already closing: its close event takes the same path
+    }
   }
 
   /** A `message.new` handler is attached: only then has this machine received a message. */
@@ -2258,13 +2289,8 @@ export class RealtimeClient {
       return
     }
 
-    // Backpressure: with the handlers this far behind the fetched rows are
-    // not taken in (not acked, not dispatched); the gap resolves as a failed
-    // fill and the rows are fetched again once the queue drains.
-    if (this.queueFull()) {
-      this.startShedding()
-      fetched = []
-    }
+    // Gap-fill rows are never shed: they close a gap in front of frames
+    // already taken in, which would otherwise be handed over without them.
 
     // Insert fetched rows into the buffer (skip anything below our cursor —
     // shouldn't happen but defensive against server-side filtering changes).

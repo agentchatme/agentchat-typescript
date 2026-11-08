@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { ReceiveLoop, type ReceiveLoopEvent, type RunRequest, type TurnAdmission, type TurnRequest } from '../../src/integration/receive-loop.js'
 import type { TurnEnd } from '../../src/integration/outcome.js'
+import { TurnTracker } from '../../src/integration/turn-tracker.js'
 import type { InboxCard, InboxTray, ReplyDecision, Texts, TrayInvite } from '../../src/types/index.js'
 import { MockWebSocket, MockWebSocketCtor, sentFrames } from '../helpers/mock-websocket.js'
 import { json } from './fixtures.js'
@@ -180,7 +181,7 @@ describe('ReceiveLoop — gate-call mode', () => {
     const { client, state, record } = fakeClient()
     state.tray = trayOf([DIRECT])
     const t = turns()
-    const { loop } = gateLoop({ client, callModel: answer([{ conversation_id: DIRECT.conversation_id, decision: 'reply' }]), startTurn: t.startTurn })
+    const { loop } = gateLoop({ client, callModel: answer([{ conversation_id: DIRECT.conversation_id, decision: 'reply' }]), startTurn: t.startTurn, paceMs: 0 })
     await loop.start()
     loop.wake()
     await until(() => t.started.length === 1)
@@ -221,7 +222,7 @@ describe('ReceiveLoop — gate-call mode', () => {
     const t = turns()
     const callModel = vi.fn(answer([]))
     const startInviteTurn = vi.fn(t.startTurn)
-    const { loop } = gateLoop({ client, callModel, startTurn: async () => ({ started: false }), startInviteTurn })
+    const { loop } = gateLoop({ client, callModel, startTurn: async () => ({ started: false }), startInviteTurn, paceMs: 0 })
     await loop.start()
     loop.wake()
     await until(() => t.started.length === 1)
@@ -348,7 +349,7 @@ describe('ReceiveLoop — the socket', () => {
       callModel: answer([]),
       startTurn: async () => ({ started: false }),
       socket: { apiKey: 'ac_key', webSocket: MockWebSocketCtor },
-      handle: '@Relay-Bot',
+      handle: '@Example-Relay',
       quietMs: 0,
       maxMs: 0,
       onEvent: (e) => events.push(e),
@@ -363,11 +364,11 @@ describe('ReceiveLoop — the socket', () => {
     expect(loop.status().socket).toEqual({ state: 'ready', ackNegotiated: true, capabilities: ['ack', 'heartbeat', 'rewake'] })
 
     const frame = (id: string, sender: string) => ({ type: 'message.new', payload: { id, conversation_id: 'conv_x', sender, seq: Number(id.slice(-1)) } })
-    ws.simulateMessage(frame('msg_own1', 'relay-bot'))
+    ws.simulateMessage(frame('msg_own1', 'example-relay'))
     await idle()
     expect(events.filter((e) => e.type === 'echo')).toHaveLength(1)
     expect(loop.status().coalescer.cycles).toBe(1)
-    ws.simulateMessage(frame('msg_peer2', '@nova-scout'))
+    ws.simulateMessage(frame('msg_peer2', '@example-scout'))
     await until(() => loop.status().coalescer.cycles === 2, 'a message wake')
     ws.simulateMessage(json('wake-frame.unanswered.json'))
     await until(() => loop.status().coalescer.cycles === 3, 'a wake-frame wake')
@@ -387,7 +388,7 @@ describe('ReceiveLoop — the socket', () => {
 
   it('learns its own handle from the tray when none is given', async () => {
     const { client, state } = fakeClient()
-    state.tray = trayOf([], { you: '@relay-bot' })
+    state.tray = trayOf([], { you: '@example-relay' })
     const loop = new ReceiveLoop({
       mode: 'singleRun',
       client,
@@ -400,7 +401,7 @@ describe('ReceiveLoop — the socket', () => {
     expect(loop.status().handle).toBeNull()
     loop.wake()
     await until(() => loop.status().lastCycle !== null)
-    expect(loop.status().handle).toBe('relay-bot')
+    expect(loop.status().handle).toBe('example-relay')
     await loop.stop()
   })
 })
@@ -559,6 +560,219 @@ describe('conformance — single-run invites (turn-outcome.cases.json)', () => {
     const dismissals = c.expect.filter((e) => e.action === 'dismiss_invite').length
     expect(dismissInvite).toHaveBeenCalledTimes(dismissals)
     expect(record).not.toHaveBeenCalled() // cards: the run's own verdicts only
+    await loop.stop()
+  })
+})
+
+// ─── turn slots, pacing, the truncated-tray backoff, after stop ────────────
+
+describe('ReceiveLoop — turn slots (maxConcurrentTurns)', () => {
+  const OPS = sample.conversations[2]! // owes a reply too
+
+  it('one turn at a time by default: the rest wait, held out of the gate, and start when a slot frees', async () => {
+    const { client, state } = fakeClient()
+    state.tray = trayOf([DIRECT, OPS])
+    const t = turns()
+    const callModel = vi.fn(
+      answer([
+        { conversation_id: DIRECT.conversation_id, decision: 'reply' },
+        { conversation_id: OPS.conversation_id, decision: 'reply' },
+      ]),
+    )
+    const { loop } = gateLoop({ client, callModel, startTurn: t.startTurn })
+    loop.wake()
+    await until(() => loop.status().lastCycle !== null)
+    expect(t.started.map((r) => (r as { conversationId: string }).conversationId)).toEqual([DIRECT.conversation_id])
+    expect(loop.status().lastCycle).toMatchObject({ turnsStarted: 1, turnsQueued: 1 })
+    expect(loop.status().counters).toMatchObject({ turnsActive: 1, turnsWaiting: 1 })
+    // Another wake: both cards are held (running or waiting): no second model call decides them.
+    loop.wake()
+    await until(() => loop.status().coalescer.cycles === 2)
+    await idle()
+    expect(callModel).toHaveBeenCalledTimes(1)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'nothing_owed', heldByTurns: 2 })
+    // The first ends: the waiting one starts.
+    t.ends[0]!({ status: 'failed', detail: 'x' })
+    await until(() => t.started.length === 2, 'the queued turn')
+    expect((t.started[1] as { conversationId: string }).conversationId).toBe(OPS.conversation_id)
+    expect(loop.status().counters).toMatchObject({ turnsActive: 1, turnsWaiting: 0 })
+    await loop.stop()
+  })
+
+  it('stop() drops waiting turns; maxConcurrentTurns must be an integer >= 1', async () => {
+    const { client, state } = fakeClient()
+    state.tray = trayOf([DIRECT, OPS])
+    const t = turns()
+    const { loop } = gateLoop({
+      client,
+      callModel: answer([
+        { conversation_id: DIRECT.conversation_id, decision: 'reply' },
+        { conversation_id: OPS.conversation_id, decision: 'reply' },
+      ]),
+      startTurn: t.startTurn,
+    })
+    loop.wake()
+    await until(() => loop.status().counters.turnsWaiting === 1)
+    const stopping = loop.stop()
+    expect(loop.status().counters.turnsWaiting).toBe(0)
+    expect(loop.status().turns.map((x) => (x as { conversationId?: string }).conversationId)).toEqual([DIRECT.conversation_id])
+    t.ends[0]!({ status: 'failed' })
+    await stopping
+    expect(t.started).toHaveLength(1)
+    expect(() => gateLoop({ client, maxConcurrentTurns: 0 })).toThrow(RangeError)
+  })
+
+  it('maxConcurrentTurns: 2 runs two at once', async () => {
+    const { client, state } = fakeClient()
+    state.tray = trayOf([DIRECT, OPS])
+    const t = turns()
+    const { loop } = gateLoop({
+      client,
+      maxConcurrentTurns: 2,
+      callModel: answer([
+        { conversation_id: DIRECT.conversation_id, decision: 'reply' },
+        { conversation_id: OPS.conversation_id, decision: 'reply' },
+      ]),
+      startTurn: t.startTurn,
+    })
+    loop.wake()
+    await until(() => t.started.length === 2)
+    expect(loop.status().counters).toMatchObject({ turnsActive: 2, turnsWaiting: 0 })
+    await loop.stop()
+  })
+
+  it('a shared tracker: a turn another loop runs keeps its card out of this gate', async () => {
+    const { client, state } = fakeClient()
+    state.tray = trayOf([DIRECT, CREW])
+    const tracker = new TurnTracker()
+    tracker.begin({ kind: 'reply', conversationId: DIRECT.conversation_id, anchor: 'msg_nova0first00001a' })
+    const callModel = vi.fn(answer([{ conversation_id: CREW.conversation_id, decision: 'dismiss' }]))
+    const { loop } = gateLoop({ client, callModel, tracker })
+    loop.wake()
+    await until(() => loop.status().lastCycle !== null)
+    expect(callModel.mock.calls[0]![0]).not.toContain(DIRECT.conversation_id)
+    expect(loop.status().lastCycle).toMatchObject({ heldByTurns: 1 })
+    await loop.stop()
+  })
+})
+
+describe('ReceiveLoop — D5 pacing', () => {
+  it('after a silent turn the card is not gated again at that anchor; a newer message lifts it', async () => {
+    const { client, state } = fakeClient()
+    state.tray = trayOf([DIRECT])
+    const t = turns()
+    const callModel = vi.fn(answer([{ conversation_id: DIRECT.conversation_id, decision: 'reply' }]))
+    const { loop } = gateLoop({ client, callModel, startTurn: t.startTurn })
+    loop.wake()
+    await until(() => t.started.length === 1)
+    t.ends[0]!({ status: 'completed', agentchatCalls: { made: 2, failed: 0 } })
+    await until(() => loop.status().counters.outcomes.silent_first === 1)
+    loop.wake()
+    await until(() => loop.status().coalescer.cycles === 2)
+    await idle()
+    expect(callModel).toHaveBeenCalledTimes(1)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'nothing_owed', paced: 1 })
+    // A newer message moves the anchor: gated again.
+    state.tray = trayOf([{ ...DIRECT, preview: { ...DIRECT.preview!, message_id: 'msg_newer0000001' }, last_message_id: 'msg_newer0000001' }])
+    loop.wake()
+    await until(() => callModel.mock.calls.length === 2, 'the gate after a newer message')
+    await loop.stop()
+  })
+
+  it('an unanswered wake that names the conversation lifts its pacing, and lifts every invite pacing', async () => {
+    const { client, state } = fakeClient()
+    state.tray = trayOf([DIRECT], { invites: [INVITE] })
+    const t = turns()
+    const callModel = vi.fn(answer([{ conversation_id: DIRECT.conversation_id, decision: 'reply' }]))
+    const events: ReceiveLoopEvent[] = []
+    const loop = new ReceiveLoop({
+      mode: 'gateCall',
+      client,
+      texts: textsSource(),
+      callModel,
+      startTurn: t.startTurn,
+      maxConcurrentTurns: 2,
+      socket: { apiKey: 'k', webSocket: MockWebSocketCtor },
+      quietMs: 0,
+      maxMs: 0,
+      onEvent: (e) => events.push(e),
+    })
+    await loop.start()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage(json('hello-ok.v1.json'))
+    await until(() => t.started.length === 2, 'a reply turn and an invite turn')
+    t.ends[0]!({ status: 'completed', agentchatCalls: null })
+    t.ends[1]!({ status: 'completed', agentchatCalls: null })
+    await until(() => loop.status().counters.outcomes.silent_first === 1 && loop.status().counters.outcomes.invite_silent_first === 1)
+    const cycles = loop.status().coalescer.cycles
+    ws.simulateMessage({ type: 'message.new', payload: { id: 'msg_x9', conversation_id: 'conv_other', sender: '@example-quill', seq: 9 } })
+    await until(() => loop.status().coalescer.cycles > cycles)
+    await idle()
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'nothing_owed', paced: 2 })
+    ws.simulateMessage({
+      type: 'wake',
+      payload: { reason: 'unanswered', conversation_ids: [DIRECT.conversation_id], step: 1, at: '2026-11-08T09:01:00.000Z' },
+    })
+    await until(() => t.started.length === 4, 'both again after the unanswered wake')
+    const wake = events.find((e) => e.type === 'wake' && e.source === 'wake_frame')
+    expect(wake).toMatchObject({ reason: 'unanswered', conversationIds: [DIRECT.conversation_id] })
+    await loop.stop()
+  })
+})
+
+describe('ReceiveLoop — a truncated tray that cannot progress does not spin', () => {
+  it('no verdict recorded and no turn started: the self-wake backs off instead of re-gating at once', async () => {
+    const { client, state, record } = fakeClient()
+    state.tray = trayOf([CREW], { truncated: true })
+    record.mockImplementation(async () => {
+      throw new Error('500')
+    })
+    const callModel = vi.fn(answer([{ conversation_id: CREW.conversation_id, decision: 'dismiss' }]))
+    const { loop } = gateLoop({ client, callModel })
+    loop.wake()
+    await new Promise((r) => setTimeout(r, 200))
+    expect(callModel).toHaveBeenCalledTimes(1)
+    await new Promise((r) => setTimeout(r, 1_000))
+    expect(callModel).toHaveBeenCalledTimes(2) // after the first backoff step (1 s)
+    await new Promise((r) => setTimeout(r, 1_300))
+    expect(callModel).toHaveBeenCalledTimes(2) // the next step is 2 s
+    await loop.stop()
+  })
+})
+
+describe('ReceiveLoop — after stop, and what it reports', () => {
+  it('a turn that ends after stop() still has its outcome recorded', async () => {
+    const { client, state, record } = fakeClient()
+    state.tray = trayOf([DIRECT])
+    const t = turns()
+    const { loop } = gateLoop({ client, callModel: answer([{ conversation_id: DIRECT.conversation_id, decision: 'reply' }]), startTurn: t.startTurn })
+    loop.wake()
+    await until(() => t.started.length === 1)
+    await loop.stop()
+    state.tray = trayOf([{ ...DIRECT, you_owe_reply: false, your_last_message_at: '2026-11-08T09:11:30.000Z' }])
+    t.ends[0]!({ status: 'completed', agentchatCalls: { made: 3, failed: 0 } })
+    await until(() => record.mock.calls.length === 1, 'the reply after stop')
+    expect(record.mock.calls[0]![1]).toMatchObject({ decision: 'reply', throughMessageId: 'msg_nova0first00001a' })
+  })
+
+  it('asks the server for invites on every tray read, and marks a turn running past 30 minutes', async () => {
+    const { client, state, tray } = fakeClient()
+    state.tray = trayOf([DIRECT])
+    let clock = Date.parse('2026-11-08T09:00:00.000Z')
+    const t = turns()
+    const { loop } = gateLoop({
+      client,
+      callModel: answer([{ conversation_id: DIRECT.conversation_id, decision: 'reply' }]),
+      startTurn: t.startTurn,
+      now: () => clock,
+    })
+    loop.wake()
+    await until(() => t.started.length === 1)
+    expect(tray.mock.calls[0]).toEqual([{ waitMs: 0, limit: 50, includeInvites: true }])
+    expect(loop.status().turns[0]).toMatchObject({ overdue: false })
+    clock += 31 * 60_000
+    expect(loop.status().turns[0]).toMatchObject({ overdue: true })
     await loop.stop()
   })
 })

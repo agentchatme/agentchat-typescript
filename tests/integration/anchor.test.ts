@@ -80,6 +80,6 @@ describe('conformance — anchor.cases.json', () => {
     const c = doc.render[0]!
     const block = anchor.render(c.texts, c.handle)
     const found = anchor.find(anchor.replace('# notes\n', block))
-    expect(found).toMatchObject({ handle: 'relay-bot', marked: true, legacy: false, body: c.texts.identity_line })
+    expect(found).toMatchObject({ handle: 'example-relay', marked: true, legacy: false, body: c.texts.identity_line })
   })
 })

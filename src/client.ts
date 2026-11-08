@@ -74,6 +74,22 @@ function intHeader(headers: Headers | undefined, name: string): number | null {
   return Number(raw.trim())
 }
 
+function staticTransport(options: StaticCallOptions | undefined): HttpTransport {
+  return new HttpTransport({
+    baseUrl: options?.baseUrl ?? DEFAULT_BASE_URL,
+    defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
+    ...(options?.fetch ? { fetch: options.fetch } : {}),
+    ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+  })
+}
+
+function staticRequest(options: StaticCallOptions | undefined): Pick<HttpRequestOptions, 'signal' | 'timeoutMs'> {
+  return {
+    ...(options?.signal ? { signal: options.signal } : {}),
+    ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+  }
+}
+
 function generateClientMsgId(): string {
   // Web Crypto API — supported in Node 14.17+, every modern browser, Deno,
   // Bun, and every major edge runtime. Fallback handles exotic environments.
@@ -144,13 +160,27 @@ export interface AgentChatClientOptions {
   fetch?: typeof fetch
 }
 
-interface RegisterOptions {
+/**
+ * What the static, unauthenticated calls (`register`, `verify`, `recover`,
+ * `recoverVerify`) accept besides their own fields, as the rest of the client
+ * does: a `fetch` override, a request timeout and an abort signal. None of
+ * them is ever retried (a second OTP would be sent).
+ */
+export interface StaticCallOptions {
+  baseUrl?: string
+  clientIdentity?: AgentChatClientIdentity
+  /** `fetch` override (tests, polyfills). Also used by the client `verify` / `recoverVerify` return. */
+  fetch?: typeof fetch
+  /** Request timeout in ms. Default 30 s. */
+  timeoutMs?: number
+  signal?: AbortSignal
+}
+
+interface RegisterOptions extends StaticCallOptions {
   email: string
   handle: string
   display_name?: string
   description?: string
-  baseUrl?: string
-  clientIdentity?: AgentChatClientIdentity
 }
 
 interface RegisterResult {
@@ -164,7 +194,7 @@ interface VerifyResult {
 }
 
 /** Options for `AgentChatClient.recover()`. */
-export interface RecoverOptions {
+export interface RecoverOptions extends StaticCallOptions {
   /**
    * Handle of the agent to recover. **Required when the email backs more
    * than one agent; always pass it.** Optional here only for backward
@@ -173,8 +203,6 @@ export interface RecoverOptions {
    * `HandleRequiredError` otherwise.
    */
   handle?: string
-  baseUrl?: string
-  clientIdentity?: AgentChatClientIdentity
 }
 
 /**
@@ -503,6 +531,7 @@ export class AgentChatClient {
     const waitMs = options?.waitMs ?? 0
     if (waitMs > 0) params.set('wait_ms', String(waitMs))
     if (options?.limit !== undefined) params.set('limit', String(options.limit))
+    if (options?.includeInvites === true) params.set('invites', '1')
     const qs = params.toString()
     // A long-poll must not be cut off by the transport's default timeout
     // (30 s) while the server is still legitimately holding the request.
@@ -588,7 +617,7 @@ export class AgentChatClient {
     opts?: CallOptions,
   ): Promise<T> {
     const res = await this.http.request<T>('POST', path, {
-      ...this.toRequestOpts(opts),
+      ...this.toRequestOpts(opts, { idempotent: false }),
       body,
     })
     return res.data
@@ -600,7 +629,7 @@ export class AgentChatClient {
     opts?: CallOptions,
   ): Promise<T> {
     const res = await this.http.request<T>('PATCH', path, {
-      ...this.toRequestOpts(opts),
+      ...this.toRequestOpts(opts, { idempotent: false }),
       body,
     })
     return res.data
@@ -621,12 +650,21 @@ export class AgentChatClient {
     return res.data
   }
 
-  private toRequestOpts(opts?: CallOptions): HttpRequestOptions {
+  /**
+   * Call options for the transport. A per-call `retry` never makes a
+   * non-idempotent request (POST, PATCH) without an Idempotency-Key
+   * retryable: a retried verdict would be recorded twice (a `defer` would
+   * climb the reminder ladder twice). `'never'` always applies.
+   */
+  private toRequestOpts(opts?: CallOptions, kind: { idempotent: boolean } = { idempotent: true }): HttpRequestOptions {
+    const retry = opts?.retry
+    const keyed = typeof opts?.idempotencyKey === 'string' && opts.idempotencyKey.length > 0
+    const applies = retry !== undefined && (retry === 'never' || kind.idempotent || keyed)
     return {
       signal: opts?.signal,
       timeoutMs: opts?.timeoutMs,
       idempotencyKey: opts?.idempotencyKey,
-      ...(opts?.retry !== undefined ? { retry: opts.retry } : {}),
+      ...(applies ? { retry } : {}),
     }
   }
 
@@ -646,10 +684,7 @@ export class AgentChatClient {
    * Both carry the cap in `limit`.
    */
   static async register(options: RegisterOptions): Promise<RegisterResult> {
-    const http = new HttpTransport({
-      baseUrl: options.baseUrl ?? DEFAULT_BASE_URL,
-      defaultHeaders: clientIdentityHeaders(options.clientIdentity),
-    })
+    const http = staticTransport(options)
     const res = await http.request<RegisterResult>('POST', '/v1/register', {
       body: {
         email: options.email,
@@ -658,6 +693,7 @@ export class AgentChatClient {
         description: options.description,
       },
       retry: 'never',
+      ...staticRequest(options),
     })
     return res.data
   }
@@ -671,24 +707,20 @@ export class AgentChatClient {
   static async verify(
     pendingId: string,
     code: string,
-    options?: {
-      baseUrl?: string
-      clientIdentity?: AgentChatClientIdentity
-    },
+    options?: StaticCallOptions,
   ): Promise<{ agent: Record<string, unknown>; apiKey: string; client: AgentChatClient }> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
-    const http = new HttpTransport({
-      baseUrl,
-      defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
-    })
+    const http = staticTransport(options)
     const res = await http.request<VerifyResult>('POST', '/v1/register/verify', {
       body: { pending_id: pendingId, code },
       retry: 'never',
+      ...staticRequest(options),
     })
     const client = new AgentChatClient({
       apiKey: res.data.api_key,
       baseUrl,
       clientIdentity: options?.clientIdentity,
+      ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
     return { agent: res.data.agent, apiKey: res.data.api_key, client }
   }
@@ -708,17 +740,14 @@ export class AgentChatClient {
    * successful return is not proof the pair exists.
    */
   static async recover(email: string, options?: RecoverOptions): Promise<RecoverResult> {
-    const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
-    const http = new HttpTransport({
-      baseUrl,
-      defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
-    })
+    const http = staticTransport(options)
     const res = await http.request<RecoverResult>('POST', '/v1/agents/recover', {
       // `handle: undefined` is dropped by JSON serialization, so a legacy
       // email-only call sends `{ email }` exactly as before — the server's
       // schema marks `handle` optional, not nullable.
       body: { email, handle: options?.handle },
       retry: 'never',
+      ...staticRequest(options),
     })
     return res.data
   }
@@ -735,25 +764,20 @@ export class AgentChatClient {
   static async recoverVerify(
     pendingId: string,
     code: string,
-    options?: {
-      baseUrl?: string
-      clientIdentity?: AgentChatClientIdentity
-    },
+    options?: StaticCallOptions,
   ): Promise<{ handle: string; apiKey: string; client: AgentChatClient }> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
-    const http = new HttpTransport({
-      baseUrl,
-      defaultHeaders: clientIdentityHeaders(options?.clientIdentity),
-    })
+    const http = staticTransport(options)
     const res = await http.request<{ handle: string; api_key: string }>(
       'POST',
       '/v1/agents/recover/verify',
-      { body: { pending_id: pendingId, code }, retry: 'never' },
+      { body: { pending_id: pendingId, code }, retry: 'never', ...staticRequest(options) },
     )
     const client = new AgentChatClient({
       apiKey: res.data.api_key,
       baseUrl,
       clientIdentity: options?.clientIdentity,
+      ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
     return { handle: res.data.handle, apiKey: res.data.api_key, client }
   }

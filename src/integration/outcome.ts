@@ -25,9 +25,9 @@
  * read failed. Here a failed read records nothing (the server's re-wake
  * covers it), "answer went out" is read from `your_last_message_at` moving
  * (clock-free, and true even when the peer has written again since), and a
- * verdict the turn recorded is recognised both by `your_last_decision`
- * changing (clock-free, as both copies did) and by its time against the turn
- * start (D5).
+ * verdict the turn recorded is recognised by `your_last_decision` changing
+ * against the card the gate saw (clock-free, as both copies did; no local
+ * clock is compared with a server time).
  */
 
 import type { InboxCard, InboxTray, ReplyDecisionCategory, TrayInvite } from '../types/index.js'
@@ -83,7 +83,7 @@ export type TurnOutcome =
 
 export interface TurnOutcomeInput {
   turn: TurnEnd
-  /** When the host started the turn (an ISO string, epoch ms or a Date). */
+  /** When the host started the turn (an ISO string, epoch ms or a Date). Informational: the rule compares no clocks. */
   turnStartedAt: string | number | Date
   /** The card the gate saw when it decided `reply`. */
   gateCard: InboxCard
@@ -112,7 +112,7 @@ export function turnOutcome(input: TurnOutcomeInput): TurnOutcome {
   const fresh = cardsOf(tray as InboxTray).find((card) => card.conversation_id === conversationId)
   if (!fresh) return none(tray.truncated === true ? 'card_unknown' : 'card_left_tray')
 
-  if (verdictRecordedSince(input.gateCard, fresh, input.turnStartedAt)) return none('turn_recorded_verdict')
+  if (verdictRecordedSince(input.gateCard, fresh)) return none('turn_recorded_verdict')
 
   const anchor = anchorOf(input.gateCard) ?? null
   if (answerWentOut(input.gateCard, fresh)) {
@@ -224,14 +224,13 @@ function decisionKey(card: InboxCard): string | null {
   return `${String(last.decision)}|${String(last.category ?? '')}|${String(last.at ?? '')}`
 }
 
-/** The fresh card's verdict is not the one the gate saw, or it was recorded at or after the turn start. */
-function verdictRecordedSince(gate: InboxCard, fresh: InboxCard, turnStartedAt: TurnOutcomeInput['turnStartedAt']): boolean {
+/**
+ * The fresh card's verdict is not the one the gate saw. Clock-free: the two
+ * values are the same server field, so no local clock is compared.
+ */
+function verdictRecordedSince(gate: InboxCard, fresh: InboxCard): boolean {
   const now = decisionKey(fresh)
-  if (now === null) return false
-  if (now !== decisionKey(gate)) return true
-  const at = instant(fresh.your_last_decision?.at)
-  const started = instant(turnStartedAt)
-  return at !== null && started !== null && at >= started
+  return now !== null && now !== decisionKey(gate)
 }
 
 /** Your last message moved since the gate's card, or the reply the gate saw owed is no longer owed. */

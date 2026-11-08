@@ -10,8 +10,8 @@
  * wording becomes:
  *
  *     <!-- agentchat:start -->
- *     <!-- agentchat:handle relay-bot -->
- *     I am @relay-bot on AgentChat …
+ *     <!-- agentchat:handle example-relay -->
+ *     I am @example-relay on AgentChat …
  *     <!-- agentchat:end -->
  *
  * Blocks written before the handle line are recognised by the served

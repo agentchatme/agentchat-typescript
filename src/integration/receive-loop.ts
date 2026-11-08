@@ -26,10 +26,28 @@
  * the `ack`, `heartbeat` and `rewake` capabilities: delivered means this
  * machine received the message; only a verdict reads it.
  *
+ * Turns: at most `maxConcurrentTurns` (default 1) reply and invite turns run
+ * at once; the rest wait for a slot, held out of the gate meanwhile (their
+ * cards stay on the tray; nothing is recorded for them; no second model call
+ * decides them again). `stop()` drops the waiting ones. A turn that ends
+ * after `stop()` still has its outcome recorded: what it did is a fact.
+ * `startTurn` / `startRun` must enforce their own deadline (the loop cannot
+ * end a turn); `status()` marks a turn running longer than 30 minutes.
+ *
+ * Pacing (D5): after a silent turn (it looked and did nothing) the same
+ * conversation at the same anchor is not gated again for `paceMs` (60 s)
+ * unless a newer message moves its anchor or an `unanswered` wake names it;
+ * after an invite turn that left the invite pending, no second invite turn
+ * for it within `paceMs` unless an `unanswered` wake arrives (those name no
+ * invites). In memory.
+ *
  * There is no retry ladder here. A cycle that could not finish (the tray
  * could not be read, the model failed, a turn was refused or failed) leaves
  * the cards on the tray and does nothing more: the server re-wakes
- * unanswered cards on its own durable ladder (D3).
+ * unanswered cards on its own durable ladder (D3). The one wake the loop
+ * gives itself is for a truncated tray (read the rest): at once after a cycle
+ * that recorded a verdict or started a turn; otherwise after a backoff
+ * (1 s doubling to 60 s), so a cycle that cannot progress never spins.
  */
 
 import type { AgentChatClient } from '../client.js'
@@ -52,8 +70,15 @@ import { normalizeHandle } from './anchor.js'
 
 /** Largest tray the server builds: the loop always reads all of it. */
 const TRAY_LIMIT = 50
-/** Silent-turn memory (D5 "second time for the same anchor"), bounded. */
+/** Silent-turn and pacing memory, bounded. */
 const SILENT_MEMORY = 1_000
+/** D5 pacing: how long a silent turn's card (or an invite after its turn) is not gated again. */
+export const PACE_MS = 60_000
+/** A running turn older than this is shown as overdue in `status()`. */
+export const TURN_OVERDUE_MS = 30 * 60_000
+/** The truncated-tray self-wake after a cycle that made no progress: 1 s, doubling, at most 60 s. */
+const NO_PROGRESS_BACKOFF_MS = 1_000
+const NO_PROGRESS_BACKOFF_MAX_MS = 60_000
 
 export type ReceiveLoopMode = 'gateCall' | 'singleRun'
 
@@ -86,7 +111,8 @@ export type TurnRequest =
  * Whether the runtime admitted the turn. `done` resolves with what the
  * runtime reports when it ends — `still_running` (with `next` when known) if
  * the integration stopped waiting before the end. It should not reject (a
- * rejection counts as a failed turn).
+ * rejection counts as a failed turn). The runtime enforces the turn's own
+ * deadline; the loop never ends a turn.
  */
 export type TurnAdmission =
   | { readonly started: false; readonly error?: string }
@@ -110,6 +136,7 @@ export interface RunEnd {
   readonly detail?: string
 }
 
+/** Starts the one run and resolves when it ends. Enforce the run's deadline here: the loop never ends a run. */
 export type RunStarter = (request: RunRequest) => Promise<RunEnd>
 
 /** Whether a turn started now could reach AgentChat (e.g. `probeHostedTools`); checked before a cycle spends a model call. */
@@ -132,16 +159,16 @@ export type WakeSource = 'message' | 'wake_frame' | 'connect' | 'invite' | 'exte
 export type CycleOutcome =
   /** The tray had no cards and no invites. */
   | 'empty'
-  /** Cards were there, but only muted ones or ones a running turn holds. */
+  /** Cards were there, but only muted ones, paced ones or ones a turn holds. */
   | 'nothing_owed'
   | 'tray_failed'
   | 'texts_missing'
   | 'tools_unavailable'
-  /** gateCall: the gate decided (turns started for the replies). */
+  /** gateCall: the gate decided (turns started or queued for the replies). */
   | 'decided'
   /** gateCall: the model failed or answered nothing usable; nothing recorded. */
   | 'fail_closed'
-  /** gateCall: only invites were owed; their turns were started. */
+  /** gateCall: only invites were owed; their turns were started or queued. */
   | 'invites_only'
   /** singleRun: the run's end. */
   | 'run_completed'
@@ -158,17 +185,31 @@ export interface CycleSummary {
   readonly dismiss: number
   readonly defer: number
   readonly undecided: number
+  /** `dismiss` / `defer` verdicts the gate recorded. */
+  readonly recorded: number
   readonly recordFailures: number
   readonly turnsStarted: number
   readonly turnsRefused: number
-  /** Cards left out because a turn for their conversation is running. */
+  /** Reply or invite turns waiting for a slot (`maxConcurrentTurns`). */
+  readonly turnsQueued: number
+  /** Cards left out because a turn for their conversation is running or waiting. */
   readonly heldByTurns: number
+  /** Cards and invites left out by D5 pacing (a recent silent turn). */
+  readonly paced: number
   readonly truncated: boolean
   readonly failure: string | null
 }
 
 export type ReceiveLoopEvent =
-  | { readonly type: 'wake'; readonly source: WakeSource; readonly conversationId?: string }
+  | {
+      readonly type: 'wake'
+      readonly source: WakeSource
+      readonly conversationId?: string
+      /** A wake frame's `reason` (`reminder`, `unanswered`, …). */
+      readonly reason?: string
+      /** An `unanswered` wake frame's conversations. */
+      readonly conversationIds?: string[]
+    }
   | { readonly type: 'echo'; readonly conversationId?: string }
   | { readonly type: 'cycle'; readonly summary: CycleSummary }
   | { readonly type: 'turn_started'; readonly request: Omit<TurnRequest, 'signal' | 'texts'> }
@@ -216,6 +257,12 @@ export interface ReceiveLoopOptions {
   /** How this runtime spells the hosted tools named in the tray's question (gate call). */
   readonly toolNamer?: ToolNamer
   readonly readiness?: Readiness
+  /** Reply and invite turns running at once (gateCall). Default 1. */
+  readonly maxConcurrentTurns?: number
+  /** D5 pacing window. Default `PACE_MS` (60 s). */
+  readonly paceMs?: number
+  /** A tracker shared with other loops or the integration; default: the loop's own. */
+  readonly tracker?: TurnTracker
   readonly quietMs?: number
   readonly maxMs?: number
   readonly onEvent?: (event: ReceiveLoopEvent) => void
@@ -239,13 +286,19 @@ export interface ReceiveLoopStatus {
     readonly lastError: string | null
   }
   readonly lastCycle: CycleSummary | null
-  readonly turns: RunningTurn[]
+  /** Turns the tracker holds; `overdue` past 30 minutes (the runtime should have ended it). */
+  readonly turns: Array<RunningTurn & { readonly overdue: boolean }>
   readonly counters: {
     readonly frames: number
     readonly echoes: number
     readonly turnsStarted: number
     readonly turnsRefused: number
+    readonly turnsQueued: number
     readonly inviteTurnsStarted: number
+    /** Turns holding a slot now. */
+    readonly turnsActive: number
+    /** Turns waiting for a slot now. */
+    readonly turnsWaiting: number
     readonly runsStarted: number
     readonly runsCompleted: number
     readonly runsFailed: number
@@ -256,21 +309,68 @@ export interface ReceiveLoopStatus {
   readonly lastError: string | null
 }
 
+/** D5 pacing, in memory: a key (`conversation:<id>` / `invite:<id>`) held until a time, for one anchor. */
+class Pacer {
+  private readonly until = new Map<string, { anchor: string | null; until: number }>()
+  constructor(
+    private readonly paceMs: number,
+    private readonly now: () => number,
+  ) {}
+
+  hold(key: string, anchor: string | null): void {
+    this.until.delete(key)
+    this.until.set(key, { anchor, until: this.now() + this.paceMs })
+    while (this.until.size > SILENT_MEMORY) {
+      const oldest = this.until.keys().next().value
+      if (oldest === undefined) break
+      this.until.delete(oldest)
+    }
+  }
+
+  held(key: string, anchor: string | null): boolean {
+    const entry = this.until.get(key)
+    if (!entry) return false
+    if (entry.anchor !== anchor || this.now() >= entry.until) {
+      this.until.delete(key)
+      return false
+    }
+    return true
+  }
+
+  release(key: string): void {
+    this.until.delete(key)
+  }
+
+  releaseInvites(): void {
+    for (const key of [...this.until.keys()]) if (key.startsWith('invite:')) this.until.delete(key)
+  }
+}
+
+type Launch = 'started' | 'refused' | 'queued'
+
 export class ReceiveLoop {
   private readonly options: ReceiveLoopOptions
   private readonly client: ReceiveLoopClient
   private readonly coalescer: WakeCoalescer
   private readonly tracker: TurnTracker
+  private readonly pacer: Pacer
+  private readonly maxTurns: number
   private readonly now: () => number
+  private readonly _setTimeout: (fn: () => void, ms: number) => TimerHandle
+  private readonly _clearTimeout: (handle: TimerHandle) => void
   private readonly abort = new AbortController()
   private readonly realtime: RealtimeClient | null
   private readonly unsubscribe: Array<() => void> = []
   private readonly silent = new Map<string, number>()
+  private readonly waiting: Array<{ handle: TurnHandle; admit: () => Promise<boolean> }> = []
 
   private handle: string | null
   private started = false
   private stopped = false
   private heldWhileRunning = false
+  private activeTurns = 0
+  private noProgressStreak = 0
+  private moreTimer: TimerHandle | null = null
   private lastCycle: CycleSummary | null = null
   private lastError: string | null = null
   private readonly counts = {
@@ -278,6 +378,7 @@ export class ReceiveLoop {
     echoes: 0,
     turnsStarted: 0,
     turnsRefused: 0,
+    turnsQueued: 0,
     inviteTurnsStarted: 0,
     runsStarted: 0,
     runsCompleted: 0,
@@ -295,11 +396,17 @@ export class ReceiveLoop {
     if (options.mode === 'singleRun' && !options.startRun) {
       throw new Error('ReceiveLoop: singleRun mode needs startRun')
     }
+    const maxTurns = options.maxConcurrentTurns ?? 1
+    if (!Number.isInteger(maxTurns) || maxTurns < 1) throw new RangeError('ReceiveLoop: maxConcurrentTurns must be an integer >= 1')
     this.options = options
     this.client = options.client
     this.now = options.now ?? Date.now
+    this._setTimeout = options.setTimeout ?? ((fn, ms) => setTimeout(fn, ms))
+    this._clearTimeout = options.clearTimeout ?? ((h) => clearTimeout(h))
+    this.maxTurns = maxTurns
     this.handle = options.handle ? normalizeHandle(options.handle) : null
-    this.tracker = new TurnTracker({ now: this.now })
+    this.tracker = options.tracker ?? new TurnTracker({ now: this.now })
+    this.pacer = new Pacer(options.paceMs ?? PACE_MS, this.now)
     this.coalescer = new WakeCoalescer({
       onCycle: () => this.cycle(),
       onError: (err) => this.fail(err),
@@ -335,11 +442,7 @@ export class ReceiveLoop {
     if (rt === null) return
     this.unsubscribe.push(
       rt.on('message.new', (message) => this.onMessage(message)),
-      rt.on('wake', (frame) => {
-        this.counts.frames += 1
-        const id = (frame.payload as { conversation_id?: unknown }).conversation_id
-        this.wakeFrom('wake_frame', typeof id === 'string' ? id : undefined)
-      }),
+      rt.on('wake', (frame) => this.onWakeFrame(frame.payload as unknown as Record<string, unknown>)),
       rt.on('group.invite.received', () => {
         this.counts.frames += 1
         this.wakeFrom('invite')
@@ -361,16 +464,19 @@ export class ReceiveLoop {
   }
 
   /**
-   * Stop: no new cycles or turns, the socket closed, running turns and runs
-   * signalled through their `AbortSignal`. Resolves when the running cycle
-   * and any recording already under way have finished; it does not wait for
-   * turns the runtime has not ended (they record nothing once stopped).
+   * Stop: no new cycles or turns, waiting turns dropped (their cards stay on
+   * the tray), the socket closed, running turns and runs signalled through
+   * their `AbortSignal`. Resolves when the running cycle and any recording
+   * already under way have finished. A turn that ends later still has its
+   * outcome recorded.
    */
   async stop(): Promise<void> {
     if (this.stopped) return
     this.stopped = true
     this.coalescer.stop()
+    this.clearMoreTimer()
     this.abort.abort()
+    for (const { handle } of this.waiting.splice(0)) this.tracker.end(handle)
     for (const off of this.unsubscribe.splice(0)) {
       try {
         off()
@@ -383,16 +489,16 @@ export class ReceiveLoop {
     } catch {
       // already closed
     }
-    await this.coalescer.settled()
+    await this.coalescer.idle()
     await Promise.allSettled([...this.pendingWork])
   }
 
   /** Resolves when the running cycle has finished (tests, graceful stops). */
-  settled(): Promise<void> {
-    return this.coalescer.settled()
+  idle(): Promise<void> {
+    return this.coalescer.idle()
   }
 
-  /** Let go of a turn whose end the runtime will never confirm (an operator's call). */
+  /** Let go of a turn whose end the runtime will never confirm (an operator's call). Nothing is recorded for it. */
   releaseTurn(key: string): boolean {
     const released = this.tracker.release(key)
     if (released) this.wakeFrom('more')
@@ -402,6 +508,7 @@ export class ReceiveLoop {
   status(): ReceiveLoopStatus {
     const texts = this.options.texts.current()
     const counters = this.coalescer.counters()
+    const now = this.now()
     return {
       mode: this.options.mode,
       started: this.started,
@@ -424,8 +531,13 @@ export class ReceiveLoop {
         lastError: this.options.texts.lastError ?? null,
       },
       lastCycle: this.lastCycle,
-      turns: this.tracker.running(),
-      counters: { ...this.counts, outcomes: { ...this.outcomes } },
+      turns: this.tracker.running().map((turn) => ({ ...turn, overdue: now - turn.startedAt > TURN_OVERDUE_MS })),
+      counters: {
+        ...this.counts,
+        turnsActive: this.activeTurns,
+        turnsWaiting: this.waiting.length,
+        outcomes: { ...this.outcomes },
+      },
       lastError: this.lastError,
     }
   }
@@ -447,9 +559,31 @@ export class ReceiveLoop {
     this.wakeFrom('message', conversationId)
   }
 
-  private wakeFrom(source: WakeSource, conversationId?: string): void {
+  private onWakeFrame(payload: Record<string, unknown>): void {
+    this.counts.frames += 1
+    const reason = typeof payload.reason === 'string' ? payload.reason : undefined
+    const id = typeof payload.conversation_id === 'string' ? payload.conversation_id : undefined
+    const named = Array.isArray(payload.conversation_ids)
+      ? payload.conversation_ids.filter((x): x is string => typeof x === 'string')
+      : []
+    if (reason === 'unanswered') {
+      // The server says these are still unanswered: pacing yields.
+      for (const conversationId of named) this.pacer.release(`conversation:${conversationId}`)
+      this.pacer.releaseInvites()
+    }
+    this.wakeFrom('wake_frame', id, {
+      ...(reason !== undefined ? { reason } : {}),
+      ...(named.length > 0 ? { conversationIds: named } : {}),
+    })
+  }
+
+  private wakeFrom(
+    source: WakeSource,
+    conversationId?: string,
+    extra: { reason?: string; conversationIds?: string[] } = {},
+  ): void {
     if (this.stopped) return
-    this.emit({ type: 'wake', source, ...(conversationId ? { conversationId } : {}) })
+    this.emit({ type: 'wake', source, ...(conversationId ? { conversationId } : {}), ...extra })
     this.coalescer.wake()
   }
 
@@ -466,7 +600,10 @@ export class ReceiveLoop {
 
   private async readTray(): Promise<InboxTray | null> {
     try {
-      const tray = await this.client.inbox.tray({ waitMs: 0, limit: TRAY_LIMIT, signal: this.abort.signal })
+      // The loop acts on the tray's invites, so it says so to the server
+      // (a held wait then also ends for an invite). No stop signal: a turn
+      // that ends after stop() still reads the card before its outcome.
+      const tray = await this.client.inbox.tray({ waitMs: 0, limit: TRAY_LIMIT, includeInvites: true })
       if (this.handle === null && typeof tray.you === 'string' && tray.you.length > 0) {
         this.handle = normalizeHandle(tray.you)
       }
@@ -493,12 +630,15 @@ export class ReceiveLoop {
     if (tray === null) return this.summary('tray_failed', { failure: this.lastError })
     const cards = cardsOf(tray)
     const invites = trayInvites(tray)
-    const gateCards = this.tracker.withoutRunning(cards)
-    const heldByTurns = cards.length - gateCards.length
+    const unheld = this.tracker.withoutRunning(cards)
+    const heldByTurns = cards.length - unheld.length
     if (heldByTurns > 0) this.heldWhileRunning = true
+    const gateCards = unheld.filter((card) => !this.pacer.held(`conversation:${card.conversation_id}`, anchorFrom(card)))
+    const openInvites = invites.filter((invite) => !this.tracker.inviteRunning(invite.invite_id))
+    const owedInvites = openInvites.filter((invite) => !this.pacer.held(`invite:${invite.invite_id}`, null))
+    const paced = unheld.length - gateCards.length + (openInvites.length - owedInvites.length)
     const owedCards = gateCards.filter((card) => card.muted !== true)
-    const owedInvites = invites.filter((invite) => !this.tracker.inviteRunning(invite.invite_id))
-    const base = { cards: cards.length, invites: invites.length, heldByTurns, truncated: tray.truncated === true }
+    const base = { cards: cards.length, invites: invites.length, heldByTurns, paced, truncated: tray.truncated === true }
     if (cards.length === 0 && invites.length === 0) return this.summary('empty', base)
     if (owedCards.length === 0 && owedInvites.length === 0) return this.summary('nothing_owed', base)
 
@@ -508,7 +648,17 @@ export class ReceiveLoop {
     if (unready !== null) return this.summary('tools_unavailable', { ...base, failure: unready })
 
     let gated = 0
-    const tally = { reply: 0, dismiss: 0, defer: 0, undecided: 0, recordFailures: 0, turnsStarted: 0, turnsRefused: 0 }
+    const tally = {
+      reply: 0,
+      dismiss: 0,
+      defer: 0,
+      undecided: 0,
+      recorded: 0,
+      recordFailures: 0,
+      turnsStarted: 0,
+      turnsRefused: 0,
+      turnsQueued: 0,
+    }
     let outcome: CycleOutcome = 'invites_only'
     let failure: string | null = null
     if (owedCards.length > 0) {
@@ -522,6 +672,7 @@ export class ReceiveLoop {
       })
       for (const verdict of result.verdicts) tally[verdict.decision] += 1
       tally.undecided = result.undecided.length
+      tally.recorded = result.recorded
       tally.recordFailures = result.recordFailures.length
       if (result.outcome === 'fail_closed') {
         outcome = 'fail_closed'
@@ -530,19 +681,49 @@ export class ReceiveLoop {
         outcome = 'decided'
         for (const reply of result.reply) {
           if (this.stopped) break
-          if (await this.startReplyTurn(reply, texts)) tally.turnsStarted += 1
-          else tally.turnsRefused += 1
+          tally[launchKey(await this.startReplyTurn(reply, texts))] += 1
         }
       }
     }
     for (const invite of owedInvites) {
       if (this.stopped) break
-      if (await this.startInviteTurn(invite, texts)) tally.turnsStarted += 1
-      else tally.turnsRefused += 1
+      tally[launchKey(await this.startInviteTurn(invite, texts))] += 1
     }
-    // More conversations wait than one tray shows: read again for the rest.
-    if (tray.truncated === true && outcome === 'decided') this.wakeFrom('more')
+    if (tray.truncated === true && outcome === 'decided') {
+      this.readTheRest(tally.recorded > 0 || tally.turnsStarted > 0)
+    }
     return this.summary(outcome, { ...base, gated, ...tally, failure })
+  }
+
+  /**
+   * More conversations wait than one tray shows. After a cycle that moved
+   * something (a verdict recorded, a turn started) read again at once; after
+   * one that did not, wait 1 s, doubling to 60 s, so a cycle that cannot
+   * progress (every record failing, every turn refused) never spins.
+   */
+  private readTheRest(progressed: boolean): void {
+    if (this.stopped) return
+    if (progressed) {
+      this.noProgressStreak = 0
+      this.clearMoreTimer()
+      this.wakeFrom('more')
+      return
+    }
+    this.noProgressStreak += 1
+    if (this.moreTimer !== null) return
+    const delay = Math.min(NO_PROGRESS_BACKOFF_MAX_MS, NO_PROGRESS_BACKOFF_MS * 2 ** Math.min(this.noProgressStreak - 1, 16))
+    this.moreTimer = this._setTimeout(() => {
+      this.moreTimer = null
+      this.wakeFrom('more')
+    }, delay)
+    ;(this.moreTimer as { unref?: () => void }).unref?.()
+  }
+
+  private clearMoreTimer(): void {
+    if (this.moreTimer !== null) {
+      this._clearTimeout(this.moreTimer)
+      this.moreTimer = null
+    }
   }
 
   private async singleRunCycle(): Promise<CycleSummary> {
@@ -585,7 +766,7 @@ export class ReceiveLoop {
     // cost a run on every wake: the same rule as an invite turn (D5) —
     // pending after the second completed run → dismissed.
     const startedWith = tray === null ? [] : trayInvites(tray)
-    if (startedWith.length > 0 && !this.stopped) await this.track(this.afterRunInvites(startedWith, end))
+    if (startedWith.length > 0) await this.track(this.afterRunInvites(startedWith, end))
     const outcome: CycleOutcome =
       end.status === 'completed' ? 'run_completed' : end.status === 'failed' ? 'run_failed' : 'run_not_started'
     return this.summary(outcome, { ...base, failure: end.status === 'completed' ? null : (end.detail ?? null) })
@@ -604,10 +785,10 @@ export class ReceiveLoop {
 
   // ─── turns (gate-call mode) ─────────────────────────────────────────────
 
-  private async startReplyTurn(reply: GateReply, texts: Texts): Promise<boolean> {
+  private async startReplyTurn(reply: GateReply, texts: Texts): Promise<Launch> {
     const anchor = anchorFrom(reply.card)
     const handle = this.tracker.begin({ kind: 'reply', conversationId: reply.conversationId, anchor })
-    if (handle === null) return false
+    if (handle === null) return 'refused'
     const request: TurnRequest = {
       kind: 'reply',
       conversationId: reply.conversationId,
@@ -618,33 +799,91 @@ export class ReceiveLoop {
       texts,
       signal: this.abort.signal,
     }
-    const admission = await this.admit(this.options.startTurn!, request)
-    if (!admission.started) {
-      this.tracker.end(handle)
-      this.counts.turnsRefused += 1
-      this.emit({ type: 'turn_refused', kind: 'reply', id: reply.conversationId, error: admission.error ?? null })
-      return false
+    return this.launch(handle, async () => {
+      const admission = await this.admit(this.options.startTurn!, request)
+      if (!admission.started) {
+        this.tracker.end(handle)
+        this.counts.turnsRefused += 1
+        this.emit({ type: 'turn_refused', kind: 'reply', id: reply.conversationId, error: admission.error ?? null })
+        return false
+      }
+      this.counts.turnsStarted += 1
+      this.emit({ type: 'turn_started', request: withoutRuntime(request) })
+      void this.afterReplyTurn(handle, reply, admission.done)
+      return true
+    })
+  }
+
+  private async startInviteTurn(invite: TrayInvite, texts: Texts): Promise<Launch> {
+    const handle = this.tracker.begin({ kind: 'invite', inviteId: invite.invite_id })
+    if (handle === null) return 'refused'
+    const request: TurnRequest = {
+      kind: 'invite',
+      invite,
+      prompt: `${texts.invite_prompt.trim()}\n\ninvite_id: ${invite.invite_id}`,
+      texts,
+      signal: this.abort.signal,
     }
-    this.counts.turnsStarted += 1
-    this.emit({ type: 'turn_started', request: withoutRuntime(request) })
-    void this.afterReplyTurn(handle, reply, admission.done)
-    return true
+    return this.launch(handle, async () => {
+      const admission = await this.admit(this.options.startInviteTurn ?? this.options.startTurn!, request)
+      if (!admission.started) {
+        this.tracker.end(handle)
+        this.counts.turnsRefused += 1
+        this.emit({ type: 'turn_refused', kind: 'invite', id: invite.invite_id, error: admission.error ?? null })
+        return false
+      }
+      this.counts.inviteTurnsStarted += 1
+      this.emit({ type: 'turn_started', request: withoutRuntime(request) })
+      void this.afterInviteTurn(handle, invite, admission.done)
+      return true
+    })
+  }
+
+  /** Start a turn now when a slot is free, else let it wait for one (its tracker entry holds the card out of the gate). */
+  private async launch(handle: TurnHandle, admit: () => Promise<boolean>): Promise<Launch> {
+    if (this.activeTurns >= this.maxTurns) {
+      this.waiting.push({ handle, admit })
+      this.counts.turnsQueued += 1
+      return 'queued'
+    }
+    this.activeTurns += 1
+    if (await admit()) return 'started'
+    this.activeTurns -= 1
+    return 'refused'
+  }
+
+  /** A slot freed: start the turns waiting for one. */
+  private slotFreed(): void {
+    this.activeTurns = Math.max(0, this.activeTurns - 1)
+    void this.pump()
+  }
+
+  private async pump(): Promise<void> {
+    while (this.waiting.length > 0 && this.activeTurns < this.maxTurns && !this.stopped) {
+      const next = this.waiting.shift()!
+      this.activeTurns += 1
+      if (!(await next.admit())) this.activeTurns -= 1
+    }
   }
 
   private async afterReplyTurn(handle: TurnHandle, reply: GateReply, done: Promise<TurnEnd>): Promise<void> {
     try {
       const end = await this.tracker.confirmedEnd(handle, done)
-      if (end === null || this.stopped) return // released, or stopping: nothing recorded
+      if (end === null || !this.tracker.holds(handle)) return // released: nothing recorded
+      // Recorded also when the turn ends after stop(): what it did is a fact.
       await this.track(this.recordReplyOutcome(handle, reply, end))
     } finally {
       this.tracker.end(handle)
+      this.slotFreed()
       this.afterTurnEnded()
     }
   }
 
   private async recordReplyOutcome(handle: TurnHandle, reply: GateReply, end: TurnEnd): Promise<void> {
     const fresh = await this.readTray()
-    const key = `${reply.conversationId}|${anchorFrom(reply.card) ?? ''}`
+    if (!this.tracker.holds(handle)) return // released while the card was read
+    const anchor = anchorFrom(reply.card)
+    const key = `${reply.conversationId}|${anchor ?? ''}`
     const silentBefore = this.silent.get(key) ?? 0
     const outcome = turnOutcome({
       turn: end,
@@ -655,10 +894,15 @@ export class ReceiveLoop {
       silentBefore,
     })
     this.count(outcome.reason)
-    if (outcome.reason === 'silent_first') this.remember(key, silentBefore + 1)
-    if (outcome.reason === 'card_left_tray' || outcome.reason === 'turn_recorded_verdict') this.silent.delete(key)
+    if (outcome.reason === 'silent_first') {
+      this.remember(key, silentBefore + 1)
+      // D5 pacing: not gated again at this anchor for a while.
+      this.pacer.hold(`conversation:${reply.conversationId}`, anchor)
+    } else if (outcome.reason === 'card_left_tray' || outcome.reason === 'turn_recorded_verdict') {
+      this.silent.delete(key)
+    }
     let recorded = false
-    if (outcome.action !== 'none' && !this.stopped) {
+    if (outcome.action !== 'none') {
       try {
         recorded = await applyOutcome(this.client, outcome)
         this.silent.delete(key)
@@ -670,42 +914,25 @@ export class ReceiveLoop {
     this.emit({ type: 'turn_outcome', outcome, recorded })
   }
 
-  private async startInviteTurn(invite: TrayInvite, texts: Texts): Promise<boolean> {
-    const handle = this.tracker.begin({ kind: 'invite', inviteId: invite.invite_id })
-    if (handle === null) return false
-    const request: TurnRequest = {
-      kind: 'invite',
-      invite,
-      prompt: `${texts.invite_prompt.trim()}\n\ninvite_id: ${invite.invite_id}`,
-      texts,
-      signal: this.abort.signal,
-    }
-    const admission = await this.admit(this.options.startInviteTurn ?? this.options.startTurn!, request)
-    if (!admission.started) {
-      this.tracker.end(handle)
-      this.counts.turnsRefused += 1
-      this.emit({ type: 'turn_refused', kind: 'invite', id: invite.invite_id, error: admission.error ?? null })
-      return false
-    }
-    this.counts.inviteTurnsStarted += 1
-    this.emit({ type: 'turn_started', request: withoutRuntime(request) })
-    void this.afterInviteTurn(handle, invite, admission.done)
-    return true
-  }
-
   private async afterInviteTurn(handle: TurnHandle, invite: TrayInvite, done: Promise<TurnEnd>): Promise<void> {
     try {
       const end = await this.tracker.confirmedEnd(handle, done)
-      if (end === null || this.stopped) return
-      await this.track(this.recordInviteOutcome(invite, end))
+      if (end === null || !this.tracker.holds(handle)) return
+      await this.track(this.recordInviteOutcome(handle, invite, end))
+      // D5 pacing: no second invite turn for it for a while (an answered
+      // invite has left the tray anyway).
+      this.pacer.hold(`invite:${invite.invite_id}`, null)
     } finally {
       this.tracker.end(handle)
+      this.slotFreed()
       this.afterTurnEnded()
     }
   }
 
-  private async recordInviteOutcome(invite: TrayInvite, end: TurnEnd): Promise<void> {
-    await this.settleInvite(invite, end, await this.readTray())
+  private async recordInviteOutcome(handle: TurnHandle, invite: TrayInvite, end: TurnEnd): Promise<void> {
+    const fresh = await this.readTray()
+    if (!this.tracker.holds(handle)) return
+    await this.settleInvite(invite, end, fresh)
   }
 
   /** The D5 rule for one invite after a turn or a run, and the one call it asks for. */
@@ -717,7 +944,7 @@ export class ReceiveLoop {
     if (outcome.reason === 'silent_first') this.remember(key, silentBefore + 1)
     if (outcome.reason === 'invite_answered') this.silent.delete(key)
     let recorded = false
-    if (outcome.action !== 'none' && !this.stopped) {
+    if (outcome.action !== 'none') {
       try {
         recorded = await applyInviteOutcome(this.client, outcome)
         this.silent.delete(key)
@@ -781,10 +1008,13 @@ export class ReceiveLoop {
       dismiss: 0,
       defer: 0,
       undecided: 0,
+      recorded: 0,
       recordFailures: 0,
       turnsStarted: 0,
       turnsRefused: 0,
+      turnsQueued: 0,
       heldByTurns: 0,
+      paced: 0,
       truncated: false,
       failure: null,
       ...parts,
@@ -809,6 +1039,10 @@ export class ReceiveLoop {
 /** The prompt a reply turn starts with: the served wake instruction, then the conversation it is for. */
 export function replyPrompt(texts: Pick<Texts, 'wake_instruction'>, conversationId: string): string {
   return `${texts.wake_instruction.trim()}\n\nconversation_id: ${conversationId}`
+}
+
+function launchKey(launch: Launch): 'turnsStarted' | 'turnsRefused' | 'turnsQueued' {
+  return launch === 'started' ? 'turnsStarted' : launch === 'queued' ? 'turnsQueued' : 'turnsRefused'
 }
 
 function trayInvites(tray: InboxTray): TrayInvite[] {

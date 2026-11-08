@@ -52,7 +52,10 @@ async function open(rt: RealtimeClient, hello: unknown = json('hello-ok.v1.json'
 }
 
 beforeEach(() => MockWebSocket.reset())
-afterEach(() => vi.useRealTimers())
+afterEach(() => {
+  vi.useRealTimers()
+  vi.restoreAllMocks()
+})
 
 describe('capabilities', () => {
   it('offers ack and heartbeat by default, rewake only when asked', async () => {
@@ -77,28 +80,48 @@ describe('capabilities', () => {
 
   it('offers ack only while a message handler is attached: a handler-less client is marked on send, as before', async () => {
     const bare = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor })
-    bare.onError(() => undefined)
+    const errors: Error[] = []
+    bare.onError((e) => errors.push(e))
     await bare.connect()
-    let ws = MockWebSocket.latest()
-    ws.simulateOpen()
-    expect(JSON.parse(ws.sent[0]!)).toMatchObject({ capabilities: ['heartbeat'] })
-    ws.simulateMessage({ type: 'hello.ok', capabilities: ['ack', 'heartbeat'] }) // a server echo it was not offered
+    const first = MockWebSocket.latest()
+    first.simulateOpen()
+    expect(JSON.parse(first.sent[0]!)).toMatchObject({ capabilities: ['heartbeat'] })
+    first.simulateMessage({ type: 'hello.ok', capabilities: ['ack', 'heartbeat'] }) // an echo it was not offered
     expect(bare.ackNegotiated).toBe(false)
-    // A handler attached now: frames reach it; the next HELLO offers acks.
+    expect(MockWebSocket.instances).toHaveLength(1)
+
+    // The first message handler arrives late: one quiet reconnect, and the next HELLO offers acks.
     const seen: string[] = []
     bare.on('message.new', (m) => {
       seen.push(String(m.payload.id))
     })
-    ws.simulateMessage({ type: 'message.new', payload: { id: 'msg_1', conversation_id: 'c', seq: 1 } })
     await settle()
-    expect(seen).toEqual(['msg_1'])
-    expect(sentFrames(ws, 'ack')).toEqual([])
-    ws.simulateClose(1006, '', false)
-    await bare.connect()
-    ws = MockWebSocket.latest()
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(first.closed).toEqual({ code: 1000, reason: 'client reconnects to negotiate delivery acks' })
+    const second = MockWebSocket.latest()
+    second.simulateOpen()
+    expect(JSON.parse(second.sent[0]!)).toMatchObject({ capabilities: ['ack', 'heartbeat'] })
+    second.simulateMessage({ type: 'hello.ok', capabilities: ['ack', 'heartbeat'] })
+    expect(bare.ackNegotiated).toBe(true)
+    expect(bare.state).toBe('ready')
+    expect(errors).toEqual([])
+    // A second handler does not reconnect again.
+    bare.on('message.new', () => undefined)
+    await settle()
+    expect(MockWebSocket.instances).toHaveLength(2)
+    bare.disconnect()
+  })
+
+  it('a handler attached before the HELLO goes out needs no reconnect', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor })
+    await rt.connect()
+    rt.on('message.new', () => undefined)
+    const ws = MockWebSocket.latest()
     ws.simulateOpen()
     expect(JSON.parse(ws.sent[0]!)).toMatchObject({ capabilities: ['ack', 'heartbeat'] })
-    bare.disconnect()
+    await settle()
+    expect(MockWebSocket.instances).toHaveLength(1)
+    rt.disconnect()
   })
 
   it('hello-ok.v1.json: exposes what the server accepted; a close clears it', async () => {
@@ -245,6 +268,7 @@ describe('connect budget (D8) — the socket backs off for the server delay, nev
     '%s',
     async (_name, c) => {
       vi.useFakeTimers()
+      vi.spyOn(Math, 'random').mockReturnValue(0.5)
       if (c.event.kind === 'upgrade' && c.event.now) vi.setSystemTime(new Date(c.event.now))
       const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockNodeWebSocketCtor, reconnectInterval: 10 })
       const errors: Error[] = []
@@ -264,9 +288,12 @@ describe('connect budget (D8) — the socket backs off for the server delay, nev
       expect(blocked).not.toHaveBeenCalled()
       expect(errors.some((e) => /connect budget exceeded/.test(e.message))).toBe(true)
       const delay = c.expect.delay_ms!
-      await vi.advanceTimersByTimeAsync(delay - 1)
+      // The wait is the server's delay plus 0–10% (never less); with the
+      // jitter pinned at its middle: nothing before delay × 1.05, the next attempt then.
+      const top = Math.floor(delay * (1 + 0.5 * 0.1))
+      expect(top).toBeGreaterThanOrEqual(delay)
+      await vi.advanceTimersByTimeAsync(top - 1)
       expect(MockWebSocket.instances).toHaveLength(1)
-      // This SDK adds no jitter to the server's delay (the contract allows up to +10%).
       await vi.advanceTimersByTimeAsync(1)
       expect(MockWebSocket.instances).toHaveLength(2)
       expect(rt.state).toBe('connecting')
@@ -320,6 +347,71 @@ describe('in-flight adoption across reconnects is bounded (inFlightAdoptMs)', ()
     ws.simulateMessage({ type: 'message.new', payload: { id: 'msg_1', conversation_id: 'c', seq: 1 } })
     await settle()
     expect(calls).toEqual(['msg_1', 'msg_1'])
+    rt.disconnect()
+  })
+})
+
+describe('one message at a time per conversation (promise 2)', () => {
+  it('a conversation waits for its running handler; another conversation does not; order is seq order', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false })
+    const entered: string[] = []
+    const releases = new Map<string, () => void>()
+    rt.on('message.new', async (m) => {
+      const id = String(m.payload.id)
+      entered.push(id)
+      await new Promise<void>((r) => releases.set(id, r))
+    })
+    const ws = await open(rt, { type: 'hello.ok', capabilities: ['ack'] })
+    const frame = (conv: string, seq: number) => ({ type: 'message.new', payload: { id: `${conv}_${seq}`, conversation_id: conv, seq } })
+    ws.simulateMessage(frame('a', 1))
+    ws.simulateMessage(frame('a', 2))
+    ws.simulateMessage(frame('b', 1))
+    ws.simulateMessage(frame('a', 3))
+    await settle()
+    expect(entered).toEqual(['a_1', 'b_1'])
+    releases.get('a_1')!()
+    await settle()
+    expect(entered).toEqual(['a_1', 'b_1', 'a_2'])
+    releases.get('a_2')!()
+    await settle()
+    expect(entered).toEqual(['a_1', 'b_1', 'a_2', 'a_3'])
+    // Acks follow each handler's end, in that order.
+    releases.get('a_3')!()
+    releases.get('b_1')!()
+    await settle()
+    const acks = sentFrames(ws, 'ack').map((f) => String(f.message_id))
+    expect(acks.filter((id) => id.startsWith('a_'))).toEqual(['a_1', 'a_2', 'a_3'])
+    expect(acks).toContain('b_1')
+    rt.disconnect()
+  })
+
+  it('plain (synchronous) handlers are still called at once, frame by frame', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false })
+    const seen: string[] = []
+    rt.on('message.new', (m) => {
+      seen.push(String(m.payload.id))
+    })
+    const ws = await open(rt, { type: 'hello.ok', capabilities: ['ack'] })
+    ws.simulateMessage({ type: 'message.new', payload: { id: 'x1', conversation_id: 'a', seq: 1 } })
+    ws.simulateMessage({ type: 'message.new', payload: { id: 'x2', conversation_id: 'a', seq: 2 } })
+    expect(seen).toEqual(['x1', 'x2'])
+    rt.disconnect()
+  })
+
+  it('a handler that never finishes holds its conversation at most inFlightAdoptMs', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false, inFlightAdoptMs: 20 })
+    const entered: string[] = []
+    rt.on('message.new', async (m) => {
+      entered.push(String(m.payload.id))
+      if (m.payload.id === 'h1') await new Promise(() => undefined)
+    })
+    const ws = await open(rt, { type: 'hello.ok', capabilities: ['ack'] })
+    ws.simulateMessage({ type: 'message.new', payload: { id: 'h1', conversation_id: 'a', seq: 1 } })
+    ws.simulateMessage({ type: 'message.new', payload: { id: 'h2', conversation_id: 'a', seq: 2 } })
+    await settle()
+    expect(entered).toEqual(['h1'])
+    await new Promise((r) => setTimeout(r, 40))
+    expect(entered).toEqual(['h1', 'h2'])
     rt.disconnect()
   })
 })

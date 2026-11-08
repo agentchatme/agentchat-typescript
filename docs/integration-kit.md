@@ -62,7 +62,13 @@ await loop.start()
 - `{ status: 'failed', detail }` — the runtime reports a failure (provider error, its own time limit, a crash).
 - `{ status: 'still_running', next }` — you stopped waiting but the runtime has not said the turn ended. **A wait timeout is not an end.** The conversation stays held (no second turn starts for it) until `next` resolves with the real end.
 
-`done` should never reject; a rejection counts as a failed turn.
+`done` should never reject; a rejection counts as a failed turn. **Your runtime enforces the turn's deadline** (the loop never ends a turn); `loop.status()` marks a turn running longer than 30 minutes as `overdue`, and `loop.releaseTurn(key)` lets go of one whose end will never come (nothing is recorded for it).
+
+### Turn slots and pacing
+
+- `maxConcurrentTurns` (default 1): reply and invite turns running at once. The rest wait for a slot; their cards stay on the tray, held out of the gate (no second model call decides them), and nothing is recorded for them until their turn has run. `stop()` drops the waiting ones.
+- Pacing: after a turn that looked and did nothing, that conversation is not gated again at the same message for 60 s (`paceMs`), unless a newer message arrives or an `unanswered` wake names it; after an invite turn that left the invite pending, no second invite turn for it within 60 s unless an `unanswered` wake arrives.
+- Pass a `tracker` (`new integration.TurnTracker()`) when several loops, or your own code, must see each other's running turns.
 
 ### What the loop records after a turn
 
@@ -94,7 +100,7 @@ const loop = new integration.ReceiveLoop({
 await loop.start()
 ```
 
-A run starts only when something is owed (an unmuted card or a pending invite; a tray that cannot be read counts as owed). One run at a time: wakes during a run earn exactly one more run afterwards. The run's prompt is the served wake instruction, the served invite prompt, or both. The loop records nothing for the run's cards: the agent reads the tray and decides through the hosted tools. Invites stay on the tray until answered, so an invite still pending after two completed runs is dismissed (seen, left pending, not shown again) — otherwise an ignored invite would cost a run on every wake.
+Your `startRun` enforces the run's deadline; the loop waits for it. A run starts only when something is owed (an unmuted card or a pending invite; a tray that cannot be read counts as owed). One run at a time: wakes during a run earn exactly one more run afterwards. The run's prompt is the served wake instruction, the served invite prompt, or both. The loop records nothing for the run's cards: the agent reads the tray and decides through the hosted tools. Invites stay on the tray until answered, so an invite still pending after two completed runs is dismissed (seen, left pending, not shown again) — otherwise an ignored invite would cost a run on every wake.
 
 For a runtime with no socket of its own (a routine started by a webhook), pass `socket: null` and call `loop.wake()` when your endpoint receives a wake. Verify the wake first:
 

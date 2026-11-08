@@ -145,6 +145,11 @@ export interface InboxTrayOptions {
   waitMs?: number
   /** Cards per tray, 1–`INBOX_TRAY_MAX_LIMIT`. Server default: `INBOX_TRAY_DEFAULT_LIMIT`. */
   limit?: number
+  /**
+   * Ask for pending invites to count (`invites=1`): a held wait then also
+   * ends when an invite arrives. The `ReceiveLoop` always sends it.
+   */
+  includeInvites?: boolean
 }
 
 /** Server default for one tray page. */

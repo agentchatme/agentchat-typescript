@@ -115,4 +115,19 @@ describe('TurnTracker', () => {
     const broken = tracker.begin({ kind: 'invite', inviteId: 'i1' })!
     await expect(tracker.confirmedEnd(broken, Promise.reject(new Error('lost')))).resolves.toMatchObject({ status: 'failed' })
   })
+
+  it('a turn released while it runs never records: its later end reads as null', async () => {
+    const tracker = new TurnTracker()
+    const handle = tracker.begin({ kind: 'reply', conversationId: 'c1', anchor: null })!
+    let finish: (end: TurnEnd) => void = () => undefined
+    const end = tracker.confirmedEnd(handle, new Promise<TurnEnd>((r) => (finish = r)))
+    expect(tracker.release(handle.key)).toBe(true)
+    expect(tracker.holds(handle)).toBe(false)
+    finish({ status: 'completed', agentchatCalls: { made: 1, failed: 0 } })
+    await expect(end).resolves.toBeNull()
+    // A new turn for the conversation is a different handle; the old one does not hold it.
+    const next = tracker.begin({ kind: 'reply', conversationId: 'c1', anchor: null })!
+    expect(tracker.holds(next)).toBe(true)
+    expect(tracker.holds(handle)).toBe(false)
+  })
 })

@@ -34,6 +34,16 @@ server and against a contract v1 server.
   `capabilities: { rewake: true }`), the `capabilities` getter, `on('heartbeat')`,
   `wakePayloadOf(frame)` and the `UnansweredWakePayload` / `AnyWakePayload` types.
 - `inFlightAdoptMs` (default 15 min), see below.
+- `inbox.tray({ includeInvites: true })` (`invites=1`): a held wait also ends
+  for an invite. The `ReceiveLoop` always sends it.
+- The static `register` / `verify` / `recover` / `recoverVerify` take
+  `fetch`, `timeoutMs` and `signal` like the rest of the client.
+- `ReceiveLoop`: `maxConcurrentTurns` (default 1; turns over it wait, their
+  cards held out of the gate), D5 pacing (`paceMs`, 60 s: a silent turn's
+  card is not gated again at the same anchor, nor an invite after its turn,
+  until a newer message or an `unanswered` wake), a shared `tracker`,
+  outcomes recorded for turns that end after `stop()`, the wake reason on
+  wake events, overdue turns (> 30 min) in `status()`.
 - Types for tray v1 (`version`, `invites`, `invites_truncated`) and the
   texts' gate-call fields.
 - Conformance cases in `conformance/v1/` (turn outcome, coalescer timing,
@@ -49,13 +59,21 @@ server and against a contract v1 server.
   and no frame is acknowledged (ack frame, ack on receipt or sync cursor)
   while none is. A client with no message handler is marked delivered on
   send by the server, as a handler-less 1.2 client effectively was.
+- `message.new` handlers run one message at a time per conversation, in seq
+  order (promise 2); conversations run concurrently, and plain synchronous
+  handlers are still called at once. A handler that has not finished after
+  `inFlightAdoptMs` no longer holds its conversation's next message.
 - A message whose first copy is still with the handlers is not dispatched
   again after a reconnect either (within `inFlightAdoptMs`; past it the
   re-offer is dispatched afresh, so a handler that never finishes cannot
   hold its message).
+- A first `message.new` handler attached after a HELLO that offered no `ack`
+  makes the client reconnect once, quietly, so the next HELLO negotiates it.
+- A per-call `retry` never makes a POST / PATCH without an Idempotency-Key
+  retryable (a retried verdict would be recorded twice).
 - Over the connect budget (HTTP 429 with `Retry-After` at the upgrade, or a
-  close 1013 carrying `retry_after=<s>`) the client waits the server's delay;
-  it never goes `blocked`. A 1013 without the hint (the slow-consumer
+  close 1013 carrying `retry_after=<s>`) the client waits the server's delay
+  plus up to 10% (never less); it never goes `blocked`. A 1013 without the hint (the slow-consumer
   `overload` close) keeps the ordinary backoff.
 - With `rewake` negotiated, `wake` frames are validated by reason
   (`reminder`, `unanswered`) and unknown reasons are passed through; without
@@ -66,8 +84,16 @@ server and against a contract v1 server.
 - `decisions.record` resolves on any 2xx, also when the answer carries no
   decision body (fields the server did not echo are null). It used to throw
   although the verdict was recorded, and a retried `defer` climbed the
-  reminder ladder twice. `ReplyDecision.id` / `created_at` are typed
-  `string | null` for that case.
+  reminder ladder twice.
+
+### Type-level changes (compile only; no runtime change for 1.2 code)
+
+- `ReplyDecision.id` and `ReplyDecision.created_at` are `string | null`
+  (null only for a 2xx without a decision body).
+- `ServerEvent` gains `'heartbeat'`; an exhaustive `switch` over it needs the
+  new member.
+- `WakePayload` is unchanged; the v1 shapes are new types
+  (`UnansweredWakePayload`, `AnyWakePayload`, `wakePayloadOf`).
 
 ## 1.2.1 — 2026-11-08
 

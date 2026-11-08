@@ -103,11 +103,13 @@ export class TurnTracker {
       try {
         end = await report
       } catch (err) {
+        if (!this.holds(handle)) return null
         return { status: 'failed', agentchatCalls: null, detail: `the turn's report failed: ${err instanceof Error ? err.message : String(err)}` }
       }
+      // A turn released while it ran records nothing, whatever it reports.
+      if (!this.holds(handle)) return null
       if (end.status !== 'still_running') return end
-      const entry = this.turns.get(handle.key)
-      if (!entry || entry.handle !== handle || entry.released) return null
+      const entry = this.turns.get(handle.key)!
       entry.waitTimedOutAt = this.now()
       report = end.next
     }
@@ -121,6 +123,12 @@ export class TurnTracker {
       }
       this.waiters.set(handle.key, () => resolve(null))
     })
+  }
+
+  /** Whether this turn is still tracked (not ended, not released). Check it after every await before recording. */
+  holds(handle: TurnHandle): boolean {
+    const entry = this.turns.get(handle.key)
+    return entry !== undefined && entry.handle === handle && !entry.released
   }
 
   /** Stop tracking a turn (its outcome is recorded, or it never started). */

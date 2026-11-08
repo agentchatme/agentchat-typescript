@@ -18,6 +18,7 @@ export {
   type WakeWebhookResource,
   type SyncOptions,
   type SyncPage,
+  type StaticCallOptions,
 } from './client.js'
 
 export {

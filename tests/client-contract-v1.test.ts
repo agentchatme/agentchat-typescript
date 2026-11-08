@@ -199,3 +199,75 @@ describe('client.decisions.record — any 2xx is a recorded verdict', () => {
     await expect(client.decisions.record('conv_1', { decision: 'defer' })).resolves.toEqual(served)
   })
 })
+
+describe('per-call retry never retries a POST without an Idempotency-Key', () => {
+  it('decisions.record with a retry policy: one attempt (a retried defer would climb the ladder twice)', async () => {
+    const { fetch, calls } = capture([() => json(503, { code: 'X', message: 'busy' })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    await expect(
+      client.decisions.record('conv_1', { decision: 'defer', retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 1 } }),
+    ).rejects.toThrow()
+    expect(calls).toHaveLength(1)
+  })
+
+  it('with an Idempotency-Key the policy applies', async () => {
+    const { fetch, calls } = capture([() => json(503, { code: 'X', message: 'busy' }), () => json(201, { decision: null })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    await client.decisions.record('conv_1', {
+      decision: 'defer',
+      idempotencyKey: 'k-1',
+      retry: { maxRetries: 1, baseDelayMs: 1, maxDelayMs: 1 },
+    })
+    expect(calls).toHaveLength(2)
+  })
+})
+
+describe('inbox.tray includeInvites', () => {
+  it('sends invites=1 when asked, nothing otherwise', async () => {
+    const tray = { you: '@x', question: 'q', categories: [], conversations: [], deferred: 0, truncated: false, waited_ms: null }
+    const { fetch, calls } = capture([() => json(200, tray)])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    await client.inbox.tray({ includeInvites: true, limit: 50 })
+    await client.inbox.tray()
+    expect(calls.map((c) => c.url)).toEqual([
+      'https://api.agentchat.me/v1/inbox?limit=50&invites=1',
+      'https://api.agentchat.me/v1/inbox',
+    ])
+  })
+})
+
+describe('static calls take fetch, timeoutMs and signal', () => {
+  it('register / verify / recover / recoverVerify go through the given fetch; the returned client keeps it', async () => {
+    const { fetch, calls } = capture([
+      () => json(200, { pending_id: 'p1', message: 'sent' }),
+      () => json(200, { agent: { handle: 'example-relay' }, api_key: 'key_1' }),
+      () => json(200, { pending_id: 'p2', message: 'sent' }),
+      () => json(200, { handle: 'example-relay', api_key: 'key_2' }),
+      () => json(200, { id: 'a', handle: 'example-relay' }),
+    ])
+    const controller = new AbortController()
+    await AgentChatClient.register({ email: 'a@example.com', handle: 'example-relay', fetch, timeoutMs: 5_000, signal: controller.signal })
+    const verified = await AgentChatClient.verify('p1', '123456', { fetch })
+    await AgentChatClient.recover('a@example.com', { handle: 'example-relay', fetch })
+    await AgentChatClient.recoverVerify('p2', '654321', { fetch })
+    await verified.client.getMe()
+    expect(calls.map((c) => c.url)).toEqual([
+      'https://api.agentchat.me/v1/register',
+      'https://api.agentchat.me/v1/register/verify',
+      'https://api.agentchat.me/v1/agents/recover',
+      'https://api.agentchat.me/v1/agents/recover/verify',
+      'https://api.agentchat.me/v1/agents/me',
+    ])
+    expect(calls[4]!.headers.authorization).toBe('Bearer key_1')
+  })
+
+  it('an aborted signal stops a static call', async () => {
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal?.aborted) throw new DOMException('aborted', 'AbortError')
+      return json(200, { pending_id: 'p', message: 'm' })
+    }) as unknown as typeof globalThis.fetch
+    const controller = new AbortController()
+    controller.abort()
+    await expect(AgentChatClient.recover('a@example.com', { fetch, signal: controller.signal })).rejects.toThrow()
+  })
+})

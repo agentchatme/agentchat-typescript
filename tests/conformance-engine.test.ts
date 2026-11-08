@@ -70,7 +70,7 @@ const OPS = ['close', 'connect', 'drain', 'frame', 'gap_window_lapses', 'reconne
 // harness runs on real timers throughout.
 const GAP_WINDOW_LAPSE_MS = 2_150
 const EXPECTATIONS = ['cursor_acks', 'dispatched', 'dispatched_includes', 'ws_acks']
-const INVARIANTS = ['acked_was_handled', 'acks_follow_handling', 'dispatched_once', 'seq_order']
+const INVARIANTS = ['acked_was_handled', 'acks_follow_handling', 'dispatched_once', 'seq_order', 'serial_per_conversation']
 
 // One entry per thing the client did that the scenario can observe, in order.
 type Event =
@@ -108,6 +108,7 @@ async function run(scenario: Scenario, mode: Mode): Promise<Outcome> {
     held.set(id, new Promise<void>((r) => releases.set(id, r)))
   }
   const failing = new Set(scenario.fail ?? [])
+  const running = new Set<string>()
 
   let rt: RealtimeClient | null = null
   let ws: MockWebSocket | null = null
@@ -144,10 +145,17 @@ async function run(scenario: Scenario, mode: Mode): Promise<Outcome> {
           rt.on('message.new', async (message) => {
             const payload = message.payload as unknown as Payload
             dispatched.push(payload)
-            const hold = held.get(payload.id)
-            if (hold) await hold
-            if (failing.has(payload.id)) throw new Error(`scenario handler fails ${payload.id}`)
-            events.push({ kind: 'handled', id: payload.id })
+            // serial_per_conversation: nothing else of this conversation is running.
+            expect(running.has(payload.conversation_id), `${payload.id} entered while ${payload.conversation_id} was running`).toBe(false)
+            running.add(payload.conversation_id)
+            try {
+              const hold = held.get(payload.id)
+              if (hold) await hold
+              if (failing.has(payload.id)) throw new Error(`scenario handler fails ${payload.id}`)
+              events.push({ kind: 'handled', id: payload.id })
+            } finally {
+              running.delete(payload.conversation_id)
+            }
           })
         }
         ws = await open(rt)

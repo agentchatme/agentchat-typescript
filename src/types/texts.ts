@@ -25,7 +25,7 @@ export interface Texts {
   identity_line_template: string
   /**
    * Gate-call mode: the text a tool-less gate call opens with (contract v1).
-   * Absent on older servers; the gate fails closed without it.
+   * Absent on older servers; the gate then falls back to the 1.2 wording.
    */
   gate_call_preamble?: string
   /** Gate-call mode: the answer shape the gate call ends with (contract v1). */

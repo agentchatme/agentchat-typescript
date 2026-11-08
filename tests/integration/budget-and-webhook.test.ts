@@ -131,7 +131,7 @@ describe('conformance — wake-webhook.cases.json', () => {
       secret: webhook.secret,
       now: () => webhook.now * 1000,
     })
-    expect(payload.handle).toBe('@relay-bot')
+    expect(payload.handle).toBe('@example-relay')
   })
 
   it('never puts the secret in an error message', async () => {

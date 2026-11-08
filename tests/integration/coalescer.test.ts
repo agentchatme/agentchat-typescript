@@ -154,7 +154,7 @@ describe('WakeCoalescer', () => {
     await new Promise((r) => setTimeout(r, 5))
     expect(coalescer.counters().cycles).toBe(2)
     release()
-    await coalescer.settled()
+    await coalescer.idle()
     coalescer.stop()
     expect(coalescer.state).toBe('stopped')
   })

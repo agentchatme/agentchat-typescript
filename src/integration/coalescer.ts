@@ -139,7 +139,7 @@ export class WakeCoalescer {
   }
 
   /** Resolves when the running cycle (if any) has ended. */
-  settled(): Promise<void> {
+  idle(): Promise<void> {
     return this.current ?? Promise.resolve()
   }
 

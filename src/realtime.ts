@@ -253,12 +253,15 @@ export interface RealtimeOptions {
    */
   livenessTimeoutMs?: number
   /**
-   * How long a message still with its handlers keeps a re-offer that arrives
-   * on a LATER connection from being dispatched again, in ms. Within that
-   * time the re-offer takes the running dispatch's outcome (no second
-   * dispatch); past it, it is dispatched afresh, so a handler that never
-   * finishes cannot hold its message forever. On the same connection a
-   * repeat always takes the running outcome. Default 900 000 (15 min).
+   * How long a running `message.new` handler may hold things up, in ms.
+   * Handlers run one message at a time per conversation; a run that has not
+   * finished after this long no longer holds its conversation's next
+   * message back. And a re-offer of the same message on a LATER connection
+   * takes the running dispatch's outcome (no second dispatch) only within
+   * this time; past it, it is dispatched afresh. So a handler that never
+   * finishes cannot hold its message or its conversation forever. On the
+   * same connection a repeat always takes the running outcome. Default
+   * 900 000 (15 min).
    */
   inFlightAdoptMs?: number
   /**
@@ -315,6 +318,9 @@ const LONG_OUTAGE_MAX_INTERVAL_MS = 5 * 60_000
  * ceilings (30 s, then 5 min — never 37.5 s or 6.25 min).
  */
 const RECONNECT_JITTER_RATIO = 0.25
+
+/** The connect-budget wait is the server's delay plus up to this much (never less). */
+const BUDGET_JITTER_RATIO = 0.1
 
 /**
  * After the server rejects the credential, retry a fresh HELLO at this
@@ -568,8 +574,11 @@ export class RealtimeClient {
   private ackMode = false
   // Every capability the server echoed in this connection's hello.ok.
   private negotiated: ReadonlySet<string> = new Set()
-  // What this connection's HELLO offered.
+  // What this connection's HELLO offered, and whether it has been sent.
   private offeredThisHello: SocketCapability[] = []
+  private helloSent = false
+  // The current socket is being closed to negotiate `ack` (see maybeRenegotiateAck).
+  private renegotiating = false
   // The current socket's upgrade was answered with an HTTP status instead of
   // 101 (Node `ws` only; a browser-shaped socket cannot see it).
   private upgradeRejection: { status: number; retryAfter: string | null } | null = null
@@ -614,6 +623,10 @@ export class RealtimeClient {
   // reason about than interleaved read cursors.
   private drainInFlight = false
   private orderStates = new Map<string, OrderState>()
+  // Per-conversation serial lanes for message.new handlers (promise 2: one
+  // message at a time per conversation, in seq order). The tail of each
+  // lane; an idle lane has no entry, so the map holds busy lanes only.
+  private lanes = new Map<string, Promise<void>>()
   private disposed = false
 
   constructor(options: RealtimeOptions) {
@@ -718,6 +731,7 @@ export class RealtimeClient {
     this.ackMode = false
     this.negotiated = new Set()
     this.offeredThisHello = []
+    this.helloSent = false
     this.upgradeRejection = null
     this.livenessMs =
       this.options.livenessTimeoutMs ?? (isPingCapable(ws) ? DEFAULT_LIVENESS_TIMEOUT_MS : 0)
@@ -1161,6 +1175,8 @@ export class RealtimeClient {
   private handleClose(info: DisconnectInfo): void {
     const duringHandshake = !this.authenticated
     const rejection = this.upgradeRejection
+    const renegotiating = this.renegotiating
+    this.renegotiating = false
     this.upgradeRejection = null
     this.negotiated = new Set()
     this.clearWatchdogs()
@@ -1168,7 +1184,7 @@ export class RealtimeClient {
     // must not clear the backoff counter — that is the whole point of the
     // stability window.
     this.cancelStabilityTimer()
-    this.noteConnectionEnded()
+    if (!renegotiating) this.noteConnectionEnded()
     this.authenticated = false
     this.ackMode = false
 
@@ -1185,7 +1201,7 @@ export class RealtimeClient {
     // the next drain. That includes REST drain rows: the drain's cursor
     // covers only rows that reached a handler, so a parked row dropped
     // here stops the cursor instead of being acked.
-    if (this.options.ackOnReceipt) this.flushParkedFrames('connection_closed')
+    if (this.options.ackOnReceipt || renegotiating) this.flushParkedFrames('connection_closed')
 
     // Drop all per-conversation ordering state. Across the connection
     // break the application is responsible for calling /sync (or
@@ -1198,6 +1214,12 @@ export class RealtimeClient {
     this.generation++
 
     if (this.disposed) return
+
+    // A quiet renegotiation: straight back, no backoff step, no notice.
+    if (renegotiating) {
+      this.retryNow()
+      return
+    }
 
     // Over the connect budget (D8): an upgrade answered 429, or a close 1013.
     // Back off for the server's delay — never `blocked`, whatever the reason
@@ -1215,7 +1237,9 @@ export class RealtimeClient {
               `retrying in ${Math.round(budgetDelay / 1000)}s`,
           ),
         )
-        this.scheduleReconnect(budgetDelay)
+        // Up to 10% longer (never shorter) than the server asked: a fleet
+        // limited together does not come back in the same instant.
+        this.scheduleReconnect(this.jitteredAbove(budgetDelay, BUDGET_JITTER_RATIO))
         return
       }
     }
@@ -1367,6 +1391,11 @@ export class RealtimeClient {
     return Math.max(0, Math.floor(ms * factor))
   }
 
+  /** Jitter in [ms, ms × (1 + ratio)]: `ms` is a floor (a server-given delay is never shortened). */
+  private jitteredAbove(ms: number, ratio: number): number {
+    return Math.max(0, Math.floor(ms * (1 + Math.random() * ratio)))
+  }
+
   /** Jitter in [ms × (1 − ratio), ms]: `ms` is a ceiling. Thundering-herd-safe across a fleet. */
   private jitteredBelow(ms: number, ratio: number): number {
     const factor = 1 - Math.random() * ratio
@@ -1478,7 +1507,9 @@ export class RealtimeClient {
     // A validated wake frame is a WsMessage whose payload is a WakePayload;
     // dispatchWake guarantees the shape before any 'wake' handler runs.
     const stored = handler as MessageHandler
+    const firstMessageHandler = event === 'message.new' && handlers.size === 0
     handlers.add(stored)
+    if (firstMessageHandler) this.maybeRenegotiateAck()
     return () => {
       handlers!.delete(stored)
       if (handlers!.size === 0) this.handlers.delete(event)
@@ -1632,10 +1663,10 @@ export class RealtimeClient {
 
   private dispatch(message: WsMessage): void {
     if (this.isMessageNew(message)) {
-      // message.new rides the dedup + delivery-ack pipeline. Handlers are
-      // still invoked synchronously and in order here; only settlement
-      // (async handler completion → ack) is deferred. The returned promise
-      // never rejects.
+      // message.new rides the dedup + delivery-ack pipeline and its
+      // conversation's serial lane: one message at a time per conversation,
+      // in the order the ordering layer hands them over (seq order). The
+      // returned promise never rejects.
       void this.dispatchMessageNew(message)
       return
     }
@@ -1713,17 +1744,10 @@ export class RealtimeClient {
         return ok
       })
     } else {
-      const pending: Array<Promise<unknown>> = []
-      if (handlers) {
-        for (const handler of handlers) {
-          try {
-            const result = handler(message)
-            if (isThenable(result)) pending.push(result)
-          } catch (err) {
-            pending.push(Promise.reject(err))
-          }
-        }
-      }
+      // The handlers attached now are the ones this message goes to, even if
+      // its turn in the lane comes later (disconnect() releases the handlers
+      // right after flushing parked frames into the lanes).
+      const snapshot = handlers ? [...handlers] : []
       const entry: InFlight = {
         promise: Promise.resolve(false),
         generation: this.generation,
@@ -1731,14 +1755,8 @@ export class RealtimeClient {
         settled: false,
         ok: false,
       }
-      const own: Promise<boolean> = Promise.allSettled(pending).then((outcomes) => {
-        let ok = true
-        for (const outcome of outcomes) {
-          if (outcome.status === 'rejected') {
-            ok = false
-            this.emitError(toError(outcome.reason, 'message.new'))
-          }
-        }
+      const handled = this.runInLane(this.laneOf(message), () => this.invokeMessageHandlers(message, snapshot))
+      const own: Promise<boolean> = handled.then((ok) => {
         // Leave the in-flight map in the same step the outcome is known
         // (and, on success, the id enters the dedup cache): a later copy
         // always finds one or the other, never neither.
@@ -1761,6 +1779,92 @@ export class RealtimeClient {
 
     if (isDrainRow) this.drainSettlements.set(message, settlement)
     return settlement
+  }
+
+  /**
+   * Invoke one message's handlers (in registration order, synchronously),
+   * then wait for every one of them. `true` when all finished without
+   * throwing. Synchronous when every handler is (so a lane of plain
+   * handlers never waits a tick); a promise otherwise. Never rejects.
+   */
+  private invokeMessageHandlers(message: WsMessage, handlers: readonly MessageHandler[]): boolean | Promise<boolean> {
+    if (handlers.length === 0) return false
+    const pending: Array<Promise<unknown>> = []
+    let ok = true
+    for (const handler of handlers) {
+      try {
+        const result = handler(message)
+        if (isThenable(result)) pending.push(result)
+      } catch (err) {
+        ok = false
+        this.emitError(toError(err, 'message.new'))
+      }
+    }
+    if (pending.length === 0) return ok
+    return Promise.allSettled(pending).then((outcomes) => {
+      for (const outcome of outcomes) {
+        if (outcome.status === 'rejected') {
+          ok = false
+          this.emitError(toError(outcome.reason, 'message.new'))
+        }
+      }
+      return ok
+    })
+  }
+
+  /** A message's serial lane: its conversation, or one lane for messages that name none. */
+  private laneOf(message: WsMessage): string {
+    const id = (message as { payload?: { conversation_id?: unknown } }).payload?.conversation_id
+    return typeof id === 'string' && id.length > 0 ? `c:${id}` : '-'
+  }
+
+  /**
+   * Run `task` when the lane is free: at once (synchronously) on an idle
+   * lane, else after the task before it has finished. At most one task per
+   * lane runs at a time; lanes run concurrently with each other.
+   */
+  private runInLane(key: string, task: () => boolean | Promise<boolean>): Promise<boolean> {
+    const previous = this.lanes.get(key)
+    if (previous === undefined) {
+      const now = task()
+      // Finished synchronously: the lane stays free.
+      if (!isThenable(now)) return Promise.resolve(now)
+      this.setLaneTail(key, this.heldAtMost(now))
+      return now
+    }
+    const result = previous.then(task)
+    this.setLaneTail(key, previous.then(() => this.heldAtMost(result)))
+    return result
+  }
+
+  /**
+   * How long one handler run holds its lane: until it finishes, or
+   * `inFlightAdoptMs` at most — a handler that never finishes must not stop
+   * its conversation for good (it keeps running; the next message goes on).
+   */
+  private heldAtMost(run: Promise<unknown>): Promise<void> {
+    const ms = this.options.inFlightAdoptMs
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, ms)
+      unref(timer)
+      run.then(
+        () => {
+          clearTimeout(timer)
+          resolve()
+        },
+        () => {
+          clearTimeout(timer)
+          resolve()
+        },
+      )
+    })
+  }
+
+  private setLaneTail(key: string, tail: Promise<void>): void {
+    this.lanes.set(key, tail)
+    void tail.then(() => {
+      if (this.lanes.get(key) === tail) this.lanes.delete(key)
+    })
   }
 
   /**
@@ -1810,7 +1914,26 @@ export class RealtimeClient {
   private helloCapabilities(): SocketCapability[] {
     const withAck = this.hasMessageHandler()
     this.offeredThisHello = this.options.offeredCapabilities.filter((c) => c !== 'ack' || withAck)
+    this.helloSent = true
     return this.offeredThisHello
+  }
+
+  /**
+   * The first `message.new` handler was attached after this socket's HELLO
+   * went out without `ack`: reconnect once, quietly (no error, no backoff
+   * step), so the next HELLO negotiates delivery acks. Frames parked on a
+   * seq gap are handed to the handlers first — this socket was marked on
+   * send, so nothing would re-offer them.
+   */
+  private maybeRenegotiateAck(): void {
+    if (this.disposed || this.ws === null || !this.helloSent) return
+    if (this.offeredThisHello.includes('ack')) return
+    const ws = this.ws
+    queueMicrotask(() => {
+      if (this.ws !== ws || this.disposed || !this.hasMessageHandler()) return
+      this.renegotiating = true
+      this.abandonSocket(1000, 'client reconnects to negotiate delivery acks')
+    })
   }
 
   /** A `message.new` handler is attached: only then has this machine received a message. */

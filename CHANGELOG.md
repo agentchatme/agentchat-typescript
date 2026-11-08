@@ -18,7 +18,7 @@ server and against a contract v1 server.
   mode and a `status()` snapshot. A runtime supplies only `callModel` +
   `startTurn`, or `startRun`. In single-run mode an invite still pending
   after two completed runs is dismissed, so an ignored invite does not cost
-  a run on every wake.
+  a run on every wake (`dismissIgnoredInvites: false` turns it off).
 - `client.wakeWebhook.set` / `test` / `clear`, `rewake` included.
 - `client.groups.dismissInvite(inviteId)`: seen, left pending, not shown again.
 - `client.syncPage()` (rows plus `waitedMs` / `pollIntervalSeconds`), and

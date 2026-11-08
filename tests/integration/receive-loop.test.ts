@@ -942,3 +942,59 @@ describe('ReceiveLoop — deadlines (gateCallTimeoutMs, cycleTimeoutMs) and rece
     await loop.stop()
   })
 })
+
+describe('ReceiveLoop — dismissIgnoredInvites', () => {
+  it('false: a run-ignored invite is never dismissed and no outcome is recorded for it', async () => {
+    const { client, state, dismissInvite, tray } = fakeClient()
+    state.tray = trayOf([], { invites: [INVITE] })
+    let runs = 0
+    const events: ReceiveLoopEvent[] = []
+    const loop = new ReceiveLoop({
+      mode: 'singleRun',
+      client,
+      texts: textsSource(),
+      socket: null,
+      quietMs: 0,
+      maxMs: 0,
+      dismissIgnoredInvites: false,
+      startRun: async () => {
+        runs += 1
+        return { status: 'completed' }
+      },
+      onEvent: (e) => events.push(e),
+    })
+    for (let i = 1; i <= 3; i++) {
+      loop.wake()
+      await until(() => runs === i && loop.status().coalescer.state === 'idle', `run ${i}`)
+    }
+    await idle()
+    expect(dismissInvite).not.toHaveBeenCalled()
+    expect(events.filter((e) => e.type === 'invite_outcome')).toEqual([])
+    expect(tray).toHaveBeenCalledTimes(3) // no post-run reads
+    await loop.stop()
+  })
+
+  it('default (true): dismissed after the second completed run', async () => {
+    const { client, state, dismissInvite } = fakeClient()
+    state.tray = trayOf([], { invites: [INVITE] })
+    let runs = 0
+    const loop = new ReceiveLoop({
+      mode: 'singleRun',
+      client,
+      texts: textsSource(),
+      socket: null,
+      quietMs: 0,
+      maxMs: 0,
+      startRun: async () => {
+        runs += 1
+        return { status: 'completed' }
+      },
+    })
+    for (let i = 1; i <= 2; i++) {
+      loop.wake()
+      await until(() => runs === i && loop.status().coalescer.state === 'idle', `run ${i}`)
+    }
+    await until(() => dismissInvite.mock.calls.length === 1)
+    await loop.stop()
+  })
+})

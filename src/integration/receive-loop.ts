@@ -16,7 +16,8 @@
  *   the tray itself and records its own verdicts. The loop records nothing
  *   for cards. An invite still pending and undismissed after two completed
  *   runs is dismissed (seen, left pending, not shown again), so an ignored
- *   invite does not cost a run on every wake; the count is in memory only.
+ *   invite does not cost a run on every wake; the count is in memory only
+ *   (`dismissIgnoredInvites: false` turns this off).
  *
  * Wakes: a `message.new` frame that is not the echo of the agent's own send,
  * a `wake` frame (a reminder, or unanswered cards), every accepted HELLO (a
@@ -292,6 +293,13 @@ export interface ReceiveLoopOptions {
    * acting at its next step), reported once, and the loop takes wakes again.
    */
   readonly cycleTimeoutMs?: number
+  /**
+   * singleRun: dismiss an invite still pending after two completed runs that
+   * left it (default `true`), so an ignored invite does not cost a run on
+   * every wake. `false` leaves every invite to the runs (a host that
+   * forwards invites elsewhere): nothing is recorded for them.
+   */
+  readonly dismissIgnoredInvites?: boolean
   readonly quietMs?: number
   readonly maxMs?: number
   readonly onEvent?: (event: ReceiveLoopEvent) => void
@@ -914,7 +922,7 @@ export class ReceiveLoop {
     // Invites sit on the tray until answered, so one the run ignored would
     // cost a run on every wake: the same rule as an invite turn (D5) —
     // pending after the second completed run → dismissed.
-    const startedWith = tray === null ? [] : trayInvites(tray)
+    const startedWith = tray === null || this.options.dismissIgnoredInvites === false ? [] : trayInvites(tray)
     if (startedWith.length > 0) await this.track(this.afterRunInvites(startedWith, end))
     const outcome: CycleOutcome =
       end.status === 'completed' ? 'run_completed' : end.status === 'failed' ? 'run_failed' : 'run_not_started'

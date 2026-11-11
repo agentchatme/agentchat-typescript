@@ -12,15 +12,19 @@ Releases ship only through `.github/workflows/publish.yml`: npm trusted publishi
    node -p "require('./package.json').version"   # must print <version>
    git tag v<version> && git push origin v<version>
    ```
-   The tag must be exactly `v` + the `package.json` version. `publish.yml` publishes whatever `package.json` says and does not compare it with the tag, so check it before pushing.
-4. **The gate.** The tag push starts `publish.yml`. Its `test` job repeats the full CI gate on the tagged commit (Node 20 and 22: frozen install, `pnpm audit --prod --audit-level high`, type-check, tests, build). The `publish` job then waits at the `npm-publish` environment, and `notify-awaiting-tap` posts the run link to the Slack warning channel.
+   Two things only the person tagging checks; `publish.yml` checks neither:
+   - the tag is exactly `v` + the `package.json` version (it publishes whatever `package.json` says);
+   - the tagged commit is on `main` (any `v*` tag on any branch starts a publish).
+4. **The gate.** The tag push starts `publish.yml`. Its `test` job repeats CI's test job on the tagged commit (Node 20 and 22: frozen install, `pnpm audit --prod --audit-level high`, type-check, tests, build). CI's contract-fixture check and secret scan do not run again here; they ran on the release PR. The `publish` job then waits at the `npm-publish` environment, and `notify-awaiting-tap` posts the run link to the Slack warning channel.
 5. **The approval.** The approver taps **Approve and deploy**: `npm publish --access public` runs with OIDC, and npm attaches provenance. A red gate, a rejection or no approval publishes nothing; any red job posts `notify-failure` to the same channel.
 6. **The check.** `npm view agentchatme version` shows the number, and the package page's provenance points at the tagged commit.
 
 ## Other targets (Actions → Publish to npm → Run workflow)
 
-- **`test`**: publishes the dispatched commit under the `next` dist-tag, for an install check before a structural change ships. It is a real, public publish, and npm never reuses a number: use it only with a pre-release number in `package.json` (`1.4.0-rc.1`).
-- **`prod`**: publishes the dispatched commit to `latest`, behind the same approval. For finishing a release whose tag run failed for a reason outside the code (the commit must be the tagged one).
+All three wait for the same `npm-publish` approval.
+
+- **`test`**: publishes the dispatched commit under the `next` dist-tag, for an install check before a structural change ships. No Slack post asks for the tap. It is a real, public publish, and npm never reuses a number: use it only with a pre-release number in `package.json` (`1.4.0-rc.1`).
+- **`prod`**: publishes the dispatched commit to `latest`. For finishing a release whose tag run failed for a reason outside the code. Dispatch it on the tagged commit: nothing checks that it is.
 - **`stage-proof`**: see below.
 
 ## New-package checklist (one-time per package)

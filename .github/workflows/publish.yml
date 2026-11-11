@@ -4,8 +4,9 @@ name: Publish to npm
 #
 #   1. Push a tag matching `v*` (e.g. `v1.0.2`) on a commit on `main` →
 #      publishes to npm. The `verify` job refuses the release unless the
-#      tag is exactly `v` + the `package.json` version and the tagged commit
-#      is on `main`.
+#      tag is exactly `v` + the `package.json` version (not a pre-release),
+#      the tagged commit is on `main`, and the tag still points at it on
+#      origin (deleting a tag starts a run too).
 #
 #   2. Manual `workflow_dispatch`:
 #      - `target=test` publishes the dispatched commit under the `next`
@@ -13,7 +14,8 @@ name: Publish to npm
 #        npm never reuses a number, so `verify` requires a pre-release
 #        version in `package.json` (`1.4.0-rc.1`).
 #      - `target=prod` publishes the dispatched commit to `latest`; `verify`
-#        requires that commit to be on `main`.
+#        requires it to be on `main` and to be the commit `v<version>` points
+#        at (it finishes a release whose tag run failed).
 #      - `target=stage-proof` stages a throwaway prerelease (RELEASING.md).
 #
 # Auth is OIDC trusted publishing behind a human approval (converted
@@ -60,19 +62,32 @@ jobs:
             exit 1
           fi
           problems=0
+          # Build metadata (`+…`) is not part of the number npm keeps.
+          prerelease=false
+          if [[ "${version%%+*}" == *-* ]]; then prerelease=true; fi
           if [ "$EVENT" = "push" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match the package version $version (expected v$version)"
             problems=1
           fi
-          # Build metadata (`+…`) is not part of the number npm keeps.
-          if [ "$EVENT" = "workflow_dispatch" ] && [ "$TARGET" = "test" ] && [[ "${version%%+*}" != *-* ]]; then
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$TARGET" = "test" ] && [ "$prerelease" = false ]; then
             echo "::error::target=test publishes $version under the next dist-tag, and npm never reuses a number; set a pre-release version (like 1.4.0-rc.1) first"
             problems=1
           fi
           if [ "$EVENT" = "push" ] || [ "$TARGET" = "prod" ]; then
+            if [ "$prerelease" = true ]; then
+              echo "::error::$version is a pre-release: it goes out with target=test (the next dist-tag), never to latest"
+              problems=1
+            fi
             git fetch --no-tags origin main
             if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
               echo "::error::$GITHUB_SHA is not on main; releases are cut from main only"
+              problems=1
+            fi
+            # The tag as origin has it now. Deleting a tag starts a run too
+            # (on main's head), and a moved tag points elsewhere: both refused.
+            if ! git fetch -q --no-tags origin "+refs/tags/v$version:refs/verify/tag" 2>/dev/null \
+              || [ "$(git rev-parse 'refs/verify/tag^{commit}')" != "$GITHUB_SHA" ]; then
+              echo "::error::tag v$version on origin does not point at $GITHUB_SHA (missing, deleted or moved); a release publishes the commit its tag points at"
               problems=1
             fi
           fi
@@ -151,9 +166,10 @@ jobs:
   # awaiting-tap: fires after build succeeds, while the environment-gated
   # publish job sits waiting for the human approval — so the tap request
   # lives in Slack, not email. failure: any red job in the pipeline.
-  # Both fail-safe: absent secret → logged warning, exit 0. A post Slack
-  # refuses (a revoked webhook) or never answers fails its step, so the run
-  # shows it; continue-on-error keeps that from failing the release.
+  # Both fail-safe: absent secret → logged warning, exit 0. A post that
+  # Slack refuses (a revoked webhook) or never answers fails its step, with
+  # an error annotation on the run; continue-on-error keeps the job and the
+  # run green. publish never depends on a notify job.
   notify-awaiting-tap:
     runs-on: ubuntu-latest
     needs: test
@@ -167,6 +183,7 @@ jobs:
           WEBHOOK: ${{ secrets.SLACK_WEBHOOK_WARNING }}
           TEXT: ":hourglass_flowing_sand: *agentchatme (npm) release awaiting your approval* (`${{ github.ref_name }}` → npm-publish gate). Tap it here: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
+          set -o pipefail
           if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped"; exit 0; fi
           if ! printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -fsS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK"; then
             echo "::error::the Slack post failed (webhook revoked, or Slack unreachable)"
@@ -184,6 +201,7 @@ jobs:
           WEBHOOK: ${{ secrets.SLACK_WEBHOOK_WARNING }}
           TEXT: ":warning: *agentchatme (npm) publish pipeline failed* on `${{ github.ref_name }}` — ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
         run: |
+          set -o pipefail
           if [ -z "$WEBHOOK" ]; then echo "::warning::SLACK_WEBHOOK_WARNING not set — skipped"; exit 0; fi
           if ! printf '%s' "$TEXT" | jq -Rs '{text: .}' | curl -fsS -o /dev/null --max-time 15 -H 'Content-Type: application/json' -d @- "$WEBHOOK"; then
             echo "::error::the Slack post failed (webhook revoked, or Slack unreachable)"

@@ -50,7 +50,7 @@ const WIRE_FIXTURE = [
     id: 'msg_9f2c1b7a5e304d18',
     conversation_id: 'conv_51c9aa02f7d84b33',
     delivery_id: 'del_0a1b2c3d4e5f60718293a4b5c6d7e8f9',
-    sender: 'aleph-null',
+    sender: 'example-scout',
     client_msg_id: '3f6f0a52-6f3d-4bfb-9a91-1f0f0f8f2a11',
     seq: 41,
     type: 'text',
@@ -65,7 +65,7 @@ const WIRE_FIXTURE = [
     id: 'msg_c4d0e6f2a8b1479c',
     conversation_id: 'conv_51c9aa02f7d84b33',
     delivery_id: 'del_ffeeddccbbaa99887766554433221100',
-    sender: 'tessera-rho',
+    sender: 'example-quill',
     client_msg_id: '7f1d9f04-2c5e-49ab-8d3a-52f7f9b0c644',
     seq: 42,
     type: 'structured',
@@ -83,7 +83,7 @@ const WIRE_FIXTURE = [
     conversation_id: 'conv_e00f11223344a9b8',
     // Nullable on the wire — cursor computation must skip null rows.
     delivery_id: null,
-    sender: 'chatfather',
+    sender: 'example-notices',
     seq: 7,
     type: 'system',
     content: { text: 'group settings updated' },
@@ -114,7 +114,7 @@ describe('client.sync() — bare-array wire', () => {
     // Opaque STRING cursor, del_<32 hex> in production.
     expect(first.delivery_id).toBe('del_0a1b2c3d4e5f60718293a4b5c6d7e8f9')
     expect(first.delivery_id).toMatch(/^del_[0-9a-f]{32}$/)
-    expect(first.sender).toBe('aleph-null')
+    expect(first.sender).toBe('example-scout')
     expect(first.seq).toBe(41)
 
     // Passthrough: unknown fields survive untouched.

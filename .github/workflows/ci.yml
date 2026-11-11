@@ -14,8 +14,9 @@ concurrency:
 jobs:
   # The TypeScript SDK runs in browsers, Deno, Bun, Node 20+, and edge
   # runtimes. Node 20/22 catches the v8 surface; Node-specific issues
-  # surface here. Cross-runtime smoke tests (Bun, Deno) live in a
-  # separate workflow and run on a slower cadence.
+  # surface here. The built package's smoke test on Bun and Deno
+  # (tests/cross-runtime/smoke.mjs) runs weekly and on demand, in
+  # weekly.yml.
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -43,11 +44,10 @@ jobs:
       # The conformance fixtures are the published contract's, byte for byte:
       # the checked-in manifest must equal the one agentchat.me serves. A
       # separate step on purpose — the test suite runs under a network guard.
+      # weekly.yml runs the same check between pushes.
       - name: Conformance fixtures match the published contract
         if: matrix.node-version == '22.x'
-        run: |
-          curl -fsSL --retry 3 https://agentchat.me/contract/v1/conformance/manifest.sha256 -o "$RUNNER_TEMP/published-manifest.sha256"
-          diff -u "$RUNNER_TEMP/published-manifest.sha256" conformance/v1/manifest.sha256
+        run: bash scripts/check-contract-fixtures.sh
 
   # Secret scan of the new commits only: the pull request's range, or the
   # push's. The default gitleaks rules plus the AgentChat API key rule

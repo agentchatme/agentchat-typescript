@@ -1,0 +1,151 @@
+name: Weekly
+
+# Checks worth running even when nobody pushes, once a week and on demand
+# (Actions → Weekly → Run workflow):
+#
+# - contract-fixtures: the checked-in conformance fixtures against the
+#   contract agentchat.me publishes. CI runs the same script on every push
+#   to main and every pull request into main; this run flags a contract
+#   change on the server between pushes here.
+# - cross-runtime: the built package on the newest Bun 1.x and Deno 2.x
+#   (tests/cross-runtime/smoke.mjs: REST, the socket with acks, WebCrypto
+#   webhook checks, the gate fixtures, node:fs), so a runtime release that
+#   breaks the SDK shows up without a push.
+#
+# A run on main (scheduled or by hand) that does not pass, because a check
+# failed or timed out, opens an issue titled "Weekly checks failed", or
+# comments on the open one; a run on main that passes closes it. GitHub also
+# emails whoever last edited the cron line about a failed scheduled run; the
+# issue is the record everyone sees. Only the report job may write issues,
+# with the run's own GITHUB_TOKEN.
+#
+# Its own file, not a trigger in ci.yml: GitHub turns scheduled workflows off
+# in a public repository after 60 days without activity, and that must only
+# ever stop this file, never CI. Actions → Weekly → "Enable workflow" turns
+# it back on.
+
+on:
+  schedule:
+    - cron: "23 6 * * 1" # Mondays, 06:23 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: weekly
+  cancel-in-progress: false
+
+jobs:
+  contract-fixtures:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # A step timeout fails the step (a job timeout would read as cancelled).
+      - name: Conformance fixtures match the published contract
+        timeout-minutes: 3
+        run: bash scripts/check-contract-fixtures.sh
+
+  cross-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        runtime: [bun, deno]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm run build
+
+      - if: matrix.runtime == 'bun'
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.x
+
+      - if: matrix.runtime == 'deno'
+        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2.0.5
+        with:
+          deno-version: 2.x
+
+      # Run from the repo, so `agentchatme` resolves to this build through
+      # package.json "exports", and `ws` from node_modules.
+      - name: Smoke test on Bun
+        timeout-minutes: 5
+        if: matrix.runtime == 'bun'
+        run: |
+          bun --version
+          bun tests/cross-runtime/smoke.mjs "$RUNNER_TEMP"
+
+      # Deno's permissions are the network guard here: loopback only. The two
+      # env names are the ones the `ws` package reads at import.
+      - name: Smoke test on Deno
+        timeout-minutes: 5
+        if: matrix.runtime == 'deno'
+        run: |
+          deno --version
+          deno run --allow-read --allow-net=127.0.0.1 --allow-write="$RUNNER_TEMP" \
+            --allow-env=WS_NO_BUFFER_UTIL,WS_NO_UTF_8_VALIDATE \
+            tests/cross-runtime/smoke.mjs "$RUNNER_TEMP"
+
+  # Not when the whole run was cancelled by hand; a job that timed out or
+  # failed is reported.
+  report:
+    needs: [contract-fixtures, cross-runtime]
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    steps:
+      - name: Open, update or close the "Weekly checks failed" issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CONTRACT: ${{ needs.contract-fixtures.result }}
+          RUNTIMES: ${{ needs.cross-runtime.result }}
+        run: |
+          set -euo pipefail
+          TITLE="Weekly checks failed"
+          # The open issues themselves, not the search index (it can lag a
+          # run behind and open a duplicate); the exact title only.
+          EXISTING=$(gh issue list --state open --limit 200 --json number,title \
+            --jq '[.[] | select(.title == "Weekly checks failed")][0].number // empty')
+
+          # Only a pass on both closes; anything else (failure, a timeout,
+          # a cancellation) is reported.
+          if [ "$CONTRACT" = "success" ] && [ "$RUNTIMES" = "success" ]; then
+            if [ -n "$EXISTING" ]; then
+              gh issue comment "$EXISTING" --body "The weekly checks pass again: $RUN_URL"
+              gh issue close "$EXISTING"
+            fi
+            exit 0
+          fi
+
+          {
+            echo "A run of \`.github/workflows/weekly.yml\` on \`main\` did not pass: $RUN_URL"
+            echo
+            echo "- **Contract fixtures: $CONTRACT.** \`conformance/v1/manifest.sha256\` against https://agentchat.me/contract/v1/conformance/manifest.sha256. A failure means the published contract changed (or could not be fetched): copy the published fixtures into \`conformance/v1/\` byte for byte, run the tests, and fix what they find."
+            echo "- **Cross-runtime smoke (Bun, Deno): $RUNTIMES.** \`tests/cross-runtime/smoke.mjs\` on the newest Bun 1.x and Deno 2.x. The run log names the failing check and the runtime version."
+            echo
+            echo "A run on main that does not pass comments here; one that passes closes this issue."
+          } > issue-body.md
+
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file issue-body.md
+            echo "Commented on issue #$EXISTING"
+          else
+            gh issue create --title "$TITLE" --body-file issue-body.md
+          fi

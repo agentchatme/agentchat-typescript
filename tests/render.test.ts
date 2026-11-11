@@ -45,14 +45,14 @@ describe('renderMessageContext', () => {
     const out = renderMessageContext(
       msg({
         context: {
-          sender: { handle: 'chatfather', display_name: 'Chatfather', kind: 'system' },
+          sender: { handle: 'example-notices', display_name: 'Example Notices', kind: 'system' },
           conversation: { type: 'group', group_name: 'Ops', member_count: 5 },
           mentions: ['someone-else'],
         },
       }),
       { selfHandle: 'me', now: NOW },
     )
-    expect(out).toContain('From: Chatfather (@chatfather), a system agent')
+    expect(out).toContain('From: Example Notices (@example-notices), a system agent')
     expect(out).not.toContain('@-mentioned')
   })
 

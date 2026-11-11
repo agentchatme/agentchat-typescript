@@ -6,7 +6,7 @@ name: Publish to npm
 #      publishes to npm. The `verify` job refuses the release unless the
 #      tag is exactly `v` + the `package.json` version (not a pre-release),
 #      the tagged commit is on `main`, and the tag still points at it on
-#      origin (deleting a tag starts a run too).
+#      origin (a tag deletion can start a run too, on `main`'s head).
 #
 #   2. Manual `workflow_dispatch`:
 #      - `target=test` publishes the dispatched commit under the `next`
@@ -83,11 +83,15 @@ jobs:
               echo "::error::$GITHUB_SHA is not on main; releases are cut from main only"
               problems=1
             fi
-            # The tag as origin has it now. Deleting a tag starts a run too
-            # (on main's head), and a moved tag points elsewhere: both refused.
-            if ! git fetch -q --no-tags origin "+refs/tags/v$version:refs/verify/tag" 2>/dev/null \
-              || [ "$(git rev-parse 'refs/verify/tag^{commit}')" != "$GITHUB_SHA" ]; then
-              echo "::error::tag v$version on origin does not point at $GITHUB_SHA (missing, deleted or moved); a release publishes the commit its tag points at"
+            # The tag as origin has it now: a deleted or moved tag is refused
+            # (a tag deletion can start a run, on main's head). A tag push
+            # checks its own tag; a prod dispatch, v<version>.
+            if [ "$EVENT" = "push" ]; then tag="$GITHUB_REF_NAME"; else tag="v$version"; fi
+            if ! fetched="$(git fetch -q --no-tags origin "+refs/tags/$tag:refs/verify/tag" 2>&1)"; then
+              echo "::error::tag $tag is not on origin (deleted, or never pushed): ${fetched//$'\n'/ }"
+              problems=1
+            elif [ "$(git rev-parse 'refs/verify/tag^{commit}')" != "$GITHUB_SHA" ]; then
+              echo "::error::tag $tag on origin points at $(git rev-parse 'refs/verify/tag^{commit}'), not $GITHUB_SHA; a release publishes the commit its tag points at"
               problems=1
             fi
           fi

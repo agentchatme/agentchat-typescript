@@ -16,7 +16,7 @@ Releases ship only through `.github/workflows/publish.yml`: npm trusted publishi
    `publish.yml`'s `verify` job refuses the release, before anything else runs, unless:
    - the tag is exactly `v` + the `package.json` version, and that version is not a pre-release;
    - the tagged commit is on `main`;
-   - the tag still points at that commit on origin (deleting a tag starts a run too, on `main`'s head).
+   - the tag still points at that commit on origin (a tag deletion can start a run too, on `main`'s head).
 
    GitHub runs the `publish.yml` of the tagged commit, so a commit whose workflow predates `verify`, or that edits it, skips these checks. The approval is the check nothing skips: approve only a run whose `verify` job is green.
 4. **The gate.** The tag push starts `publish.yml`. After `verify`, its `test` job repeats CI's test job on the tagged commit (Node 20 and 22: frozen install, `pnpm audit --prod --audit-level high`, type-check, tests, build). CI's contract-fixture check and secret scan do not run again here; they ran on the release PR. The `publish` job then waits at the `npm-publish` environment, and `notify-awaiting-tap` posts the run link to the Slack warning channel.
@@ -28,7 +28,7 @@ Releases ship only through `.github/workflows/publish.yml`: npm trusted publishi
 All three wait for the same `npm-publish` approval.
 
 - **`test`**: publishes the dispatched commit under the `next` dist-tag, for an install check before a structural change ships. No Slack post asks for the tap. It is a real, public publish, and npm never reuses a number: `verify` refuses it unless `package.json` has a pre-release number (`1.4.0-rc.1`).
-- **`prod`**: publishes the dispatched commit to `latest`. For finishing a release whose tag run failed for a reason outside the code. Dispatch it on the tagged commit: `verify` refuses a commit that is not on `main`, or that `v<version>` does not point at.
+- **`prod`**: publishes the dispatched commit to `latest`. For finishing a release whose tag run failed for a reason outside the code. Dispatch it on the tag (pick `v<version>` under *Use workflow from*, or `gh workflow run publish.yml --ref v<version> -f target=prod`): `verify` refuses a commit that is not on `main`, or that `v<version>` does not point at.
 - **`stage-proof`**: see below.
 
 ## New-package checklist (one-time per package)

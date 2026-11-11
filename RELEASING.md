@@ -1,11 +1,27 @@
 # Releasing `agentchatme`
 
-Releases ship ONLY through the gated pipeline — never `npm publish` from a machine (the account's security-key 2FA EOTPs every token type; this is by design and by npm policy).
+Releases ship only through `.github/workflows/publish.yml`: npm trusted publishing (OIDC) behind a human approval, with provenance attached. Never `npm publish` from a machine. No npm token exists anywhere: the account's security-key 2FA makes every token type ask for a one-time password, by design.
 
-1. Bump the version — append-digit scheme (0.7.8 → 0.7.81 → 0.7.82; brand-new packages start 0.0.1). Keep lockstep files in sync where they exist.
-2. Commit and push, then tag and push the tag: `git tag v<version> && git push origin v<version>`
-3. CI re-runs the full gate on the tagged commit, then waits at the `npm-publish` environment.
-4. The approver gets a GitHub notification — one tap on **Approve and deploy** publishes to npm with provenance. Red gate, rejection, or silence = nothing publishes.
+## A release
+
+1. **The number.** The founder sets it, per [VERSIONING.md](./VERSIONING.md).
+2. **The release PR**, from `main`: the `version` in `package.json` (the only place it lives; the build injects it as `VERSION` and into the User-Agent) and a CHANGELOG section `## <version> — <date>`. CI green, merged.
+3. **The tag**, on the merge commit on `main`:
+   ```bash
+   git fetch origin && git checkout origin/main
+   node -p "require('./package.json').version"   # must print <version>
+   git tag v<version> && git push origin v<version>
+   ```
+   The tag must be exactly `v` + the `package.json` version. `publish.yml` publishes whatever `package.json` says and does not compare it with the tag, so check it before pushing.
+4. **The gate.** The tag push starts `publish.yml`. Its `test` job repeats the full CI gate on the tagged commit (Node 20 and 22: frozen install, `pnpm audit --prod --audit-level high`, type-check, tests, build). The `publish` job then waits at the `npm-publish` environment, and `notify-awaiting-tap` posts the run link to the Slack warning channel.
+5. **The approval.** The approver taps **Approve and deploy**: `npm publish --access public` runs with OIDC, and npm attaches provenance. A red gate, a rejection or no approval publishes nothing; any red job posts `notify-failure` to the same channel.
+6. **The check.** `npm view agentchatme version` shows the number, and the package page's provenance points at the tagged commit.
+
+## Other targets (Actions → Publish to npm → Run workflow)
+
+- **`test`**: publishes the dispatched commit under the `next` dist-tag, for an install check before a structural change ships. It is a real, public publish, and npm never reuses a number: use it only with a pre-release number in `package.json` (`1.4.0-rc.1`).
+- **`prod`**: publishes the dispatched commit to `latest`, behind the same approval. For finishing a release whose tag run failed for a reason outside the code (the commit must be the tagged one).
+- **`stage-proof`**: see below.
 
 ## New-package checklist (one-time per package)
 

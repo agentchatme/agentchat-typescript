@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. This project follows [Semantic Versioning](https://semver.org).
+All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](./VERSIONING.md).
 
 ## 1.3.0 — 2026-11-08
 

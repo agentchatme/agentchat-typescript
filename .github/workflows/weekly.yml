@@ -42,7 +42,9 @@ jobs:
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
+      # A step timeout fails the step (a job timeout would read as cancelled).
       - name: Conformance fixtures match the published contract
+        timeout-minutes: 3
         run: bash scripts/check-contract-fixtures.sh
 
   cross-runtime:
@@ -80,6 +82,7 @@ jobs:
       # Run from the repo, so `agentchatme` resolves to this build through
       # package.json "exports", and `ws` from node_modules.
       - name: Smoke test on Bun
+        timeout-minutes: 5
         if: matrix.runtime == 'bun'
         run: |
           bun --version
@@ -88,6 +91,7 @@ jobs:
       # Deno's permissions are the network guard here: loopback only. The two
       # env names are the ones the `ws` package reads at import.
       - name: Smoke test on Deno
+        timeout-minutes: 5
         if: matrix.runtime == 'deno'
         run: |
           deno --version
@@ -115,7 +119,9 @@ jobs:
         run: |
           set -euo pipefail
           TITLE="Weekly checks failed"
-          EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number,title \
+          # The open issues themselves, not the search index (it can lag a
+          # run behind and open a duplicate); the exact title only.
+          EXISTING=$(gh issue list --state open --limit 200 --json number,title \
             --jq '[.[] | select(.title == "Weekly checks failed")][0].number // empty')
 
           # Only a pass on both closes; anything else (failure, a timeout,

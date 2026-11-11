@@ -5,16 +5,19 @@ name: Weekly
 #
 # - contract-fixtures: the checked-in conformance fixtures against the
 #   contract agentchat.me publishes. CI runs the same script on every push
-#   and pull request; this run flags a contract change on the server between
-#   pushes here.
+#   to main and every pull request into main; this run flags a contract
+#   change on the server between pushes here.
 # - cross-runtime: the built package on the newest Bun 1.x and Deno 2.x
 #   (tests/cross-runtime/smoke.mjs: REST, the socket with acks, WebCrypto
 #   webhook checks, the gate fixtures, node:fs), so a runtime release that
 #   breaks the SDK shows up without a push.
 #
-# A scheduled run that fails opens an issue titled "Weekly checks failed",
-# or comments on the open one; a scheduled run that passes closes it. Only
-# the report job may write issues, with the run's own GITHUB_TOKEN.
+# A run on main (scheduled or by hand) that does not pass, because a check
+# failed or timed out, opens an issue titled "Weekly checks failed", or
+# comments on the open one; a run on main that passes closes it. GitHub also
+# emails whoever last edited the cron line about a failed scheduled run; the
+# issue is the record everyone sees. Only the report job may write issues,
+# with the run's own GITHUB_TOKEN.
 #
 # Its own file, not a trigger in ci.yml: GitHub turns scheduled workflows off
 # in a public repository after 60 days without activity, and that must only
@@ -78,22 +81,29 @@ jobs:
         with:
           deno-version: 2.x
 
+      # Run from the repo, so `agentchatme` resolves to this build through
+      # package.json "exports", and `ws` from node_modules.
       - name: Smoke test on Bun
         if: matrix.runtime == 'bun'
         run: |
           bun --version
           bun tests/cross-runtime/smoke.mjs "$RUNNER_TEMP"
 
-      # Deno's permissions are the network guard here: loopback only.
+      # Deno's permissions are the network guard here: loopback only. The two
+      # env names are the ones the `ws` package reads at import.
       - name: Smoke test on Deno
         if: matrix.runtime == 'deno'
         run: |
           deno --version
-          deno run --allow-read --allow-net=127.0.0.1 --allow-write="$RUNNER_TEMP" tests/cross-runtime/smoke.mjs "$RUNNER_TEMP"
+          deno run --allow-read --allow-net=127.0.0.1 --allow-write="$RUNNER_TEMP" \
+            --allow-env=WS_NO_BUFFER_UTIL,WS_NO_UTF_8_VALIDATE \
+            tests/cross-runtime/smoke.mjs "$RUNNER_TEMP"
 
+  # Not when the whole run was cancelled by hand; a job that timed out or
+  # failed is reported.
   report:
     needs: [contract-fixtures, cross-runtime]
-    if: always() && github.event_name == 'schedule'
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -112,6 +122,8 @@ jobs:
           EXISTING=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number,title \
             --jq '[.[] | select(.title == "Weekly checks failed")][0].number // empty')
 
+          # Only a pass on both closes; anything else (failure, a timeout,
+          # a cancellation) is reported.
           if [ "$CONTRACT" = "success" ] && [ "$RUNTIMES" = "success" ]; then
             if [ -n "$EXISTING" ]; then
               gh issue comment "$EXISTING" --body "The weekly checks pass again: $RUN_URL"
@@ -119,18 +131,14 @@ jobs:
             fi
             exit 0
           fi
-          if [ "$CONTRACT" != "failure" ] && [ "$RUNTIMES" != "failure" ]; then
-            echo "No check failed (contract-fixtures: $CONTRACT, cross-runtime: $RUNTIMES): nothing to report."
-            exit 0
-          fi
 
           {
-            echo "The scheduled run of \`.github/workflows/weekly.yml\` on \`main\` failed: $RUN_URL"
+            echo "A run of \`.github/workflows/weekly.yml\` on \`main\` did not pass: $RUN_URL"
             echo
             echo "- **Contract fixtures: $CONTRACT.** \`conformance/v1/manifest.sha256\` against https://agentchat.me/contract/v1/conformance/manifest.sha256. A failure means the published contract changed (or could not be fetched): copy the published fixtures into \`conformance/v1/\` byte for byte, run the tests, and fix what they find."
             echo "- **Cross-runtime smoke (Bun, Deno): $RUNTIMES.** \`tests/cross-runtime/smoke.mjs\` on the newest Bun 1.x and Deno 2.x. The run log names the failing check and the runtime version."
             echo
-            echo "A scheduled run that fails again comments here; one that passes closes this issue."
+            echo "A run on main that does not pass comments here; one that passes closes this issue."
           } > issue-body.md
 
           if [ -n "$EXISTING" ]; then

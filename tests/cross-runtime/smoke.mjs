@@ -1,20 +1,23 @@
-// Cross-runtime smoke test: the BUILT package (dist/, what npm ships) on Bun
-// and Deno. The vitest suite covers Node against the sources; this covers
-// the runtimes the README promises, through their own fetch, WebSocket,
-// WebCrypto, timers and node:fs, against a fake server on 127.0.0.1.
+// Cross-runtime smoke test: the BUILT package (dist/, what npm ships, loaded
+// by its own name through package.json "exports") on Bun and Deno. The
+// vitest suite covers Node against the sources; this covers the runtimes the
+// README promises, through their own fetch, WebSocket, WebCrypto, timers and
+// node:fs, against a fake server on 127.0.0.1.
 //
-//   pnpm run build
+//   pnpm install && pnpm run build
 //   bun tests/cross-runtime/smoke.mjs <work dir>
-//   deno run --allow-read --allow-net=127.0.0.1 --allow-write=<work dir> tests/cross-runtime/smoke.mjs <work dir>
+//   deno run --allow-read --allow-net=127.0.0.1 --allow-write=<work dir> \
+//     --allow-env=WS_NO_BUFFER_UTIL,WS_NO_UTF_8_VALIDATE tests/cross-runtime/smoke.mjs <work dir>
 //
-// Deno's permissions double as the network guard: nothing but loopback.
-// The work dir is where the atomic-write check writes (it must exist).
-// Run weekly and on demand by .github/workflows/weekly.yml.
+// Deno's permissions double as the network guard: nothing but loopback. The
+// two env names are the ones the `ws` package reads at import; without them
+// `import('ws')` fails on Deno. The work dir is where the atomic-write check
+// writes (it must exist). Run weekly and on demand by .github/workflows/weekly.yml.
 
 import { readdir, readFile, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import * as sdk from '../../dist/index.js'
+import * as sdk from 'agentchatme'
 
 const RUNTIME = typeof globalThis.Bun !== 'undefined' ? 'bun' : typeof globalThis.Deno !== 'undefined' ? 'deno' : null
 const exit = (code) => (globalThis.Deno ? globalThis.Deno.exit(code) : globalThis.process.exit(code))
@@ -167,7 +170,7 @@ function messageRow(id, body) {
   }
 }
 
-const seen = { userAgents: [], sends: [], hellos: [], acks: [] }
+const seen = { userAgents: [], sends: [], sendTimes: [], hellos: [], acks: [] }
 let ackWaiter = null
 
 const server = await serve({
@@ -184,9 +187,11 @@ const server = await serve({
     if (req.method === 'POST' && url.pathname === '/v1/messages') {
       const body = await req.json()
       seen.sends.push(body)
-      // The first attempt fails retryably: the SDK waits (Retry-After: 0)
-      // and replays with the same client_msg_id.
-      if (seen.sends.length === 1) return json(503, { code: 'INTERNAL_ERROR', message: 'try again' }, { 'retry-after': '0' })
+      seen.sendTimes.push(performance.now())
+      // The first attempt fails retryably: the SDK waits the Retry-After
+      // (1 s, far above its own 250 ms backoff) and replays with the same
+      // client_msg_id.
+      if (seen.sends.length === 1) return json(503, { code: 'INTERNAL_ERROR', message: 'try again' }, { 'retry-after': '1' })
       return json(201, messageRow('msg_smoke_sent00001', body))
     }
     return json(404, { code: 'NOT_FOUND', message: `no route ${req.method} ${url.pathname}` })
@@ -210,7 +215,7 @@ const WS_BASE = `ws://127.0.0.1:${server.port}`
 // ─── the checks ─────────────────────────────────────────────────────────────
 
 await step('the ESM and CommonJS builds load and export the same names', async () => {
-  const cjs = createRequire(import.meta.url)('../../dist/index.cjs')
+  const cjs = createRequire(import.meta.url)('agentchatme')
   checkEqual(Object.keys(cjs).sort(), Object.keys(sdk).sort(), 'ESM and CJS export lists differ')
   for (const name of ['AgentChatClient', 'RealtimeClient', 'verifyWakeWebhook', 'gate', 'integration', 'VERSION']) {
     check(name in sdk, `missing export ${name}`)
@@ -242,6 +247,8 @@ await step('REST: a 503 is retried after Retry-After with the same client_msg_id
   check(message.id === 'msg_smoke_sent00001', `send returned ${JSON.stringify(message)}`)
   check(seen.sends.length === 2, `expected 2 attempts, the server saw ${seen.sends.length}`)
   check(seen.sends[0].client_msg_id === seen.sends[1].client_msg_id, 'the replay changed client_msg_id')
+  const waited = seen.sendTimes[1] - seen.sendTimes[0]
+  check(waited >= 900, `the replay came ${Math.round(waited)} ms after the 503, not after its Retry-After (1 s)`)
   check(/^[0-9a-f-]{36}$/i.test(seen.sends[0].client_msg_id), `client_msg_id is not a UUID: ${seen.sends[0].client_msg_id}`)
 })
 
@@ -266,11 +273,15 @@ async function socketRoundTrip(options) {
   }
 }
 
-await step('socket: HELLO, hello.ok, a live message, its ack (the WebSocket the SDK picks)', async () => {
-  await socketRoundTrip({})
+// Both sockets the SDK can pick on these runtimes, each named explicitly
+// (which one it picks by default depends on whether `ws` resolves).
+await step('socket: HELLO, hello.ok, a live message, its ack, over the `ws` package', async () => {
+  const { default: WebSocketFromWs } = await import('ws')
+  check(typeof WebSocketFromWs === 'function', 'the ws package exported no WebSocket')
+  await socketRoundTrip({ webSocket: WebSocketFromWs })
 })
 
-await step("socket: the same round trip on the runtime's native WebSocket", async () => {
+await step("socket: the same round trip over the runtime's native WebSocket", async () => {
   check(typeof globalThis.WebSocket === 'function', 'no native WebSocket')
   await socketRoundTrip({ webSocket: globalThis.WebSocket })
 })

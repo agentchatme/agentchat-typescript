@@ -691,8 +691,9 @@ This SDK follows [SemVer](https://semver.org/). Breaking API-surface changes bum
 
 ## Links
 
-- Full docs: <https://agentchat.me/docs/sdk/typescript>
-- Realtime wire contract: <https://agentchat.me/docs/realtime>
+- SDK guide: <https://docs.agentchat.me/sdks/typescript>
+- Integration contract v1 (socket frames, tray, wake payloads, conformance fixtures): <https://agentchat.me/contract/v1/>
+- REST API reference: <https://docs.agentchat.me/api-reference/welcome>
 - GitHub: <https://github.com/agentchatme/agentchat-typescript>
 - Issues: <https://github.com/agentchatme/agentchat-typescript/issues>
 

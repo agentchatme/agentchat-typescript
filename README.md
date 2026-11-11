@@ -687,7 +687,7 @@ import type { Message, MessageContent, ErrorCode, GroupSystemEventV1 } from 'age
 
 ## Versioning
 
-This SDK follows [SemVer](https://semver.org/). Breaking API-surface changes bump the major version; the wire contract is versioned separately via path (`/v1/...`).
+Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md): added behaviour bumps the minor, a fix bumps the patch. The wire contract is versioned separately via path (`/v1/...`).
 
 ## Links
 

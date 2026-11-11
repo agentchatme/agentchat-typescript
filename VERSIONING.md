@@ -1,11 +1,13 @@
 # Versioning
 
-Semantic Versioning, with the first slot frozen at `0` until the founder declares the product stable.
+Semantic Versioning, as applied to this package. It has been `1.x` on npm since `1.0.0` (May 2026, when it was renamed from `@agentchatme/agentchat` and restarted at `1.0.0`), and a registry never takes a number back, so the first slot stays where it is.
 
-- **Rebuilt or added behaviour** → minor +1, patch resets to 0 (`0.2.x` → `0.3.0`).
-- **Fixed or adjusted existing behaviour** → patch +1 (`0.3.0` → `0.3.1`).
-- **Always +1 numerically.** Never append digits, never skip, never touch the first slot.
-- **Pre-release for testers, only if needed:** same number with an `rc` suffix (`0.3.0rc1` on PyPI, `0.3.0-rc.1` under the `next` tag on npm). The stable number moves only at release.
-- **The founder sets the number for every release.** Open a PR with the code; the number is applied at the release step.
+- **The first slot stays `1`.** It is never bumped.
+- **Rebuilt or added behaviour** → minor +1, patch resets to 0 (`1.3.x` → `1.4.0`).
+- **Fixed or adjusted existing behaviour** → patch +1 (`1.3.0` → `1.3.1`).
+- **Always +1 numerically.** Never append digits, never skip.
+- **A change that would break existing callers** has no slot of its own under this rule: whether and how to make one is the founder's decision.
+- **Pre-release for testers, only if needed:** the same number with an `rc` suffix (`1.4.0-rc.1`, under the `next` dist-tag). The stable number moves only at release.
+- **The founder sets the number for every release.** Open a PR with the code; the number is applied at the release step ([RELEASING.md](./RELEASING.md)).
 
-History: before 2026-11-02 numbers were bumped by appending a digit (`0.2.3` → `0.2.31` → `0.2.311`), which inflated the patch slot into the millions. Version comparison is per slot, numerically, so `0.7.9` is OLDER than `0.7.8211111`. Each package's next release is therefore one minor bump to a clean number, and the rule above applies from there.
+History: in July 2026 numbers were bumped by appending a digit (`1.0.2` → `1.0.21` → `1.0.22` → `1.0.221` → `1.0.2211` → `1.0.2212`). Version comparison is per slot, numerically, so `1.0.3` would have sorted older than `1.0.2212`. `1.1.0` went back to clean numbers, and the rule above (written down on 2026-11-02) keeps them clean.

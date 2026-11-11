@@ -12,24 +12,24 @@ Releases ship only through `.github/workflows/publish.yml`: npm trusted publishi
    node -p "require('./package.json').version"   # must print <version>
    git tag v<version> && git push origin v<version>
    ```
-   Two things only the person tagging checks; `publish.yml` checks neither:
-   - the tag is exactly `v` + the `package.json` version (it publishes whatever `package.json` says);
-   - the tagged commit is on `main` (any `v*` tag on any branch starts a publish).
-4. **The gate.** The tag push starts `publish.yml`. Its `test` job repeats CI's test job on the tagged commit (Node 20 and 22: frozen install, `pnpm audit --prod --audit-level high`, type-check, tests, build). CI's contract-fixture check and secret scan do not run again here; they ran on the release PR. The `publish` job then waits at the `npm-publish` environment, and `notify-awaiting-tap` posts the run link to the Slack warning channel.
-5. **The approval.** The approver taps **Approve and deploy**: `npm publish --access public` runs with OIDC, and npm attaches provenance. A red gate, a rejection or no approval publishes nothing; any red job posts `notify-failure` to the same channel.
+   `publish.yml`'s `verify` job refuses the release, before anything else runs, unless:
+   - the tag is exactly `v` + the `package.json` version;
+   - the tagged commit is on `main` (a `v*` tag on any other branch publishes nothing).
+4. **The gate.** The tag push starts `publish.yml`. After `verify`, its `test` job repeats CI's test job on the tagged commit (Node 20 and 22: frozen install, `pnpm audit --prod --audit-level high`, type-check, tests, build). CI's contract-fixture check and secret scan do not run again here; they ran on the release PR. The `publish` job then waits at the `npm-publish` environment, and `notify-awaiting-tap` posts the run link to the Slack warning channel.
+5. **The approval.** The approver taps **Approve and deploy**: `npm publish --access public` runs with OIDC, and npm attaches provenance. A red gate, a rejection or no approval publishes nothing; any red job posts `notify-failure` to the same channel. A Slack post that fails (a revoked webhook, Slack unreachable) shows as a failed step on the run and never holds up the release.
 6. **The check.** `npm view agentchatme version` shows the number, and the package page's provenance points at the tagged commit.
 
 ## Other targets (Actions → Publish to npm → Run workflow)
 
 All three wait for the same `npm-publish` approval.
 
-- **`test`**: publishes the dispatched commit under the `next` dist-tag, for an install check before a structural change ships. No Slack post asks for the tap. It is a real, public publish, and npm never reuses a number: use it only with a pre-release number in `package.json` (`1.4.0-rc.1`).
-- **`prod`**: publishes the dispatched commit to `latest`. For finishing a release whose tag run failed for a reason outside the code. Dispatch it on the tagged commit: nothing checks that it is.
+- **`test`**: publishes the dispatched commit under the `next` dist-tag, for an install check before a structural change ships. No Slack post asks for the tap. It is a real, public publish, and npm never reuses a number: `verify` refuses it unless `package.json` has a pre-release number (`1.4.0-rc.1`).
+- **`prod`**: publishes the dispatched commit to `latest`. For finishing a release whose tag run failed for a reason outside the code. `verify` refuses a commit that is not on `main`; dispatch it on the tagged commit (nothing checks that it is the tagged one).
 - **`stage-proof`**: see below.
 
 ## New-package checklist (one-time per package)
 
-- Copy this repo's `.github/workflows/publish.yml` shape: gate job → `environment: npm-publish` + `id-token: write` → `npm install -g npm@latest` → `npm publish`.
+- Copy this repo's `.github/workflows/publish.yml` shape: `verify` job → gate job → `environment: npm-publish` + `id-token: write` → `npm install -g npm@latest` → `npm publish`.
 - Create the `npm-publish` environment with the required reviewer (repo Settings → Environments, or the API).
 - `package.json` `repository.url` must exactly match the GitHub repo — npm checks it.
 - npmjs.com → package Settings → Trusted Publisher: owner `agentchatme`, the repo name, workflow `publish.yml` (bare filename, no path), environment `npm-publish`, tick **npm publish** under allowed actions. Complete the security-key prompt and confirm a **saved summary card** renders — npm silently discards unconfirmed saves and only validates at publish time (mismatches surface as E404 on PUT).

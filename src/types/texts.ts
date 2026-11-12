@@ -33,8 +33,9 @@ export interface Texts {
   /**
    * Gate-call mode: what each reply turn starts with (contract v1 §3.6). It
    * names one conversation: replace every `<conversation_id>` with the card's
-   * conversation id. Absent on older servers; a reply turn then starts with
-   * `wake_instruction` and a `conversation_id:` line.
+   * conversation id (a template without it is followed by a
+   * `conversation_id:` line). Absent on older servers; a reply turn then
+   * starts with `wake_instruction` and a `conversation_id:` line.
    */
   reply_turn_template?: string
 }

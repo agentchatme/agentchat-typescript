@@ -100,9 +100,16 @@ const RECENT_CYCLES = 20
 
 /** One cycle's clock and identity: abandoned cycles go stale and stop acting. */
 interface CycleRun {
+  /** The cycle's number in this loop: unique, increasing (not consecutive: an abandonment skips one). */
   readonly token: number
   readonly signal: AbortSignal
+  /** Abandoned by the watchdog, or the loop stopped: the cycle acts no more. */
   stale(): boolean
+  /**
+   * Abandoned by the watchdog (not a stop): its `abandoned` summary is out
+   * already, so it reports and counts nothing more.
+   */
+  abandoned(): boolean
   /** Await work whose time does not count against the cycle deadline (turn admissions, runs). */
   exclude<T>(work: () => Promise<T>): Promise<T>
 }
@@ -253,9 +260,17 @@ export interface CycleSummary {
 
 /** One gate call (a chunk of the tray), reported once its verdicts are recorded. */
 export interface GateChunkReport {
+  /**
+   * The cycle the call belongs to: unique and increasing within this loop
+   * (not consecutive), so a cycle's chunks are never taken for the next one's.
+   */
+  readonly cycle: number
   /** 1-based position of the chunk in the cycle, in tray order. */
   readonly index: number
-  /** How many chunks the cycle's cards were split into. */
+  /**
+   * How many chunks the cycle's cards were split into. A chunk not called
+   * (every card taken by a turn meanwhile, or muted cards only) has no report.
+   */
   readonly of: number
   /** Cards this call decided on (the N of its prompt). */
   readonly cards: number
@@ -760,6 +775,7 @@ export class ReceiveLoop {
       token,
       signal: controller.signal,
       stale: () => this.cycleToken !== token || this.stopped,
+      abandoned: () => this.cycleToken !== token,
       exclude: async <T>(work: () => Promise<T>): Promise<T> => {
         if (depth++ === 0) excludedSince = this.now()
         try {
@@ -775,7 +791,9 @@ export class ReceiveLoop {
     const work = (async () => {
       const summary =
         this.options.mode === 'gateCall' ? await this.gateCallCycle(run) : await this.singleRunCycle(run)
-      if (!run.stale() || this.stopped) this.finishCycle(summary)
+      // A stopped cycle reports what it did; one the watchdog abandoned has
+      // reported already (below), also when its work ends after a stop().
+      if (!run.abandoned()) this.finishCycle(summary)
     })()
     let timer: TimerHandle | null = null
     const overdue = new Promise<'overdue'>((resolve) => {
@@ -990,7 +1008,8 @@ export class ReceiveLoop {
       } else if (tally.chunksFailed > 0) {
         outcome = 'fail_closed'
       } else if (owedInvites.length === 0 && !run.stale()) {
-        // Every card became held by a turn while the gate ran: no call was made.
+        // Every owed card became held by a turn while the gate ran (muted
+        // cards alone cost no call): no call was made.
         return this.summary('nothing_owed', { ...base, heldByTurns: heldByTurns + heldDuringGate })
       }
     }
@@ -1026,8 +1045,10 @@ export class ReceiveLoop {
    * recorded as soon as it answers. A chunk that fails closed leaves only its
    * own cards undecided. Before each call the chunk is checked again for
    * cards a turn has taken since the tray was read (a shared tracker), so a
-   * longer gate never decides a card a turn holds. Stops once the cycle is
-   * stale; a call the stop cut short is not counted as a failed chunk.
+   * longer gate never decides a card a turn holds; a chunk left with muted
+   * cards only (or none) is not called. Stops once the cycle is stale; a call
+   * a stop cut short is not counted as a failed chunk, and a cycle the
+   * watchdog abandoned reports and counts no chunk after its summary.
    */
   private async gateInChunks(run: CycleRun, tray: InboxTray, cards: readonly InboxCard[], texts: Texts): Promise<ChunkedGate> {
     const size = this.gateChunkSize
@@ -1050,7 +1071,10 @@ export class ReceiveLoop {
       const chunk = this.unheld(planned)
       out.held += planned.length - chunk.length
       if (chunk.length < planned.length) this.heldWhileRunning = true
-      if (chunk.length === 0) continue
+      // The loop's rule per chunk: muted cards alone owe nothing, so they cost
+      // no call (they stay on the tray as in a nothing_owed cycle). With an
+      // owed card they ride along, as in a single call.
+      if (!chunk.some((card) => card.muted !== true)) continue
       const result = await runGate({
         tray: { ...tray, conversations: chunk },
         callModel,
@@ -1059,15 +1083,25 @@ export class ReceiveLoop {
         signal: run.signal,
         ...(this.options.toolNamer ? { toolNamer: this.options.toolNamer } : {}),
       })
-      // Cut short by stop() or the watchdog: not this chunk's failure.
+      // Abandoned by the watchdog meanwhile: its summary is out; nothing more
+      // is reported or counted for it.
+      if (run.abandoned()) break
+      // Cut short by stop(): not this chunk's failure.
       if (run.stale() && result.outcome !== 'decided') break
       out.gated += chunk.length
-      for (const verdict of result.verdicts) out.verdicts[verdict.decision] += 1
+      // A stop part-way through the recording leaves the rest undecided
+      // (`gate.run` moves them there): each card counts once, as a verdict
+      // or as undecided.
+      const undecided = new Set(result.undecided)
+      for (const verdict of result.verdicts) {
+        if (!undecided.has(verdict.conversation_id)) out.verdicts[verdict.decision] += 1
+      }
       out.reply.push(...result.reply)
       out.undecided += result.undecided.length
       out.recorded += result.recorded
       out.recordFailures += result.recordFailures.length
       const report: GateChunkReport = {
+        cycle: run.token,
         index,
         of,
         cards: chunk.length,
@@ -1481,15 +1515,19 @@ export class ReceiveLoop {
  * The prompt a reply turn starts with: the served `reply_turn_template`
  * (contract v1 §3.6) with every `<conversation_id>` replaced by the
  * conversation's id, which sends the turn to that one conversation and no
- * other. Texts without a usable template (an older server, a copy cached
- * before it, a template that does not name the conversation) fall back to
- * the served wake instruction and a `conversation_id:` line.
+ * other. A served template that names no `<conversation_id>` is still the
+ * turn's text, followed by a `conversation_id:` line. Only texts without a
+ * template (an older server, a copy cached before it; an empty or blank
+ * value counts as none, as for every served text) fall back to the served
+ * wake instruction and a `conversation_id:` line.
  */
 export function replyPrompt(texts: Pick<Texts, 'wake_instruction' | 'reply_turn_template'>, conversationId: string): string {
-  const template: unknown = texts.reply_turn_template
-  if (typeof template === 'string' && template.includes(REPLY_TURN_PLACEHOLDER)) {
+  const raw: unknown = texts.reply_turn_template
+  const template = typeof raw === 'string' ? raw.trim() : ''
+  if (template.length > 0) {
     // split/join: the id is inserted as it is (no `$&` patterns), at every place.
-    return template.trim().split(REPLY_TURN_PLACEHOLDER).join(conversationId)
+    if (template.includes(REPLY_TURN_PLACEHOLDER)) return template.split(REPLY_TURN_PLACEHOLDER).join(conversationId)
+    return `${template}\n\nconversation_id: ${conversationId}`
   }
   return `${texts.wake_instruction.trim()}\n\nconversation_id: ${conversationId}`
 }

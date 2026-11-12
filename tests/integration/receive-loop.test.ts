@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { ReceiveLoop, replyPrompt, type ReceiveLoopEvent, type RunRequest, type TurnAdmission, type TurnRequest } from '../../src/integration/receive-loop.js'
 import { buildPrompt } from '../../src/gate.js'
 import type { TurnEnd } from '../../src/integration/outcome.js'
@@ -1127,6 +1127,19 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
     JSON.stringify({ decisions: idsIn(prompt).map((id) => ({ conversation_id: id, decision })) })
   const chunkEvents = (events: ReceiveLoopEvent[]) =>
     events.filter((e): e is Extract<ReceiveLoopEvent, { type: 'gate_chunk' }> => e.type === 'gate_chunk')
+  /** Fake clock (`vi.useFakeTimers()`): time moves only here, in steps, until the condition holds. */
+  async function untilFake(condition: () => boolean, what: string, stepMs = 10, maxMs = 120_000): Promise<void> {
+    for (let t = 0; t <= maxMs; t += stepMs) {
+      if (condition()) return
+      await vi.advanceTimersByTimeAsync(stepMs)
+    }
+    throw new Error(`timed out waiting for ${what}`)
+  }
+  /** A model call that answers after `ms` of the (fake) clock. */
+  const answersAfter = (ms: number, decide: (prompt: string) => string) => (prompt: string) =>
+    new Promise<string>((r) => setTimeout(() => r(decide(prompt)), ms))
+
+  afterEach(() => vi.useRealTimers())
 
   it('a 50-card tray is gated in five calls of 10; a cut-off answer in chunk 3 leaves only its 10 cards undecided', async () => {
     const { client, state, record } = fakeClient()
@@ -1203,6 +1216,9 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
       [1, 1, 4],
       [1, 1, 10],
     ])
+    // Each event names its cycle: the second cycle's is a different, larger number.
+    const [first, second] = chunkEvents(events).map((e) => e.cycle)
+    expect(second!).toBeGreaterThan(first!)
     await loop.stop()
   })
 
@@ -1326,23 +1342,25 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
   })
 
   it('each chunk has its own deadline: a chunk past it fails closed alone; the next one gets a fresh signal', async () => {
+    vi.useFakeTimers()
     const { client, state, record } = fakeClient()
     const cards = cardsUpTo(21)
     state.tray = trayOf(cards)
     const signals: AbortSignal[] = []
     const abortedAtCall: boolean[] = []
+    const answer = answersAfter(5_000, (prompt) => allAs('dismiss', prompt))
     const callModel = vi.fn((prompt: string, options?: { signal?: AbortSignal }) => {
       signals.push(options!.signal!)
       abortedAtCall.push(options!.signal!.aborted)
       if (signals.length === 2) return new Promise<string>(() => undefined) // chunk 2 never answers
-      return new Promise<string>((r) => setTimeout(() => r(allAs('dismiss', prompt)), 50))
+      return answer(prompt)
     })
     const startedAt = Date.now()
-    const { loop } = gateLoop({ client, callModel, gateCallTimeoutMs: 80 })
+    // Each call 5 s against an 8 s deadline: 5 + 8 + 5 s in all, past any one deadline.
+    const { loop } = gateLoop({ client, callModel, gateCallTimeoutMs: 8_000 })
     loop.wake()
-    await until(() => loop.status().lastCycle !== null, 'the cycle')
-    // 50 + 80 + 50 ms: a deadline per chunk, not one for the whole gate.
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(170)
+    await untilFake(() => loop.status().lastCycle !== null, 'the cycle', 100)
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(18_000)
     expect(callModel).toHaveBeenCalledTimes(3)
     expect(abortedAtCall).toEqual([false, false, false])
     expect(signals.map((s) => s.aborted)).toEqual([false, true, false])
@@ -1353,7 +1371,7 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
       undecided: 10,
       chunksOk: 2,
       chunksFailed: 1,
-      failure: '1 of 3 gate chunks failed; chunk 2: model call failed: no answer within 80 ms',
+      failure: '1 of 3 gate chunks failed; chunk 2: model call failed: no answer within 8000 ms',
     })
     await loop.stop()
   })
@@ -1383,24 +1401,111 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
     expect(record.mock.calls.map(([id]) => id)).toEqual(ids(cards.slice(1, 10)))
     expect(t.startTurn).not.toHaveBeenCalled() // chunk 1's reply waits for the next start
     // The call the stop cut short is not a failed chunk: the cycle is abandoned.
-    expect(loop.status().lastCycle).toMatchObject({ outcome: 'abandoned', recorded: 9, chunksOk: 1, chunksFailed: 0, failure: null })
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'abandoned', gated: 10, reply: 1, dismiss: 9, recorded: 9, chunksOk: 1, chunksFailed: 0, failure: null })
     expect(loop.status().counters).toMatchObject({ chunksOk: 1, chunksFailed: 0 })
   })
 
+  it('stop() while a chunk records: the verdicts cut short count as undecided, once; gated is the sum of the outcomes', async () => {
+    vi.useFakeTimers()
+    const { client, state, record } = fakeClient()
+    const cards = cardsUpTo(20)
+    state.tray = trayOf(cards)
+    let chunk2Entered = 0
+    record.mockImplementation(async (conversationId: string, opts: { decision: string }) => {
+      if (conversationId >= 'conv_chunk10') {
+        chunk2Entered += 1
+        await new Promise((r) => setTimeout(r, 1_000)) // chunk 2's records are slow
+      }
+      return { id: 'd', conversation_id: conversationId, decision: opts.decision } as unknown as ReplyDecision
+    })
+    const { loop, events } = gateLoop({ client, callModel: async (prompt: string) => allAs('dismiss', prompt) })
+    loop.wake()
+    await untilFake(() => chunk2Entered === 1, "chunk 2's first record under way", 1)
+    const stopping = loop.stop()
+    await vi.advanceTimersByTimeAsync(5_000)
+    await stopping
+    // Chunk 1: 10 recorded. Chunk 2: the record under way finishes; the other 9 stay undecided.
+    expect(record).toHaveBeenCalledTimes(11)
+    const summary = loop.status().lastCycle!
+    expect(summary).toMatchObject({ outcome: 'abandoned', gated: 20, dismiss: 11, undecided: 9, recorded: 11, chunksOk: 2, chunksFailed: 0 })
+    expect(summary.reply + summary.dismiss + summary.defer + summary.undecided).toBe(summary.gated)
+    expect(chunkEvents(events).map((e) => [e.index, e.outcome, e.undecided])).toEqual([
+      [1, 'decided', 0],
+      [2, 'decided', 9],
+    ])
+  })
+
+  it('a cycle the watchdog abandons while a chunk records reports and counts no chunk after its summary', async () => {
+    vi.useFakeTimers()
+    const { client, state, record } = fakeClient()
+    const cards = cardsUpTo(20)
+    state.tray = trayOf(cards)
+    let slow = true
+    record.mockImplementation(async (conversationId: string, opts: { decision: string }) => {
+      // Chunk 2's records are slow; time inside records counts against the cycle deadline.
+      if (slow && conversationId >= 'conv_chunk10') await new Promise((r) => setTimeout(r, 6_000))
+      return { id: 'd', conversation_id: conversationId, decision: opts.decision } as unknown as ReplyDecision
+    })
+    const callModel = vi.fn(async (prompt: string) => allAs('dismiss', prompt))
+    const { loop, events } = gateLoop({ client, callModel, cycleTimeoutMs: 10_000 })
+    loop.wake()
+    await untilFake(() => loop.status().lastCycle !== null, 'the abandoned cycle', 100)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'abandoned' })
+    // The record under way at the abandonment ends later; the abandoned work then finishes.
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(record).toHaveBeenCalledTimes(12) // chunk 1's 10, then chunk 2's first two
+    expect(callModel).toHaveBeenCalledTimes(2)
+    const abandonedAt = events.findIndex((e) => e.type === 'cycle')
+    expect(events.slice(abandonedAt + 1).filter((e) => e.type === 'gate_chunk' || e.type === 'cycle')).toEqual([])
+    expect(chunkEvents(events).map((e) => e.index)).toEqual([1])
+    expect(loop.status().counters).toMatchObject({ chunksOk: 1, chunksFailed: 0 })
+    expect(loop.status().recentCycles).toHaveLength(1)
+
+    // The next cycle's chunks carry their own cycle.
+    slow = false
+    state.tray = trayOf(cards.slice(12))
+    loop.wake()
+    await untilFake(() => loop.status().recentCycles.length === 2, 'the next cycle', 100)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'decided', gated: 8, chunksOk: 1 })
+    const [abandoned, next] = chunkEvents(events).map((e) => e.cycle)
+    expect(next!).toBeGreaterThan(abandoned!)
+    await loop.stop()
+  })
+
+  it('a cycle abandoned before stop() emits no second summary when its work ends after the stop', async () => {
+    vi.useFakeTimers()
+    const { client, state, record } = fakeClient()
+    state.tray = trayOf(cardsUpTo(20))
+    record.mockImplementation(async (conversationId: string, opts: { decision: string }) => {
+      if (conversationId >= 'conv_chunk10') await new Promise((r) => setTimeout(r, 6_000))
+      return { id: 'd', conversation_id: conversationId, decision: opts.decision } as unknown as ReplyDecision
+    })
+    const { loop, events } = gateLoop({ client, callModel: async (prompt: string) => allAs('dismiss', prompt), cycleTimeoutMs: 10_000 })
+    loop.wake()
+    await untilFake(() => loop.status().lastCycle !== null, 'the abandoned cycle', 100)
+    await loop.stop()
+    await vi.advanceTimersByTimeAsync(30_000) // the abandoned work ends after the stop
+    expect(events.filter((e) => e.type === 'cycle').map((e) => (e as { summary: { outcome: string } }).summary.outcome)).toEqual(['abandoned'])
+    expect(chunkEvents(events)).toHaveLength(1)
+  })
+
   it('an abandoned cycle (watchdog, gate deadline off) stops between chunks: the call in flight aborts, no later chunk is called', async () => {
+    vi.useFakeTimers()
     const { client, state, record } = fakeClient()
     const cards = cardsUpTo(30)
     state.tray = trayOf(cards)
     const signals: AbortSignal[] = []
+    const answer = answersAfter(6_000, (prompt) => allAs('dismiss', prompt))
     const callModel = vi.fn((prompt: string, options?: { signal?: AbortSignal }) => {
       signals.push(options!.signal!)
-      return new Promise<string>((r) => setTimeout(() => r(allAs('dismiss', prompt)), 40))
+      return answer(prompt)
     })
-    // With no gate deadline the watchdog is the gate calls' only bound: they count against the cycle.
-    const { loop } = gateLoop({ client, callModel, gateCallTimeoutMs: 0, cycleTimeoutMs: 60 })
+    // With no gate deadline the watchdog is the gate calls' only bound: they
+    // count against the cycle. Calls of 6 s against 10 s: abandoned in chunk 2.
+    const { loop } = gateLoop({ client, callModel, gateCallTimeoutMs: 0, cycleTimeoutMs: 10_000 })
     loop.wake()
-    await until(() => loop.status().lastCycle !== null, 'the abandoned cycle')
-    await new Promise((r) => setTimeout(r, 100))
+    await untilFake(() => loop.status().lastCycle !== null, 'the abandoned cycle', 100)
+    await vi.advanceTimersByTimeAsync(30_000)
     expect(loop.status().lastCycle).toMatchObject({ outcome: 'abandoned' })
     expect(callModel).toHaveBeenCalledTimes(2)
     expect(signals[1]!.aborted).toBe(true)
@@ -1409,18 +1514,55 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
   })
 
   it('time inside gate calls that have a deadline does not count against the cycle deadline', async () => {
+    vi.useFakeTimers()
     const { client, state, record } = fakeClient()
     state.tray = trayOf(cardsUpTo(30))
-    const callModel = vi.fn(
-      (prompt: string) => new Promise<string>((r) => setTimeout(() => r(allAs('dismiss', prompt)), 40)),
-    )
-    // Three calls of 40 ms each are past a 60 ms cycle deadline; each is bounded by its own 1 s deadline.
-    const { loop } = gateLoop({ client, callModel, gateCallTimeoutMs: 1_000, cycleTimeoutMs: 60 })
+    const callModel = vi.fn(answersAfter(6_000, (prompt) => allAs('dismiss', prompt)))
+    // Three calls of 6 s (18 s) are far past a 10 s cycle deadline; each is bounded by its own 60 s deadline.
+    const { loop } = gateLoop({ client, callModel, gateCallTimeoutMs: 60_000, cycleTimeoutMs: 10_000 })
     loop.wake()
-    await until(() => loop.status().lastCycle !== null, 'the cycle')
+    await untilFake(() => loop.status().lastCycle !== null, 'the cycle', 100)
     expect(loop.status().lastCycle).toMatchObject({ outcome: 'decided', chunksOk: 3, recorded: 30 })
     expect(record).toHaveBeenCalledTimes(30)
     await loop.stop()
+  })
+
+  it('a chunk of muted cards only costs no call: 10 owed then 3 muted is one call; muted cards with owed ones ride along', async () => {
+    const mutedAt = (i: number): InboxCard => ({ ...cardAt(i), muted: true, you_owe_reply: false })
+    const { client, state, record } = fakeClient()
+    const owed = cardsUpTo(10)
+    state.tray = trayOf([...owed, mutedAt(10), mutedAt(11), mutedAt(12)])
+    const prompts: string[] = []
+    const callModel = vi.fn(async (prompt: string) => {
+      prompts.push(prompt)
+      return allAs('dismiss', prompt)
+    })
+    const { loop, events } = gateLoop({ client, callModel })
+    loop.wake()
+    await until(() => loop.status().lastCycle !== null)
+    expect(prompts.map(idsIn)).toEqual([ids(owed)])
+    expect(record).toHaveBeenCalledTimes(10)
+    // The muted chunk is left as a nothing_owed cycle leaves its cards: not gated, not undecided.
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'decided', cards: 13, gated: 10, undecided: 0, chunksOk: 1, chunksFailed: 0 })
+    expect(chunkEvents(events).map((e) => [e.index, e.of, e.cards])).toEqual([[1, 2, 10]])
+    await loop.stop()
+
+    // Muted cards in a chunk with an owed card are gated with it, as in one call.
+    const mixed = fakeClient()
+    const tray = [...cardsUpTo(9), mutedAt(9), cardAt(10), mutedAt(11), mutedAt(12)]
+    mixed.state.tray = trayOf(tray)
+    const seen: string[] = []
+    const other = gateLoop({
+      client: mixed.client,
+      callModel: async (prompt: string) => {
+        seen.push(prompt)
+        return allAs('dismiss', prompt)
+      },
+    })
+    other.loop.wake()
+    await until(() => other.loop.status().lastCycle !== null)
+    expect(seen.map(idsIn)).toEqual([ids(tray.slice(0, 10)), ids(tray.slice(10))])
+    await other.loop.stop()
   })
 })
 
@@ -1456,11 +1598,19 @@ describe('ReceiveLoop — the reply turn prompt (reply_turn_template)', () => {
     const legacy = `${texts.wake_instruction.trim()}\n\nconversation_id: ${DIRECT.conversation_id}`
     const { reply_turn_template: _absent, ...old } = { ...texts, reply_turn_template: TEMPLATE }
     expect(await promptFor(old as Texts)).toBe(legacy)
-    // A template that cannot name the conversation is not used.
-    for (const unusable of ['', '   ', 'Answer the conversation you were woken for.', 42 as unknown as string]) {
-      expect(await promptFor({ ...texts, reply_turn_template: unusable }), JSON.stringify(unusable)).toBe(legacy)
+    // No usable value counts as absent, as for every served text: empty, blank, not a string.
+    for (const none of ['', '   ', 42 as unknown as string, null as unknown as string]) {
+      expect(await promptFor({ ...texts, reply_turn_template: none }), JSON.stringify(none)).toBe(legacy)
     }
     expect(replyPrompt({ wake_instruction: texts.wake_instruction }, DIRECT.conversation_id)).toBe(legacy)
+  })
+
+  it('a served template that names no <conversation_id>: the template, then a conversation_id line (never the wake instruction)', async () => {
+    const plain = '  Answer the one conversation this run was started for, and leave the rest of your tray alone.  '
+    const expected = `${plain.trim()}\n\nconversation_id: ${DIRECT.conversation_id}`
+    expect(await promptFor({ ...texts, reply_turn_template: plain })).toBe(expected)
+    expect(replyPrompt({ ...texts, reply_turn_template: plain }, DIRECT.conversation_id)).toBe(expected)
+    expect(expected).not.toContain(texts.wake_instruction)
   })
 
   it('invite turns still start from the invite prompt', async () => {

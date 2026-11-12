@@ -2,6 +2,70 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## Unreleased
+
+### Fixed
+
+- `integration.ReceiveLoop` (gate-call mode): a tray with many unread
+  conversations no longer leaves the agent stuck. The loop sent up to 50
+  cards to the model in one gate call. Integrations cap that answer at 2,048
+  tokens, and an answer for 50 cards needs about that much, so a cut-off
+  answer failed to parse (fail closed), nothing was recorded, the tray never
+  shrank, and every wake failed the same way until fewer conversations were
+  unread. The gate now decides at most `gateChunkSize` cards per call (new
+  option, default 10, an integer from 1 to 50; contract v1 §3.6): the cards
+  are split in tray order and gated one call after another, each call's
+  prompt the gate prompt for its own cards. A chunk whose call fails, runs
+  past its deadline or answers nothing parsable leaves only its own cards
+  undecided; the other chunks' verdicts are recorded. A tray of 10 cards or
+  fewer is one call with the same prompt as before (`gate-prompt.expected.txt`).
+  Reply turns start once every chunk has answered.
+- `integration.ReceiveLoop` (gate-call mode): a reply turn could answer other
+  conversations too. Each started from the served wake instruction, which
+  sends a run to the whole tray, so the turn for one card could answer
+  another, and that card's own turn answered it again. A reply turn now
+  starts from the served `reply_turn_template` with the card's conversation
+  id in place of every `<conversation_id>` (`integration.replyPrompt`): it
+  answers that one conversation and leaves the rest alone. Texts without the
+  field (an older server, a copy cached before it) keep the previous prompt.
+  Invite turns are unchanged.
+
+### Added
+
+- `ReceiveLoopOptions.gateChunkSize`. A partial failure shows: a
+  `gate_chunk` event per gate call (`GateChunkReport`: `index`, `of`,
+  `cards`, `outcome`, `undecided`, `failure`), `CycleSummary.chunksOk` and
+  `chunksFailed`, and the same two totals in `status().counters`. A cycle
+  with some chunks decided is `decided`, with `failure` naming how many
+  failed and the first reason (`2 of 5 gate chunks failed; chunk 3: …`);
+  `fail_closed` means every chunk failed.
+- `Texts.reply_turn_template` (optional; contract v1 §3.6, served by
+  `GET /v1/texts`). `TextsCache` keeps it like every other field.
+
+### Changed
+
+- `gateCallTimeoutMs` applies to each gate call: every chunk has its own
+  deadline and its own `signal`. The cycle watchdog (`cycleTimeoutMs`) no
+  longer counts time inside a gate call that has a deadline, so a tray gated
+  in several calls is not abandoned while it makes progress; with
+  `gateCallTimeoutMs` off, gate calls still count (the watchdog is then
+  their only bound).
+- A cycle that `stop()` cuts short reports what it did (chunks, verdicts
+  recorded) in its `abandoned` summary instead of zeros. A gate call the
+  stop cut short is not counted as a failed chunk.
+
+### Types
+
+- `ReceiveLoopEvent` gains the `gate_chunk` member and `CycleSummary` the
+  `chunksOk` and `chunksFailed` fields: a `switch` over `event.type` that
+  checks exhaustiveness with `never` needs a case for the new member.
+
+### Conformance
+
+- `conformance/v1/texts.sample.json` (gains `reply_turn_template`) and
+  `manifest.sha256`, copied byte for byte from the contract fixtures;
+  `gate-prompt.expected.txt` is unchanged.
+
 ## 1.3.1 — 2026-11-11
 
 ### Fixed

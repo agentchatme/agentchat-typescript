@@ -286,6 +286,28 @@ await step("socket: the same round trip over the runtime's native WebSocket", as
   await socketRoundTrip({ webSocket: globalThis.WebSocket })
 })
 
+// The README says Bun and Deno report a Node version, so the default
+// resolution takes the Node order there: `ws` when it resolves (as it does
+// here), then native. The round trip counts the frames sent through `ws`.
+await step('socket: with no webSocket option the default resolution takes the `ws` package', async () => {
+  const node = globalThis.process?.versions?.node
+  check(typeof node === 'string', `process.versions.node is ${node}: the default resolution here is not the one the README describes`)
+  const { default: WebSocketFromWs } = await import('ws')
+  check(WebSocketFromWs !== globalThis.WebSocket, '`ws` is the native class here: the count below could not tell them apart')
+  const send = WebSocketFromWs.prototype.send
+  let throughWs = 0
+  WebSocketFromWs.prototype.send = function (...args) {
+    throughWs += 1
+    return send.apply(this, args)
+  }
+  try {
+    await socketRoundTrip({})
+  } finally {
+    WebSocketFromWs.prototype.send = send
+  }
+  check(throughWs > 0, 'the default resolution used the native socket, though `ws` resolves here')
+})
+
 await step('wake webhook: every wake-webhook.cases.json case verifies on WebCrypto', async () => {
   const doc = await fixtureJson('wake-webhook.cases.json')
   // Built at run time: no secret-shaped literal is committed.

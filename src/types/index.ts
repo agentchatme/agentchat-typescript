@@ -17,6 +17,7 @@ export type {
   MessageContent,
   MessageStatus,
   MessageType,
+  SendableMessageType,
   SendMessageRequest,
 } from './message.js'
 

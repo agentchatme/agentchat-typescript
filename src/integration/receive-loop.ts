@@ -28,9 +28,10 @@
  * machine received the message; only a verdict reads it.
  *
  * Turns: at most `maxConcurrentTurns` (default 1) reply and invite turns run
- * at once; the rest wait for a slot, held out of the gate meanwhile (their
- * cards stay on the tray; nothing is recorded for them; no second model call
- * decides them again). `stop()` drops the waiting ones. A turn that ends
+ * at once; the rest wait for a slot and take one in the order they were
+ * gated, held out of the gate meanwhile (their cards stay on the tray;
+ * nothing is recorded for them; no second model call decides them again).
+ * `stop()` drops the waiting ones. A turn that ends
  * after `stop()` still has its outcome recorded: what it did is a fact.
  * `startTurn` / `startRun` must enforce their own deadline (the loop cannot
  * end a turn); `status()` marks a turn running longer than 30 minutes.
@@ -1047,14 +1048,29 @@ export class ReceiveLoop {
     })
   }
 
-  /** Start a turn now when a slot is free, else let it wait for one (its tracker entry holds the card out of the gate). */
+  /**
+   * Start a turn now when a slot is free, else let it wait for one (its
+   * tracker entry holds the card out of the gate).
+   *
+   * Waiting turns go first, in order. A slot can be free while turns still
+   * wait: the pump frees it when an admission is refused and hands it on to
+   * the next waiting turn only after an await. A turn gated in that window
+   * queues behind them instead of taking the slot. A refused admission here
+   * hands its slot on the same way.
+   */
   private async launch(handle: TurnHandle, admit: () => Promise<boolean>): Promise<Launch> {
-    if (this.activeTurns >= this.maxTurns) {
+    if (this.waiting.length > 0 || this.activeTurns >= this.maxTurns) {
       this.waiting.push({ handle, admit })
       this.counts.turnsQueued += 1
+      // A free slot goes to the turn at the head of the queue, not to this one.
+      if (this.activeTurns < this.maxTurns) void this.pump()
       return 'queued'
     }
-    return (await this.admitInSlot(handle, admit)) ? 'started' : 'refused'
+    if (await this.admitInSlot(handle, admit)) return 'started'
+    // Defensive: a cycle launches one turn at a time, so none queued during
+    // this admission today; if one ever did, the slot still goes on.
+    if (this.waiting.length > 0) void this.pump()
+    return 'refused'
   }
 
   private async admitInSlot(handle: TurnHandle, admit: () => Promise<boolean>): Promise<boolean> {

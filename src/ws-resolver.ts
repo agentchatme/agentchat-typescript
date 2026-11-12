@@ -1,15 +1,22 @@
 /**
  * Runtime-dependent WebSocket resolution.
  *
- * - On Node, the `ws` package (an optional peer dependency) is preferred
- *   whenever it is installed: it exposes the server's ping frames
- *   (`on('ping')`) and `terminate()`, which the realtime client's liveness
- *   watchdog needs to tell a quiet-but-healthy socket from a dead pipe.
- *   Node's native `WebSocket` (22+) shows neither, so a long-lived
- *   integration on it would get no idle watchdog at all. Without `ws`, the
- *   native socket is used. Node 20 has no native socket: `ws` is required.
- * - Browsers, Deno, Bun and edge runtimes ship a native `WebSocket` on
- *   `globalThis`; it is used directly, with `ws` only as a last resort.
+ * - Where `process.versions.node` is set, the `ws` package (an optional peer
+ *   dependency) is preferred whenever it resolves: it exposes the server's
+ *   ping frames (`on('ping')`) and `terminate()`, which the realtime
+ *   client's liveness watchdog needs to tell a quiet-but-healthy socket from
+ *   a dead pipe. Node's native `WebSocket` (22+) shows neither, so a
+ *   long-lived integration on it would get no idle watchdog at all. Without
+ *   `ws`, the native socket is used. Node 20 has no native socket: `ws` is
+ *   required.
+ * - Bun and Deno 2 set `process.versions.node` too (their Node
+ *   compatibility), so they take the same order: `ws` when it resolves, the
+ *   runtime's native `WebSocket` otherwise. On Bun it always resolves (Bun
+ *   ships its own `ws` module); on Deno, when the package is installed and
+ *   its import may read the env names it reads.
+ * - Runtimes without `process.versions.node` (browsers, most edge runtimes)
+ *   use their native `WebSocket` on `globalThis` directly, with `ws` only as
+ *   a last resort.
  * - No implementation anywhere is a configuration error: the caller's
  *   `connect()` rejects and nothing retries it.
  *
@@ -43,7 +50,7 @@ async function importWs(): Promise<WebSocketCtor> {
 
 export async function resolveWebSocket(): Promise<WebSocketCtor> {
   const native = (globalThis as { WebSocket?: WebSocketCtor }).WebSocket
-  // Order: on Node `ws`, then native; everywhere else native, then `ws`.
+  // Order: with a Node version (Node, Bun, Deno 2) `ws`, then native; elsewhere native, then `ws`.
   if (!isNode() && native) return native
 
   let wsFailure: unknown

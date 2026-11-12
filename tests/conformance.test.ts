@@ -98,6 +98,12 @@ describe('conformance — texts.sample.json', () => {
     expect(texts.manual.sha256).toMatch(/^[0-9a-f]{64}$/)
     expect(texts.identity_line_template).toContain('<handle>')
   })
+
+  it('carries the reply-turn template (§3.6), naming one conversation by <conversation_id>', () => {
+    expect(typeof texts.reply_turn_template).toBe('string')
+    expect(texts.reply_turn_template).toContain('<conversation_id>')
+    expect(texts.reply_turn_template).not.toBe(texts.wake_instruction)
+  })
 })
 
 describe('conformance — gate prompt', () => {

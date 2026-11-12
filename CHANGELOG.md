@@ -19,6 +19,8 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   past its deadline or answers nothing parsable leaves only its own cards
   undecided; the other chunks' verdicts are recorded. A tray of 10 cards or
   fewer is one call with the same prompt as before (`gate-prompt.expected.txt`).
+  A chunk of muted cards only costs no call (muted cards alone owe nothing,
+  as for a whole tray); with an owed card they are gated alongside it.
   Reply turns start once every chunk has answered.
 - `integration.ReceiveLoop` (gate-call mode): a reply turn could answer other
   conversations too. Each started from the served wake instruction, which
@@ -26,15 +28,19 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   another, and that card's own turn answered it again. A reply turn now
   starts from the served `reply_turn_template` with the card's conversation
   id in place of every `<conversation_id>` (`integration.replyPrompt`): it
-  answers that one conversation and leaves the rest alone. Texts without the
-  field (an older server, a copy cached before it) keep the previous prompt.
-  Invite turns are unchanged.
+  answers that one conversation and leaves the rest alone. A served template
+  that names no `<conversation_id>` is still used, with a
+  `conversation_id: <id>` line after it. Only texts without the field (an
+  older server, a copy cached before it; an empty or blank value counts as
+  none) keep the previous prompt. Invite turns are unchanged.
 
 ### Added
 
 - `ReceiveLoopOptions.gateChunkSize`. A partial failure shows: a
-  `gate_chunk` event per gate call (`GateChunkReport`: `index`, `of`,
-  `cards`, `outcome`, `undecided`, `failure`), `CycleSummary.chunksOk` and
+  `gate_chunk` event per gate call (`GateChunkReport`: `cycle`, `index`,
+  `of`, `cards`, `outcome`, `undecided`, `failure`; `cycle` is unique and
+  increasing within the loop, so one cycle's chunks are never taken for the
+  next one's), `CycleSummary.chunksOk` and
   `chunksFailed`, and the same two totals in `status().counters`. A cycle
   with some chunks decided is `decided`, with `failure` naming how many
   failed and the first reason (`2 of 5 gate chunks failed; chunk 3: …`);
@@ -49,10 +55,20 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   longer counts time inside a gate call that has a deadline, so a tray gated
   in several calls is not abandoned while it makes progress; with
   `gateCallTimeoutMs` off, gate calls still count (the watchdog is then
-  their only bound).
+  their only bound). **Behaviour change** when `gateCallTimeoutMs` is set
+  above `cycleTimeoutMs`: the watchdog used to cut a long gate call short at
+  `cycleTimeoutMs` (abandoning the cycle); now each call runs to its own
+  `gateCallTimeoutMs`, and a cycle can take up to (number of chunks ×
+  `gateCallTimeoutMs`) plus `cycleTimeoutMs` before it is abandoned. Lower
+  `gateCallTimeoutMs` to bound a single call more tightly.
 - A cycle that `stop()` cuts short reports what it did (chunks, verdicts
-  recorded) in its `abandoned` summary instead of zeros. A gate call the
-  stop cut short is not counted as a failed chunk.
+  recorded) in its `abandoned` summary instead of zeros. Verdicts the stop
+  cut short count as undecided, each card once (`gated` = `reply` +
+  `dismiss` + `defer` + `undecided`). A gate call the stop cut short is not
+  counted as a failed chunk.
+- A cycle the watchdog abandoned reports nothing after its `abandoned`
+  summary: no `gate_chunk` event, no chunk counted, and no second summary
+  when its work ends after a `stop()`.
 
 ### Types
 

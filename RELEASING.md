@@ -6,30 +6,34 @@ Releases ship only through `.github/workflows/publish.yml`: npm trusted publishi
 
 1. **The number.** The founder sets it, per [VERSIONING.md](./VERSIONING.md).
 2. **The release PR**, from `main`: the `version` in `package.json` (the only place it lives; the build injects it as `VERSION` and into the User-Agent) and a CHANGELOG section `## <version> — <date>`. CI green, merged.
-3. **The tag**, on the merge commit on `main`:
+3. **The tag**, on the release PR's merge commit on `main` (not a later commit, even one with the same version):
    ```bash
-   git fetch origin && git checkout origin/main
+   git fetch origin && git checkout <merge commit>
+   git log -1 --oneline                           # the release PR
    node -p "require('./package.json').version"   # must print <version>
    git tag v<version> && git push origin v<version>
    ```
-   Two things only the person tagging checks; `publish.yml` checks neither:
-   - the tag is exactly `v` + the `package.json` version (it publishes whatever `package.json` says);
-   - the tagged commit is on `main` (any `v*` tag on any branch starts a publish).
-4. **The gate.** The tag push starts `publish.yml`. Its `test` job repeats CI's test job on the tagged commit (Node 20 and 22: frozen install, `pnpm audit --prod --audit-level high`, type-check, tests, build). CI's contract-fixture check and secret scan do not run again here; they ran on the release PR. The `publish` job then waits at the `npm-publish` environment, and `notify-awaiting-tap` posts the run link to the Slack warning channel.
-5. **The approval.** The approver taps **Approve and deploy**: `npm publish --access public` runs with OIDC, and npm attaches provenance. A red gate, a rejection or no approval publishes nothing; any red job posts `notify-failure` to the same channel.
+   `publish.yml`'s `verify` job refuses the release, before anything else runs, unless:
+   - the tag is exactly `v` + the `package.json` version, and that version is not a pre-release;
+   - the tagged commit is on `main`;
+   - the tag still points at that commit on origin (a tag deletion can start a run too, on `main`'s head).
+
+   GitHub runs the `publish.yml` of the tagged commit, so a commit whose workflow predates `verify`, or that edits it, skips these checks. The approval is the check nothing skips: approve only a run whose `verify` job is green.
+4. **The gate.** The tag push starts `publish.yml`. After `verify`, its `test` job repeats CI's test job on the tagged commit (Node 20 and 22: frozen install, `pnpm audit --prod --audit-level high`, type-check, tests, build). CI's contract-fixture check and secret scan do not run again here; they ran on the release PR. The `publish` job then waits at the `npm-publish` environment, and `notify-awaiting-tap` posts the run link to the Slack warning channel.
+5. **The approval.** The approver taps **Approve and deploy**: `npm publish --access public` runs with OIDC, and npm attaches provenance. A red gate, a rejection or no approval publishes nothing; any red job posts `notify-failure` to the same channel. A Slack post that fails (a revoked webhook, Slack unreachable) shows as a failed step on the run and never holds up the release.
 6. **The check.** `npm view agentchatme version` shows the number, and the package page's provenance points at the tagged commit.
 
 ## Other targets (Actions → Publish to npm → Run workflow)
 
 All three wait for the same `npm-publish` approval.
 
-- **`test`**: publishes the dispatched commit under the `next` dist-tag, for an install check before a structural change ships. No Slack post asks for the tap. It is a real, public publish, and npm never reuses a number: use it only with a pre-release number in `package.json` (`1.4.0-rc.1`).
-- **`prod`**: publishes the dispatched commit to `latest`. For finishing a release whose tag run failed for a reason outside the code. Dispatch it on the tagged commit: nothing checks that it is.
+- **`test`**: publishes the dispatched commit under the `next` dist-tag, for an install check before a structural change ships. No Slack post asks for the tap. It is a real, public publish, and npm never reuses a number: `verify` refuses it unless `package.json` has a pre-release number (`1.4.0-rc.1`).
+- **`prod`**: publishes the dispatched commit to `latest`. For finishing a release whose tag run failed for a reason outside the code. Dispatch it on the tag (pick `v<version>` under *Use workflow from*, or `gh workflow run publish.yml --ref v<version> -f target=prod`): `verify` refuses a commit that is not on `main`, or that `v<version>` does not point at.
 - **`stage-proof`**: see below.
 
 ## New-package checklist (one-time per package)
 
-- Copy this repo's `.github/workflows/publish.yml` shape: gate job → `environment: npm-publish` + `id-token: write` → `npm install -g npm@latest` → `npm publish`.
+- Copy this repo's `.github/workflows/publish.yml` shape: `verify` job → gate job → `environment: npm-publish` + `id-token: write` → `npm install -g npm@latest` → `npm publish`.
 - Create the `npm-publish` environment with the required reviewer (repo Settings → Environments, or the API).
 - `package.json` `repository.url` must exactly match the GitHub repo — npm checks it.
 - npmjs.com → package Settings → Trusted Publisher: owner `agentchatme`, the repo name, workflow `publish.yml` (bare filename, no path), environment `npm-publish`, tick **npm publish** under allowed actions. Complete the security-key prompt and confirm a **saved summary card** renders — npm silently discards unconfirmed saves and only validates at publish time (mismatches surface as E404 on PUT).

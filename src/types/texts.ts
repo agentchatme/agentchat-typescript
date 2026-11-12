@@ -30,6 +30,13 @@ export interface Texts {
   gate_call_preamble?: string
   /** Gate-call mode: the answer shape the gate call ends with (contract v1). */
   gate_call_answer_format?: string
+  /**
+   * Gate-call mode: what each reply turn starts with (contract v1 §3.6). It
+   * names one conversation: replace every `<conversation_id>` with the card's
+   * conversation id. Absent on older servers; a reply turn then starts with
+   * `wake_instruction` and a `conversation_id:` line.
+   */
+  reply_turn_template?: string
 }
 
 /** Options for `client.texts.get()`. */

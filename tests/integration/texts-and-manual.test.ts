@@ -73,6 +73,30 @@ describe('TextsCache', () => {
     cache.stop()
   })
 
+  it('keeps reply_turn_template as served: in hand, in the file, and from the file on an offline start', async () => {
+    const d = dir()
+    const file = join(d, 'texts.json')
+    const served = { ...texts, reply_turn_template: 'Answer conversation <conversation_id> only.' }
+    const online = new TextsCache({ client: textsClient([served]).client, runtime: 'generic', filePath: file })
+    await online.start()
+    expect(online.current()?.reply_turn_template).toBe(served.reply_turn_template)
+    const saved = JSON.parse(readFileSync(file, 'utf8')) as { texts: Texts }
+    expect(saved.texts.reply_turn_template).toBe(served.reply_turn_template)
+    online.stop()
+    const offline = new TextsCache({ client: textsClient([new Error('offline')]).client, runtime: 'generic', filePath: file })
+    await offline.start()
+    expect(offline.source).toBe('cache')
+    expect(offline.current()?.reply_turn_template).toBe(served.reply_turn_template)
+    offline.stop()
+    // Texts without it (an older server) are still a text set.
+    const { reply_turn_template: _absent, ...older } = served
+    const old = new TextsCache({ client: textsClient([older]).client, runtime: 'generic' })
+    await old.start()
+    expect(old.source).toBe('server')
+    expect(old.current()?.reply_turn_template).toBeUndefined()
+    old.stop()
+  })
+
   it('a file written for another runtime, or a damaged one, is not used', async () => {
     const d = dir()
     const other = join(d, 'other.json')

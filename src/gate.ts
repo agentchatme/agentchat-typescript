@@ -457,6 +457,13 @@ export interface GateResult {
  * `anchorOf(card)`; `reply` verdicts come back as `GateReply` entries whose
  * `record()` the host calls once the turn has completed. Never throws: model
  * and network failures land in the result.
+ *
+ * One call decides every card it is given. A host may gate a larger tray in
+ * chunks (contract v1 §3.6): the cards, in tray order, in chunks of at most
+ * 10, one `run` per chunk with the chunk as the tray's `conversations` (the
+ * prompt then numbers that chunk's cards); a chunk that fails closed leaves
+ * only its own cards undecided. The `ReceiveLoop` does this
+ * (`gateChunkSize`).
  */
 export async function run(options: RunGateOptions): Promise<GateResult> {
   const cards = cardsOf(options.tray)

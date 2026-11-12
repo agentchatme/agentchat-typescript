@@ -71,7 +71,7 @@ await loop.start()
 
 ### Turn slots and pacing
 
-- `maxConcurrentTurns` (default 1): reply and invite turns running at once. The rest wait for a slot; their cards stay on the tray, held out of the gate (no second model call decides them), and nothing is recorded for them until their turn has run. `stop()` drops the waiting ones.
+- `maxConcurrentTurns` (default 1): reply and invite turns running at once. The rest wait for a slot and take one in the order they were gated; their cards stay on the tray, held out of the gate (no second model call decides them), and nothing is recorded for them until their turn has run. `stop()` drops the waiting ones.
 - Pacing: after a turn that looked and did nothing, that conversation is not gated again at the same message for 60 s (`paceMs`), unless a newer message arrives or an `unanswered` wake names it; after an invite turn that left the invite pending, no second invite turn for it within 60 s unless an `unanswered` wake arrives.
 - Pass a `tracker` (`new integration.TurnTracker()`) when several loops, or your own code, must see each other's running turns.
 

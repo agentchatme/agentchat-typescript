@@ -680,6 +680,57 @@ describe('ReceiveLoop — turn slots (maxConcurrentTurns)', () => {
     await loop.stop()
   })
 
+  it('a turn gated while a refused admission hands its slot on queues behind the waiting ones', async () => {
+    const { client, state } = fakeClient()
+    state.tray = trayOf([DIRECT, CREW, OPS])
+    const started: string[] = []
+    const ends: Array<(end: TurnEnd) => void> = []
+    const startTurn = vi.fn(async (request: TurnRequest): Promise<TurnAdmission> => {
+      const id = (request as { conversationId: string }).conversationId
+      started.push(id)
+      if (id === CREW.conversation_id) return { started: false, error: 'busy' } // the runtime refuses this one
+      return { started: true, done: new Promise<TurnEnd>((r) => ends.push(r)) }
+    })
+    const reply = (id: string) => ({ conversation_id: id, decision: 'reply' })
+    let gates = 0
+    const callModel = vi.fn(async () => {
+      gates += 1
+      const decisions = gates === 1 ? [reply(DIRECT.conversation_id), reply(CREW.conversation_id), reply(OPS.conversation_id)] : [reply(DIRECT.conversation_id)]
+      return JSON.stringify({ decisions })
+    })
+    const { loop, events } = gateLoop({ client, callModel, startTurn })
+    // The window, held open: after a refused admission the slot is free, and
+    // the pump has not yet handed it on to the next waiting turn.
+    const seam = loop as unknown as { admitInSlot: (handle: unknown, admit: () => Promise<boolean>) => Promise<boolean> }
+    const admitInSlot = seam.admitInSlot.bind(loop)
+    let handOn!: () => void
+    const held = new Promise<void>((resolve) => (handOn = resolve))
+    seam.admitInSlot = async (handle, admit) => {
+      const ok = await admitInSlot(handle, admit)
+      if (!ok) await held
+      return ok
+    }
+    loop.wake()
+    await until(() => loop.status().lastCycle !== null, 'the first cycle')
+    expect(started).toEqual([DIRECT.conversation_id]) // CREW and OPS wait, in that order
+    expect(loop.status().counters.turnsWaiting).toBe(2)
+    ends[0]!({ status: 'failed', detail: 'x' }) // DIRECT ends: CREW gets the slot and is refused
+    await until(() => events.some((e) => e.type === 'turn_refused'), "CREW's refusal")
+    await until(() => loop.status().counters.turnsActive === 0, 'the freed slot')
+    loop.wake() // a cycle gates DIRECT again while OPS still waits
+    await until(() => loop.status().recentCycles.length === 2, 'the second cycle')
+    await idle()
+    expect(callModel).toHaveBeenCalledTimes(2)
+    // DIRECT queued behind OPS, and the free slot went to OPS at once.
+    expect(started).toEqual([DIRECT.conversation_id, CREW.conversation_id, OPS.conversation_id])
+    expect(loop.status().counters).toMatchObject({ turnsActive: 1, turnsWaiting: 1 })
+    handOn() // the held pump goes on: the slot is taken, nothing more starts
+    await idle()
+    expect(started).toEqual([DIRECT.conversation_id, CREW.conversation_id, OPS.conversation_id])
+    expect(loop.status().counters).toMatchObject({ turnsActive: 1, turnsWaiting: 1 }) // DIRECT waits behind OPS
+    await loop.stop()
+  })
+
   it('a shared tracker: a turn another loop runs keeps its card out of this gate', async () => {
     const { client, state } = fakeClient()
     state.tray = trayOf([DIRECT, CREW])

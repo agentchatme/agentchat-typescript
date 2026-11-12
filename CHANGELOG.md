@@ -2,6 +2,36 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## Unreleased
+
+### Fixed
+
+- `integration.ReceiveLoop`: a turn gated while a freed slot was being handed
+  on could start ahead of the turns already waiting for that slot. The window
+  opened when the runtime refused a waiting turn's admission: the slot was
+  free before the next waiting turn took it, and a cycle running then (for
+  example one gating again the conversation whose turn had just ended) took
+  it first. Waiting turns now go first, in the order they were gated, and a
+  refused admission hands its slot on to them. The Python SDK's 1.3.1 has
+  the same fix.
+
+### Docs
+
+- The README and the `webSocket` / `livenessTimeoutMs` docs say which socket
+  Bun and Deno 2 get by default. They report a Node version
+  (`process.versions.node`), so the SDK tries the `ws` package first there,
+  as on Node, and their native `WebSocket` only without it. The docs said
+  their native socket came first. The behaviour is unchanged. The README's
+  Node 20 footnote says `ws` is needed there and also used on Node 22+ when
+  installed.
+- README changes since 1.3.0 (the README ships in the package): the samples
+  send with `content: { text }`, or `type: 'file'` and
+  `content.attachment_id`; the upload sample matches `createUpload`; the
+  wake-frame section covers `reason: 'unanswered'` and the `rewake`
+  capability; the Versioning section points at VERSIONING.md; the Links
+  point at the SDK guide, the integration contract v1 and the REST API
+  reference.
+
 ## 1.3.0 — 2026-11-08
 
 Contract v1 ("finish the gate"). Additive at the API level: code written

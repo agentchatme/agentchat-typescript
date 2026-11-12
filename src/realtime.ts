@@ -213,19 +213,20 @@ export interface RealtimeOptions {
    */
   ackOnReceipt?: boolean
   /**
-   * Override the WebSocket constructor. Defaults to `globalThis.WebSocket`
-   * with a dynamic-import fallback to the `ws` package (for Node 20).
-   * Tests use this to inject a mock. Users on a polyfilled environment
-   * can supply their own implementation — anything that matches the
-   * browser WebSocket shape (`onopen/onmessage/onclose/onerror`, `send`,
-   * `close`, `readyState`) works.
+   * Override the WebSocket constructor. By default it is resolved per
+   * runtime (below). Tests use this to inject a mock. Users on a
+   * polyfilled environment can supply their own implementation — anything
+   * that matches the browser WebSocket shape (`onopen/onmessage/onclose/
+   * onerror`, `send`, `close`, `readyState`) works.
    *
-   * On Node the default resolution prefers `WebSocket` from the `ws`
-   * package when it is installed and falls back to the native socket only
-   * without it: `ws` exposes the server's ping frames (`on('ping')`), which
-   * lets the liveness watchdog tell a quiet-but-healthy socket from a dead
-   * one. The browser-shaped socket (including Node's native one) cannot see
-   * pings — see `livenessTimeoutMs`. Pass a constructor only to override.
+   * On Node, and on Bun and Deno 2 (they report a Node version too), the
+   * default resolution prefers `WebSocket` from the `ws` package when it
+   * resolves and falls back to the native socket only without it: `ws`
+   * exposes the server's ping frames (`on('ping')`), which lets the liveness
+   * watchdog tell a quiet-but-healthy socket from a dead one. A
+   * browser-shaped socket (a browser's, or a runtime's native one) cannot
+   * see pings — see `livenessTimeoutMs`. Pass a constructor only to
+   * override.
    */
   webSocket?: typeof globalThis.WebSocket
   /**
@@ -242,8 +243,8 @@ export interface RealtimeOptions {
    * closed by the client and reconnected. The server pings every 45 s, so
    * the default (100 000) survives one missed ping and trips on the second.
    *
-   * Ping frames are visible only on a socket with `on('ping')` (Node `ws`).
-   * A browser-shaped socket (browsers, Node's native socket) cannot see
+   * Ping frames are visible only on a socket with `on('ping')` (`ws`).
+   * A browser-shaped socket (browsers, a runtime's native socket) cannot see
    * them; there the deadline runs on the server's `heartbeat` frame, sent
    * on the same 45 s timer once `hello.ok` accepted the `heartbeat`
    * capability (contract v1). Against a server that did not accept it the

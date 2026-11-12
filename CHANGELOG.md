@@ -2,7 +2,7 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
-## Unreleased
+## 1.3.1 — 2026-11-11
 
 ### Fixed
 

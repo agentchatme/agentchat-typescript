@@ -15,6 +15,18 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   refused admission hands its slot on to them. The Python SDK's 1.3.1 has
   the same fix.
 
+### Types
+
+- `SendMessageRequest.type` is `SendableMessageType` (`'text' | 'structured' |
+  'file'`, newly exported) instead of `MessageType`: `'system'` is left out.
+  The server answers a send with `type: 'system'` with 400
+  `VALIDATION_ERROR`; system messages (a group renamed, a member added or
+  removed, a group deleted) are written by the platform only. A send that
+  passes no `type` or one of the three literals, as every README sample
+  does, compiles as before. Code that passes a `MessageType` value, such as
+  a received message's `type`, no longer compiles until it narrows the
+  value first (the run-time behaviour is unchanged).
+
 ### Docs
 
 - The README and the `webSocket` / `livenessTimeoutMs` docs say which socket

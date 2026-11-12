@@ -1,5 +1,13 @@
 export type MessageType = 'text' | 'structured' | 'file' | 'system'
 
+/**
+ * The types a sender may set on `sendMessage`. `system` is not one: system
+ * messages (a group renamed, a member added or removed, a group deleted) are
+ * written by the platform itself, and the server answers a send with
+ * `type: 'system'` with 400 VALIDATION_ERROR.
+ */
+export type SendableMessageType = Exclude<MessageType, 'system'>
+
 export type MessageStatus = 'stored' | 'expired' | 'delivered' | 'read'
 
 /**
@@ -75,7 +83,8 @@ export interface SendMessageRequest {
   to?: string
   conversation_id?: string
   client_msg_id: string
-  type?: MessageType
+  /** Default `text`. */
+  type?: SendableMessageType
   content: MessageContent
   metadata?: Record<string, unknown>
 }

@@ -252,8 +252,9 @@ export interface CycleSummary {
   readonly truncated: boolean
   /**
    * Why the cycle could not finish, or, when some gate chunks failed, how
-   * many and the first one's reason (`2 of 5 gate chunks failed; chunk 3: …`;
-   * a tray gated in one call gives that call's reason as it is).
+   * many of the calls made and the first one's reason (`2 of 5 gate chunks
+   * failed; chunk 3: …`, the chunk named by its `gate_chunk` index); a cycle
+   * that made one gate call gives that call's reason as it is.
    */
   readonly failure: string | null
 }
@@ -1533,17 +1534,19 @@ export function replyPrompt(texts: Pick<Texts, 'wake_instruction' | 'reply_turn_
 }
 
 /**
- * The cycle's failure from its gate chunks: none when every chunk decided;
- * a single call's reason as it is; otherwise how many failed and the first
- * one's reason (each chunk's own is in its `gate_chunk` event).
+ * The cycle's failure from its gate chunks (the calls made, one report
+ * each): none when every call decided; when the cycle made one call, that
+ * call's reason as it is (a chunk not called, muted only or held, does not
+ * count); otherwise how many of the calls failed and the first one's reason,
+ * named by its chunk's `index` as in its `gate_chunk` event.
  */
 function chunkFailure(chunks: readonly GateChunkReport[]): string | null {
   const failed = chunks.filter((chunk) => chunk.outcome === 'fail_closed')
   const first = failed[0]
   if (first === undefined) return null
   const reason = first.failure ?? 'no usable verdicts in the answer'
-  if (first.of === 1) return reason
-  return `${failed.length} of ${first.of} gate chunks failed; chunk ${first.index}: ${reason}`
+  if (chunks.length === 1) return reason
+  return `${failed.length} of ${chunks.length} gate chunks failed; chunk ${first.index}: ${reason}`
 }
 
 /** A timeout option: undefined → the default, 0 → disabled (Infinity), a positive number → itself. */

@@ -1564,6 +1564,41 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
     expect(seen.map(idsIn)).toEqual([ids(tray.slice(0, 10)), ids(tray.slice(10))])
     await other.loop.stop()
   })
+
+  it('the failure counts the calls made: one call (10 owed, 3 muted) gives its reason as it is; a skipped chunk is not counted', async () => {
+    const mutedAt = (i: number): InboxCard => ({ ...cardAt(i), muted: true, you_owe_reply: false })
+    const { client, state, record } = fakeClient()
+    state.tray = trayOf([...cardsUpTo(10), mutedAt(10), mutedAt(11), mutedAt(12)])
+    const callModel = vi.fn(async () => 'Most of these can wait.')
+    const { loop, events } = gateLoop({ client, callModel })
+    loop.wake()
+    await until(() => loop.status().lastCycle !== null)
+    expect(callModel).toHaveBeenCalledTimes(1)
+    expect(record).not.toHaveBeenCalled()
+    // As from a single gate call: the bare reason.
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'fail_closed', chunksOk: 0, chunksFailed: 1, failure: 'no usable verdicts in the answer' })
+    expect(chunkEvents(events).map((e) => [e.index, e.of, e.outcome])).toEqual([[1, 2, 'fail_closed']])
+    await loop.stop()
+
+    // Three planned chunks, the middle one muted only: two calls; the count is of those two.
+    const other = fakeClient()
+    other.state.tray = trayOf([...cardsUpTo(10), ...[10, 11, 12, 13, 14, 15, 16, 17, 18, 19].map(mutedAt), cardAt(20)])
+    let calls = 0
+    const two = gateLoop({
+      client: other.client,
+      callModel: async (prompt: string) => (++calls === 2 ? 'not JSON' : allAs('dismiss', prompt)),
+    })
+    two.loop.wake()
+    await until(() => two.loop.status().lastCycle !== null)
+    expect(calls).toBe(2)
+    expect(two.loop.status().lastCycle).toMatchObject({
+      outcome: 'decided',
+      chunksOk: 1,
+      chunksFailed: 1,
+      failure: '1 of 2 gate chunks failed; chunk 3: no usable verdicts in the answer',
+    })
+    await two.loop.stop()
+  })
 })
 
 describe('ReceiveLoop — the reply turn prompt (reply_turn_template)', () => {

@@ -42,9 +42,11 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   increasing within the loop, so one cycle's chunks are never taken for the
   next one's), `CycleSummary.chunksOk` and
   `chunksFailed`, and the same two totals in `status().counters`. A cycle
-  with some chunks decided is `decided`, with `failure` naming how many
-  failed and the first reason (`2 of 5 gate chunks failed; chunk 3: …`);
-  `fail_closed` means every chunk failed.
+  with some chunks decided is `decided`, with `failure` naming how many of
+  the calls made failed and the first reason (`2 of 5 gate chunks failed;
+  chunk 3: …`); a cycle that made one call gives its reason as it is, as
+  before (a chunk of muted cards only is not a call). `fail_closed` means
+  every chunk failed.
 - `Texts.reply_turn_template` (optional; contract v1 §3.6, served by
   `GET /v1/texts`). `TextsCache` keeps it like every other field.
 

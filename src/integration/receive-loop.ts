@@ -6,11 +6,14 @@
  * Two modes (contract v1, D5):
  *
  * - `gateCall` (Hermes, OpenClaw): read the tray, ask the agent's own model
- *   the served gate question in a tool-less call (`callModel`), record
- *   `dismiss` / `defer` at once, start one turn per `reply` (`startTurn`),
- *   and when a turn has ended record from what actually happened
- *   (`turnOutcome`). Each pending invite on the tray gets one invite turn
- *   (`startInviteTurn`, default `startTurn`) and the same rule.
+ *   the served gate question in tool-less calls (`callModel`) of at most
+ *   `gateChunkSize` cards each (contract v1 §3.6: one call per chunk, in tray
+ *   order, one after another; a chunk that fails leaves only its own cards
+ *   undecided), record `dismiss` / `defer` at once, then start one turn per
+ *   `reply` (`startTurn`) prompted with the served `reply_turn_template` for
+ *   its one conversation, and when a turn has ended record from what actually
+ *   happened (`turnOutcome`). Each pending invite on the tray gets one invite
+ *   turn (`startInviteTurn`, default `startTurn`) and the same rule.
  * - `singleRun` (Claude Code, Codex, routines, a listener): when anything is
  *   owed, start one run (`startRun`) with the served wake text; the run reads
  *   the tray itself and records its own verdicts. The loop records nothing
@@ -81,18 +84,32 @@ export const TURN_OVERDUE_MS = 30 * 60_000
 /** The truncated-tray self-wake after a cycle that made no progress: 1 s, doubling, at most 60 s. */
 const NO_PROGRESS_BACKOFF_MS = 1_000
 const NO_PROGRESS_BACKOFF_MAX_MS = 60_000
-/** The gate call's deadline: past it the cycle fails closed for its cards. */
+/** Each gate call's deadline (one per chunk): past it that chunk fails closed for its cards. */
 export const GATE_CALL_TIMEOUT_MS = 60_000
-/** A cycle's deadline, not counting time inside turns and runs: past it the cycle is abandoned. */
+/**
+ * A cycle's deadline, not counting time inside turn admissions, runs, and gate
+ * calls that have a deadline of their own: past it the cycle is abandoned.
+ */
 export const CYCLE_TIMEOUT_MS = 10 * 60_000
+/** The most cards one gate call decides (contract v1 §3.6: chunks of at most 10). */
+export const GATE_CHUNK_SIZE = 10
+/** The placeholder a served `reply_turn_template` names the conversation with. */
+const REPLY_TURN_PLACEHOLDER = '<conversation_id>'
 /** How many cycle summaries `status().recentCycles` keeps. */
 const RECENT_CYCLES = 20
 
 /** One cycle's clock and identity: abandoned cycles go stale and stop acting. */
 interface CycleRun {
+  /** The cycle's number in this loop: unique, increasing (not consecutive: an abandonment skips one). */
   readonly token: number
   readonly signal: AbortSignal
+  /** Abandoned by the watchdog, or the loop stopped: the cycle acts no more. */
   stale(): boolean
+  /**
+   * Abandoned by the watchdog (not a stop): its `abandoned` summary is out
+   * already, so it reports and counts nothing more.
+   */
+  abandoned(): boolean
   /** Await work whose time does not count against the cycle deadline (turn admissions, runs). */
   exclude<T>(work: () => Promise<T>): Promise<T>
 }
@@ -109,7 +126,11 @@ export type TurnRequest =
       /** The message the gate's verdict reads through. */
       readonly anchor: string | null
       readonly category: string | null
-      /** The served wake instruction and the conversation id: what the turn starts with. */
+      /**
+       * What the turn starts with: the served `reply_turn_template` for this
+       * one conversation (from texts without it: the served wake instruction
+       * and the conversation id). See `replyPrompt`.
+       */
       readonly prompt: string
       readonly texts: Texts
       /** Aborted when the loop stops. */
@@ -181,9 +202,13 @@ export type CycleOutcome =
   | 'tray_failed'
   | 'texts_missing'
   | 'tools_unavailable'
-  /** gateCall: the gate decided (turns started or queued for the replies). */
+  /**
+   * gateCall: the gate decided (turns started or queued for the replies). With
+   * the tray in chunks, at least one chunk decided; `chunksFailed` counts the
+   * ones that did not (their cards stay undecided).
+   */
   | 'decided'
-  /** gateCall: the model failed or answered nothing usable; nothing recorded. */
+  /** gateCall: every gate call failed or answered nothing usable; nothing recorded. */
   | 'fail_closed'
   /** gateCall: only invites were owed; their turns were started or queued. */
   | 'invites_only'
@@ -215,7 +240,44 @@ export interface CycleSummary {
   readonly heldByTurns: number
   /** Cards and invites left out by D5 pacing (a recent silent turn). */
   readonly paced: number
+  /** gateCall: gate calls (one per chunk of at most `gateChunkSize` cards) whose answer gave verdicts. */
+  readonly chunksOk: number
+  /**
+   * gateCall: gate calls that failed closed (the call failed or ran past its
+   * deadline, or its answer held no usable verdict); only their own cards
+   * stay undecided. A call the cycle's end cut short (`stop()`, the
+   * watchdog) is neither: the cycle is `abandoned`.
+   */
+  readonly chunksFailed: number
   readonly truncated: boolean
+  /**
+   * Why the cycle could not finish, or, when some gate chunks failed, how
+   * many of the calls made and the first one's reason (`2 of 5 gate chunks
+   * failed; chunk 3: …`, the chunk named by its `gate_chunk` index); a cycle
+   * that made one gate call gives that call's reason as it is.
+   */
+  readonly failure: string | null
+}
+
+/** One gate call (a chunk of the tray), reported once its verdicts are recorded. */
+export interface GateChunkReport {
+  /**
+   * The cycle the call belongs to: unique and increasing within this loop
+   * (not consecutive), so a cycle's chunks are never taken for the next one's.
+   */
+  readonly cycle: number
+  /** 1-based position of the chunk in the cycle, in tray order. */
+  readonly index: number
+  /**
+   * How many chunks the cycle's cards were split into. A chunk not called
+   * (every card taken by a turn meanwhile, or muted cards only) has no report.
+   */
+  readonly of: number
+  /** Cards this call decided on (the N of its prompt). */
+  readonly cards: number
+  readonly outcome: 'decided' | 'fail_closed'
+  /** This chunk's cards left without a usable verdict. */
+  readonly undecided: number
   readonly failure: string | null
 }
 
@@ -231,6 +293,8 @@ export type ReceiveLoopEvent =
     }
   | { readonly type: 'echo'; readonly conversationId?: string }
   | { readonly type: 'cycle'; readonly summary: CycleSummary }
+  /** gateCall: one per gate call, in order; a partial failure shows here chunk by chunk. */
+  | ({ readonly type: 'gate_chunk' } & GateChunkReport)
   | { readonly type: 'turn_started'; readonly request: Omit<TurnRequest, 'signal' | 'texts'> }
   | { readonly type: 'turn_refused'; readonly kind: 'reply' | 'invite'; readonly id: string; readonly error: string | null }
   | { readonly type: 'turn_outcome'; readonly outcome: TurnOutcome; readonly recorded: boolean }
@@ -283,15 +347,28 @@ export interface ReceiveLoopOptions {
   /** A tracker shared with other loops or the integration; default: the loop's own. */
   readonly tracker?: TurnTracker
   /**
-   * The gate call's deadline (`GATE_CALL_TIMEOUT_MS`, 60 s). Past it the
-   * cycle fails closed for its cards (nothing recorded; the next wake asks
-   * again) and the call's `signal` aborts.
+   * gateCall: the most cards one gate call decides (`GATE_CHUNK_SIZE`, 10;
+   * an integer from 1 to 50). A larger tray is gated in chunks of this size,
+   * in tray order, one call after another (contract v1 §3.6): each chunk's
+   * prompt is the gate prompt for its own cards, each call has its own
+   * deadline, and a chunk that fails leaves only its own cards undecided
+   * while the other chunks' verdicts are recorded. Reply turns start once
+   * every chunk has answered. 50 gates the largest tray in one call.
+   */
+  readonly gateChunkSize?: number
+  /**
+   * Each gate call's deadline (`GATE_CALL_TIMEOUT_MS`, 60 s; one per chunk).
+   * Past it that chunk fails closed for its cards (nothing recorded for them;
+   * the next wake asks again), the call's `signal` aborts, and the next chunk
+   * gets a deadline of its own.
    */
   readonly gateCallTimeoutMs?: number /* 0 or Infinity = no deadline */
   /**
    * A cycle's deadline (`CYCLE_TIMEOUT_MS`, 10 min), not counting time
-   * inside turn admissions and runs. A cycle past it is abandoned (it stops
-   * acting at its next step), reported once, and the loop takes wakes again.
+   * inside turn admissions, runs, and gate calls while they have a deadline
+   * (`gateCallTimeoutMs`; with it off, gate calls count: the watchdog is
+   * then their only bound). A cycle past it is abandoned (it stops acting at
+   * its next step), reported once, and the loop takes wakes again.
    */
   readonly cycleTimeoutMs?: number /* 0 or Infinity = no watchdog */
   /**
@@ -349,6 +426,10 @@ export interface ReceiveLoopStatus {
     readonly runsCompleted: number
     readonly runsFailed: number
     readonly runsNotStarted: number
+    /** Gate calls (chunks) that gave verdicts, since start. */
+    readonly chunksOk: number
+    /** Gate calls (chunks) that failed closed, since start; alarm on a rising count. */
+    readonly chunksFailed: number
     readonly outcomes: Readonly<Record<string, number>>
     readonly outcomeRecordFailures: number
   }
@@ -394,6 +475,21 @@ class Pacer {
 
 type Launch = 'started' | 'refused' | 'queued'
 
+/** What the gate's chunks of one cycle came to, together. */
+interface ChunkedGate {
+  /** Cards sent to the model (in a chunk whose call was not cut short). */
+  gated: number
+  /** Cards left out of their chunk because a turn took them while earlier chunks were gated. */
+  held: number
+  /** The replies, chunk by chunk, each chunk's in the model's order. */
+  reply: GateReply[]
+  verdicts: Record<'reply' | 'dismiss' | 'defer', number>
+  undecided: number
+  recorded: number
+  recordFailures: number
+  chunks: GateChunkReport[]
+}
+
 export class ReceiveLoop {
   private readonly options: ReceiveLoopOptions
   private readonly client: ReceiveLoopClient
@@ -431,6 +527,7 @@ export class ReceiveLoop {
   private cycleAbort: AbortController | null = null
   private readonly gateCallTimeoutMs: number
   private readonly cycleTimeoutMs: number
+  private readonly gateChunkSize: number
   private lastError: string | null = null
   private readonly counts = {
     frames: 0,
@@ -443,6 +540,8 @@ export class ReceiveLoop {
     runsCompleted: 0,
     runsFailed: 0,
     runsNotStarted: 0,
+    chunksOk: 0,
+    chunksFailed: 0,
     outcomeRecordFailures: 0,
   }
   private readonly outcomes: Record<string, number> = {}
@@ -457,6 +556,11 @@ export class ReceiveLoop {
     }
     const maxTurns = options.maxConcurrentTurns ?? 1
     if (!Number.isInteger(maxTurns) || maxTurns < 1) throw new RangeError('ReceiveLoop: maxConcurrentTurns must be an integer >= 1')
+    const chunkSize = options.gateChunkSize ?? GATE_CHUNK_SIZE
+    if (!Number.isInteger(chunkSize) || chunkSize < 1 || chunkSize > TRAY_LIMIT) {
+      throw new RangeError(`ReceiveLoop: gateChunkSize must be an integer from 1 to ${TRAY_LIMIT}`)
+    }
+    this.gateChunkSize = chunkSize
     this.options = options
     this.client = options.client
     this.now = options.now ?? Date.now
@@ -672,6 +776,7 @@ export class ReceiveLoop {
       token,
       signal: controller.signal,
       stale: () => this.cycleToken !== token || this.stopped,
+      abandoned: () => this.cycleToken !== token,
       exclude: async <T>(work: () => Promise<T>): Promise<T> => {
         if (depth++ === 0) excludedSince = this.now()
         try {
@@ -687,7 +792,9 @@ export class ReceiveLoop {
     const work = (async () => {
       const summary =
         this.options.mode === 'gateCall' ? await this.gateCallCycle(run) : await this.singleRunCycle(run)
-      if (!run.stale() || this.stopped) this.finishCycle(summary)
+      // A stopped cycle reports what it did; one the watchdog abandoned has
+      // reported already (below), also when its work ends after a stop().
+      if (!run.abandoned()) this.finishCycle(summary)
     })()
     let timer: TimerHandle | null = null
     const overdue = new Promise<'overdue'>((resolve) => {
@@ -752,8 +859,21 @@ export class ReceiveLoop {
     }
   }
 
-  /** The runtime's model call, bounded by `gateCallTimeoutMs` (and the cycle's own abandonment). */
+  /**
+   * The runtime's model call, bounded by `gateCallTimeoutMs` (and the cycle's
+   * own abandonment). Every call (one per chunk) gets its own deadline and
+   * its own `signal`. While a call has a deadline, its time does not count
+   * against the cycle's: a tray gated in k chunks may take k deadlines, and a
+   * cycle that is making progress is not abandoned for it. With the deadline
+   * off the watchdog is the calls' only bound, so they count.
+   */
   private boundedModelCall(run: CycleRun): GateModelCall {
+    const call = this.deadlineModelCall(run)
+    if (!Number.isFinite(this.gateCallTimeoutMs)) return call
+    return (prompt, options) => run.exclude(() => call(prompt, options))
+  }
+
+  private deadlineModelCall(run: CycleRun): GateModelCall {
     return (prompt) =>
       new Promise<string>((resolve, reject) => {
         const controller = new AbortController()
@@ -828,10 +948,7 @@ export class ReceiveLoop {
     if (tray === null) return this.summary('tray_failed', { failure: this.lastError })
     const cards = cardsOf(tray)
     const invites = trayInvites(tray)
-    // Held out of this gate: a running or waiting turn, or a verdict still
-    // being recorded (an abandoned cycle's last call): gating it again could
-    // record the same verdict twice (a second defer climbs the ladder).
-    const unheld = this.tracker.withoutRunning(cards).filter((card) => !this.recordsInFlight.has(card.conversation_id))
+    const unheld = this.unheld(cards)
     const heldByTurns = cards.length - unheld.length
     if (heldByTurns > 0) this.heldWhileRunning = true
     const gateCards = unheld.filter((card) => !this.pacer.held(`conversation:${card.conversation_id}`, anchorFrom(card)))
@@ -850,8 +967,8 @@ export class ReceiveLoop {
     if (run.stale()) return this.summary('abandoned', base)
     if (unready !== null) return this.summary('tools_unavailable', { ...base, failure: unready })
 
-    let gated = 0
     const tally = {
+      gated: 0,
       reply: 0,
       dismiss: 0,
       defer: 0,
@@ -861,43 +978,144 @@ export class ReceiveLoop {
       turnsStarted: 0,
       turnsRefused: 0,
       turnsQueued: 0,
+      chunksOk: 0,
+      chunksFailed: 0,
     }
+    let heldDuringGate = 0
     let outcome: CycleOutcome = 'invites_only'
     let failure: string | null = null
     if (owedCards.length > 0) {
-      gated = gateCards.length
-      const result = await runGate({
-        tray: { ...tray, conversations: gateCards },
-        callModel: this.boundedModelCall(run),
-        client: this.recordingClient(run),
-        texts,
-        signal: run.signal,
-        ...(this.options.toolNamer ? { toolNamer: this.options.toolNamer } : {}),
-      })
-      for (const verdict of result.verdicts) tally[verdict.decision] += 1
-      tally.undecided = result.undecided.length
-      tally.recorded = result.recorded
-      tally.recordFailures = result.recordFailures.length
-      if (result.outcome === 'fail_closed') {
-        outcome = 'fail_closed'
-        failure = result.failure
-      } else {
+      const gate = await this.gateInChunks(run, tray, gateCards, texts)
+      heldDuringGate = gate.held
+      tally.gated = gate.gated
+      tally.reply = gate.verdicts.reply
+      tally.dismiss = gate.verdicts.dismiss
+      tally.defer = gate.verdicts.defer
+      tally.undecided = gate.undecided
+      tally.recorded = gate.recorded
+      tally.recordFailures = gate.recordFailures
+      tally.chunksOk = gate.chunks.filter((c) => c.outcome === 'decided').length
+      tally.chunksFailed = gate.chunks.length - tally.chunksOk
+      failure = chunkFailure(gate.chunks)
+      if (tally.chunksOk > 0) {
         outcome = 'decided'
-        for (const reply of result.reply) {
+        // Every chunk has answered and its dismiss / defer verdicts are
+        // recorded: only then do the turns start, so no turn runs while cards
+        // of this cycle still wait for their gate call (as with one call).
+        for (const reply of gate.reply) {
           if (run.stale()) break
           tally[launchKey(await run.exclude(() => this.startReplyTurn(reply, texts)))] += 1
         }
+      } else if (tally.chunksFailed > 0) {
+        outcome = 'fail_closed'
+      } else if (owedInvites.length === 0 && !run.stale()) {
+        // Every owed card became held by a turn while the gate ran (muted
+        // cards alone cost no call): no call was made.
+        return this.summary('nothing_owed', { ...base, heldByTurns: heldByTurns + heldDuringGate })
       }
     }
     for (const invite of owedInvites) {
       if (run.stale()) break
       tally[launchKey(await run.exclude(() => this.startInviteTurn(invite, texts)))] += 1
     }
-    if (run.stale()) return this.summary('abandoned', base)
+    const parts = { ...base, heldByTurns: heldByTurns + heldDuringGate, ...tally }
+    // Stopped (or abandoned) part-way: what was done is still reported; the
+    // reason is the stop itself, not a failure.
+    if (run.stale()) return this.summary('abandoned', parts)
     if (tray.truncated === true && outcome === 'decided') {
       this.readTheRest(tally.recorded > 0 || tally.turnsStarted > 0)
     }
-    return this.summary(outcome, { ...base, gated, ...tally, failure })
+    return this.summary(outcome, { ...parts, failure })
+  }
+
+  /**
+   * Held out of the gate: a running or waiting turn, or a verdict still being
+   * recorded (an abandoned cycle's last call): gating it again could record
+   * the same verdict twice (a second defer climbs the ladder).
+   */
+  private unheld(cards: readonly InboxCard[]): InboxCard[] {
+    return this.tracker.withoutRunning(cards).filter((card) => !this.recordsInFlight.has(card.conversation_id))
+  }
+
+  /**
+   * The gate in chunks (contract v1 §3.6): the cards, in tray order, split
+   * into chunks of at most `gateChunkSize`, one gate call per chunk, one
+   * after another. Each chunk's prompt is the gate prompt for its own cards
+   * (N = the cards in that chunk), each call has its own deadline and the
+   * cycle's cancellation, and each chunk's dismiss / defer verdicts are
+   * recorded as soon as it answers. A chunk that fails closed leaves only its
+   * own cards undecided. Before each call the chunk is checked again for
+   * cards a turn has taken since the tray was read (a shared tracker), so a
+   * longer gate never decides a card a turn holds; a chunk left with muted
+   * cards only (or none) is not called. Stops once the cycle is stale; a call
+   * a stop cut short is not counted as a failed chunk, and a cycle the
+   * watchdog abandoned reports and counts no chunk after its summary.
+   */
+  private async gateInChunks(run: CycleRun, tray: InboxTray, cards: readonly InboxCard[], texts: Texts): Promise<ChunkedGate> {
+    const size = this.gateChunkSize
+    const of = Math.ceil(cards.length / size)
+    const callModel = this.boundedModelCall(run)
+    const client = this.recordingClient(run)
+    const out: ChunkedGate = {
+      gated: 0,
+      held: 0,
+      reply: [],
+      verdicts: { reply: 0, dismiss: 0, defer: 0 },
+      undecided: 0,
+      recorded: 0,
+      recordFailures: 0,
+      chunks: [],
+    }
+    for (let index = 1; index <= of; index++) {
+      if (run.stale()) break
+      const planned = cards.slice((index - 1) * size, index * size)
+      const chunk = this.unheld(planned)
+      out.held += planned.length - chunk.length
+      if (chunk.length < planned.length) this.heldWhileRunning = true
+      // The loop's rule per chunk: muted cards alone owe nothing, so they cost
+      // no call (they stay on the tray as in a nothing_owed cycle). With an
+      // owed card they ride along, as in a single call.
+      if (!chunk.some((card) => card.muted !== true)) continue
+      const result = await runGate({
+        tray: { ...tray, conversations: chunk },
+        callModel,
+        client,
+        texts,
+        signal: run.signal,
+        ...(this.options.toolNamer ? { toolNamer: this.options.toolNamer } : {}),
+      })
+      // Abandoned by the watchdog meanwhile: its summary is out; nothing more
+      // is reported or counted for it.
+      if (run.abandoned()) break
+      // Cut short by stop(): not this chunk's failure.
+      if (run.stale() && result.outcome !== 'decided') break
+      out.gated += chunk.length
+      // A stop part-way through the recording leaves the rest undecided
+      // (`gate.run` moves them there): each card counts once, as a verdict
+      // or as undecided.
+      const undecided = new Set(result.undecided)
+      for (const verdict of result.verdicts) {
+        if (!undecided.has(verdict.conversation_id)) out.verdicts[verdict.decision] += 1
+      }
+      out.reply.push(...result.reply)
+      out.undecided += result.undecided.length
+      out.recorded += result.recorded
+      out.recordFailures += result.recordFailures.length
+      const report: GateChunkReport = {
+        cycle: run.token,
+        index,
+        of,
+        cards: chunk.length,
+        outcome: result.outcome === 'decided' ? 'decided' : 'fail_closed',
+        undecided: result.undecided.length,
+        failure: result.failure,
+      }
+      out.chunks.push(report)
+      if (report.outcome === 'decided') this.counts.chunksOk += 1
+      else this.counts.chunksFailed += 1
+      this.emit({ type: 'gate_chunk', ...report })
+    }
+    return out
   }
 
   /**
@@ -1271,6 +1489,8 @@ export class ReceiveLoop {
       turnsQueued: 0,
       heldByTurns: 0,
       paced: 0,
+      chunksOk: 0,
+      chunksFailed: 0,
       truncated: false,
       failure: null,
       ...parts,
@@ -1292,9 +1512,41 @@ export class ReceiveLoop {
   }
 }
 
-/** The prompt a reply turn starts with: the served wake instruction, then the conversation it is for. */
-export function replyPrompt(texts: Pick<Texts, 'wake_instruction'>, conversationId: string): string {
+/**
+ * The prompt a reply turn starts with: the served `reply_turn_template`
+ * (contract v1 §3.6) with every `<conversation_id>` replaced by the
+ * conversation's id, which sends the turn to that one conversation and no
+ * other. A served template that names no `<conversation_id>` is still the
+ * turn's text, followed by a `conversation_id:` line. Only texts without a
+ * template (an older server, a copy cached before it; an empty or blank
+ * value counts as none, as for every served text) fall back to the served
+ * wake instruction and a `conversation_id:` line.
+ */
+export function replyPrompt(texts: Pick<Texts, 'wake_instruction' | 'reply_turn_template'>, conversationId: string): string {
+  const raw: unknown = texts.reply_turn_template
+  const template = typeof raw === 'string' ? raw.trim() : ''
+  if (template.length > 0) {
+    // split/join: the id is inserted as it is (no `$&` patterns), at every place.
+    if (template.includes(REPLY_TURN_PLACEHOLDER)) return template.split(REPLY_TURN_PLACEHOLDER).join(conversationId)
+    return `${template}\n\nconversation_id: ${conversationId}`
+  }
   return `${texts.wake_instruction.trim()}\n\nconversation_id: ${conversationId}`
+}
+
+/**
+ * The cycle's failure from its gate chunks (the calls made, one report
+ * each): none when every call decided; when the cycle made one call, that
+ * call's reason as it is (a chunk not called, muted only or held, does not
+ * count); otherwise how many of the calls failed and the first one's reason,
+ * named by its chunk's `index` as in its `gate_chunk` event.
+ */
+function chunkFailure(chunks: readonly GateChunkReport[]): string | null {
+  const failed = chunks.filter((chunk) => chunk.outcome === 'fail_closed')
+  const first = failed[0]
+  if (first === undefined) return null
+  const reason = first.failure ?? 'no usable verdicts in the answer'
+  if (chunks.length === 1) return reason
+  return `${failed.length} of ${chunks.length} gate chunks failed; chunk ${first.index}: ${reason}`
 }
 
 /** A timeout option: undefined → the default, 0 → disabled (Infinity), a positive number → itself. */

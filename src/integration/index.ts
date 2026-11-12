@@ -89,6 +89,7 @@ export {
   type ReceiveLoopEvent,
   type CycleOutcome,
   type CycleSummary,
+  type GateChunkReport,
   type TurnRequest,
   type TurnAdmission,
   type TurnStarter,

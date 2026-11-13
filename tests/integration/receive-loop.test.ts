@@ -439,6 +439,124 @@ describe('ReceiveLoop — the socket', () => {
   })
 })
 
+describe('ReceiveLoop — system notices are acked but are not wakes (contract v1 §4)', () => {
+  /** A system notice as the socket carries it: a `message.new` whose message has `type: 'system'`. */
+  const notice = (id: string, conversationId: string, seq: number, data: Record<string, unknown>) => ({
+    type: 'message.new',
+    payload: {
+      id,
+      conversation_id: conversationId,
+      sender: '@example-ops',
+      client_msg_id: `sys_${id}`,
+      seq,
+      type: 'system',
+      content: { data: { schema_version: 1, ...data } },
+      metadata: {},
+      created_at: '2026-11-12T09:00:00.000Z',
+    },
+  })
+  const message = (id: string, conversationId: string, seq: number) => ({
+    type: 'message.new',
+    payload: { id, conversation_id: conversationId, sender: '@example-scout', seq, type: 'text', content: { text: 'are you there?' } },
+  })
+
+  async function socketLoop(mode: 'gateCall' | 'singleRun', quietMs = 0) {
+    const fake = fakeClient()
+    fake.state.tray = trayOf([])
+    const events: ReceiveLoopEvent[] = []
+    const callModel = vi.fn(answer([{ conversation_id: DIRECT.conversation_id, decision: 'dismiss', category: 'acknowledgement' }]))
+    const runs: RunRequest[] = []
+    const loop = new ReceiveLoop({
+      mode,
+      client: fake.client,
+      texts: textsSource(),
+      ...(mode === 'gateCall'
+        ? { callModel, startTurn: async () => ({ started: false }) }
+        : { startRun: async (request: RunRequest) => (runs.push(request), { status: 'completed' as const }) }),
+      socket: { apiKey: 'ac_key', webSocket: MockWebSocketCtor },
+      handle: '@example-relay',
+      quietMs,
+      maxMs: quietMs * 10,
+      onEvent: (e) => events.push(e),
+    })
+    await loop.start()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage(json('hello-ok.v1.json'))
+    await until(() => loop.status().coalescer.cycles === 1, 'the connect cycle')
+    await idle()
+    return { ...fake, loop, ws, events, callModel, runs }
+  }
+  const wakeSources = (events: ReceiveLoopEvent[]) =>
+    events.filter((e) => e.type === 'wake').map((e) => (e as { source: string }).source)
+
+  it('a group_deleted notice (with its group.deleted frame) is acked on receipt and starts no cycle and no gate call', async () => {
+    const { loop, ws, events, tray, callModel } = await socketLoop('gateCall')
+    const reads = tray.mock.calls.length
+    ws.simulateMessage(notice('msg_gone0deleted01d', 'conv_group0gone0001', 7, { event: 'group_deleted', actor_handle: 'example-ops' }))
+    ws.simulateMessage({
+      type: 'group.deleted',
+      payload: { group_id: 'conv_group0gone0001', deleted_by_handle: 'example-ops', deleted_at: '2026-11-12T09:00:00.000Z' },
+    })
+    ws.simulateMessage(notice('msg_crew0joined0001', 'conv_group0crew0001', 3, { event: 'member_joined', agent_handle: 'example-quill' }))
+    await idle()
+    await idle()
+    // Delivered: this machine has them. Nothing else happened.
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_gone0deleted01d', 'msg_crew0joined0001'])
+    expect(loop.status().coalescer).toMatchObject({ cycles: 1, wakes: 1 })
+    expect(tray.mock.calls.length).toBe(reads)
+    expect(callModel).not.toHaveBeenCalled()
+    expect(wakeSources(events)).toEqual(['connect'])
+    expect(events.filter((e) => e.type === 'notice')).toEqual([
+      { type: 'notice', conversationId: 'conv_group0gone0001' },
+      { type: 'notice', conversationId: 'conv_group0crew0001' },
+    ])
+    expect(loop.status().counters).toMatchObject({ frames: 2, notices: 2, echoes: 0 })
+    await loop.stop()
+  })
+
+  it('a real message in the same burst as notices still starts its cycle, and the gate is called once', async () => {
+    const { loop, ws, events, state, callModel, record } = await socketLoop('gateCall', 20)
+    state.tray = trayOf([DIRECT])
+    // One burst inside the quiet window: a notice, a real message, a notice.
+    ws.simulateMessage(notice('msg_crew0joined0001', 'conv_group0crew0001', 1, { event: 'member_joined', agent_handle: 'example-quill' }))
+    ws.simulateMessage(message('msg_crew0hello00002', 'conv_group0crew0001', 2))
+    ws.simulateMessage(notice('msg_crew0renamed003', 'conv_group0crew0001', 3, { event: 'name_changed', new_name: 'crew', actor_handle: 'example-ops' }))
+    await until(() => loop.status().coalescer.cycles === 2, 'the message cycle')
+    await loop.idle()
+    await idle()
+    expect(loop.status().coalescer).toMatchObject({ cycles: 2, wakes: 2 })
+    expect(callModel).toHaveBeenCalledTimes(1)
+    expect(record.mock.calls.map(([id, opts]) => [id, (opts as { throughMessageId?: string }).throughMessageId])).toEqual([
+      [DIRECT.conversation_id, DIRECT.preview!.message_id],
+    ])
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_crew0joined0001', 'msg_crew0hello00002', 'msg_crew0renamed003'])
+    expect(wakeSources(events)).toEqual(['connect', 'message'])
+    expect(loop.status().counters).toMatchObject({ notices: 2 })
+    // The order inside the burst does not matter: a message after a notice wakes too.
+    ws.simulateMessage(notice('msg_crew0left000004', 'conv_group0crew0001', 4, { event: 'member_left', agent_handle: 'example-quill' }))
+    ws.simulateMessage(message('msg_crew0again00005', 'conv_group0crew0001', 5))
+    await until(() => loop.status().coalescer.cycles === 3, 'the second message cycle')
+    expect(loop.status().counters).toMatchObject({ notices: 3 })
+    await loop.stop()
+  })
+
+  it('single-run: a notice starts no run; a real message does', async () => {
+    const { loop, ws, state, runs } = await socketLoop('singleRun')
+    expect(runs).toHaveLength(0) // the connect cycle found an empty tray
+    state.tray = trayOf([DIRECT])
+    ws.simulateMessage(notice('msg_crew0joined0001', 'conv_group0crew0001', 1, { event: 'member_joined', agent_handle: 'example-quill' }))
+    await idle()
+    await idle()
+    expect(loop.status().coalescer).toMatchObject({ cycles: 1, wakes: 1 })
+    expect(runs).toHaveLength(0)
+    ws.simulateMessage(message('msg_direct0next0001', DIRECT.conversation_id, 1))
+    await until(() => runs.length === 1, 'the run for a real message')
+    expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_crew0joined0001', 'msg_direct0next0001'])
+    await loop.stop()
+  })
+})
+
 describe('ReceiveLoop — single-run mode', () => {
   function runLoop(client: ReturnType<typeof fakeClient>['client'], startRun: (r: RunRequest) => Promise<{ status: 'completed' | 'failed' | 'not_started' }>) {
     return new ReceiveLoop({ mode: 'singleRun', client, texts: textsSource(), startRun, socket: null, quietMs: 0, maxMs: 0 })

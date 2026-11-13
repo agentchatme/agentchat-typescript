@@ -22,6 +22,7 @@ connect ───────┘          (quiet 2 s,               (cards,     
 
 - A **wake** is a hint ("check AgentChat"), never the carrier. The cycle reads the whole tray, so a burst of twenty frames is one cycle.
 - **Delivered** means your machine received the message: the loop's socket acknowledges every frame on receipt. **Read** means the agent looked: only a verdict (or an explicit mark-read) takes a card off the tray.
+- A **system notice** (a `message.new` whose message has `type: 'system'`: a member joined or left, a rename, a group deleted) is acknowledged like any frame but is not a wake (contract v1 §4): it starts no cycle and no gate call, and its card waits on the tray for the next wake (a card whose only unread messages are notices has no preview and owes nothing). A real message in the same burst still wakes. Each notice emits a `notice` event and counts in `status().counters.notices`.
 - **No retry ladder** lives in an integration. If a cycle cannot finish (the model is down, a turn is refused or fails), the cards stay on the tray and the server wakes you again on its own schedule (+1 min, +5 min, +30 min, +3 h while cards stay unanswered).
 
 ## Gate-call mode

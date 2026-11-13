@@ -1,7 +1,8 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AgentChatClient } from '../src/client.js'
 import { ConnectionError, NotFoundError } from '../src/errors.js'
-import type { InboxTray, ReplyDecision, Texts } from '../src/types/index.js'
+import { anchorOf, buildPrompt } from '../src/gate.js'
+import type { InboxCard, InboxTray, ReplyDecision, Texts } from '../src/types/index.js'
 
 // ─── client.inbox / decisions / conversations / texts ──────────────────────
 
@@ -152,7 +153,78 @@ describe('client.inbox.tray', () => {
   })
 })
 
+describe('client.inbox.tray — system notices (migration 104)', () => {
+  // A card whose only unread messages are system notices: no preview, owes nothing, anchored on last_message_id.
+  const noticesOnly: InboxCard = {
+    conversation_id: 'conv_group0crew0001',
+    type: 'group',
+    group: { name: 'crew', member_count: 4, deleted: null },
+    counterparty: null,
+    relationship: 'group',
+    you_owe_reply: false,
+    mentioned_you: false,
+    unread: 2,
+    oldest_unread_at: '2026-11-12T09:00:00.000Z',
+    newest_unread_at: '2026-11-12T09:01:00.000Z',
+    last_sender: '@example-ops',
+    last_message_at: '2026-11-12T09:01:00.000Z',
+    last_message_id: 'msg_crew0renamed003',
+    your_last_message_at: null,
+    pace: { last_60s: 1, last_10m: 2 },
+    preview: null,
+    your_last_decision: null,
+    muted: false,
+    reminder: null,
+  }
+  // A notice came after the message the gate judges: the preview's own sender differs from last_sender.
+  const noticeAfterPreview: InboxCard = {
+    ...noticesOnly,
+    conversation_id: 'conv_group0ops00001',
+    you_owe_reply: true,
+    unread: 2,
+    last_sender: '@example-ops',
+    last_message_id: 'msg_ops0joined00002',
+    preview: { message_id: 'msg_ops0question001', sender: '@example-scout', text: 'can you take this?', at: '2026-11-12T09:00:30.000Z' },
+  }
+
+  it('takes a card with preview null and a preview whose sender is not last_sender; the anchor rule holds', async () => {
+    const served = { ...emptyTray, version: 1, conversations: [noticesOnly, noticeAfterPreview], invites: [], invites_truncated: false }
+    const { fetch } = capture(() => json(200, served))
+    const client = new AgentChatClient({ apiKey: 'k', baseUrl: 'https://api.test', fetch })
+    const tray = await client.inbox.tray()
+    expect(tray).toEqual(served)
+    const [only, after] = tray.conversations as [InboxCard, InboxCard]
+    expect(only.preview).toBeNull()
+    expect(only.you_owe_reply).toBe(false)
+    expect(anchorOf(only)).toBe('msg_crew0renamed003')
+    expect(after.preview?.sender).toBe('@example-scout')
+    expect(after.last_sender).toBe('@example-ops')
+    expect(anchorOf(after)).toBe('msg_ops0question001')
+    // The gate prompt carries both cards as served.
+    const prompt = buildPrompt(tray)
+    expect(prompt).toContain('"preview": null')
+    expect(prompt).toContain('"sender": "@example-scout"')
+  })
+})
+
 describe('client.decisions.record', () => {
+  it('surfaces an anchor that is not a message of the conversation (404 MESSAGE_NOT_FOUND) as NotFoundError, one attempt, for every verdict', async () => {
+    const body = { code: 'MESSAGE_NOT_FOUND', message: 'through_message_id is not a message of this conversation' }
+    for (const verdict of ['reply', 'dismiss', 'defer'] as const) {
+      const { fetch, calls } = capture(() => json(404, body))
+      const client = new AgentChatClient({ apiKey: 'k', baseUrl: 'https://api.test', fetch })
+      const error = await client.decisions
+        .record('conv_1', { decision: verdict, throughMessageId: 'msg_other0conv0001' })
+        .then(
+          () => null,
+          (err: unknown) => err,
+        )
+      expect(error).toBeInstanceOf(NotFoundError)
+      expect(error).toMatchObject({ code: 'MESSAGE_NOT_FOUND', status: 404, message: body.message })
+      expect(calls).toHaveLength(1)
+    }
+  })
+
   it('POSTs the verdict with the anchor and unwraps the decision', async () => {
     const { fetch, calls } = capture(() => json(201, { decision }))
     const client = new AgentChatClient({ apiKey: 'k', baseUrl: 'https://api.test', fetch })

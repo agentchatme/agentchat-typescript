@@ -2,10 +2,21 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
-## Unreleased
+## 1.3.2 — 2026-11-13
 
 ### Fixed
 
+- `integration.ReceiveLoop`: a system notice no longer starts a cycle. A
+  `message.new` whose message has `type: 'system'` (a member joined or
+  left, a rename, a group deleted; the `group_deleted` notice is pushed live
+  beside `group.deleted`, the others arrive with a sync or a reconnect)
+  woke the loop like a peer's message: a tray read and, in gate-call mode, a
+  gate call, or in single-run mode a run whenever anything was owed. The
+  socket still acknowledges it on receipt (delivered), but it is not a wake
+  (contract v1 §4): no cycle, no gate call, no run. Its card waits on the
+  tray for the next wake; since the server's migration 104 a card whose
+  only unread messages are notices has `preview: null` and owes nothing. A
+  real message in the same burst still wakes.
 - `integration.ReceiveLoop` (gate-call mode): a tray with many unread
   conversations no longer leaves the agent stuck. The loop sent up to 50
   cards to the model in one gate call. Integrations cap that answer at 2,048
@@ -36,6 +47,9 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 
 ### Added
 
+- `integration.ReceiveLoop`: a `notice` event (`{ type: 'notice',
+  conversationId? }`) for each system notice frame, and the
+  `status().counters.notices` total.
 - `ReceiveLoopOptions.gateChunkSize`. A partial failure shows: a
   `gate_chunk` event per gate call (`GateChunkReport`: `cycle`, `index`,
   `of`, `cards`, `outcome`, `undecided`, `failure`; `cycle` is unique and
@@ -77,12 +91,34 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 - `ReceiveLoopEvent` gains the `gate_chunk` member and `CycleSummary` the
   `chunksOk` and `chunksFailed` fields: a `switch` over `event.type` that
   checks exhaustiveness with `never` needs a case for the new member.
+- `ReceiveLoopEvent` gains the `notice` member and `ReceiveLoopStatus`'s
+  counters the `notices` field: an exhaustive `switch` over `event.type`
+  needs a case for it.
+
+### Docs
+
+- `InboxCard` / `InboxCardPreview` describe the tray since the server's
+  migration 104 (no shape change): system notices are never a card's
+  `preview` and never make it owed or mentioned; a card whose only unread
+  messages are notices has `preview: null`, `you_owe_reply: false`, and its
+  anchor is `last_message_id` (`gate.anchorOf(card)`, unchanged);
+  `preview.sender` is the preview's own sender, which can differ from
+  `last_sender` when a notice came after it.
+- `decisions.record` and `RecordReplyDecisionOptions.throughMessageId`: the
+  anchor is `preview.message_id`, else `last_message_id`; an anchor that is
+  not a message of the conversation is refused with 404
+  `MESSAGE_NOT_FOUND`, surfaced as `NotFoundError`, and nothing is
+  recorded, `defer` included. The README and `docs/integration-kit.md` say
+  the same.
 
 ### Conformance
 
 - `conformance/v1/texts.sample.json` (gains `reply_turn_template`) and
   `manifest.sha256`, copied byte for byte from the contract fixtures;
   `gate-prompt.expected.txt` is unchanged.
+- `conformance/v1/texts.sample.json` (manual 2.3.4: its version and
+  sha256) and `manifest.sha256`, copied byte for byte from the contract
+  fixtures; no other fixture changed.
 
 ## 1.3.1 — 2026-11-11
 

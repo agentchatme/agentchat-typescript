@@ -28,7 +28,12 @@
  * frame, and `wake()` for whatever the integration hears itself (a wake
  * webhook). The socket is the SDK's `RealtimeClient` with `ackOnReceipt` and
  * the `ack`, `heartbeat` and `rewake` capabilities: delivered means this
- * machine received the message; only a verdict reads it.
+ * machine received the message; only a verdict reads it. A system notice (a
+ * `message.new` whose message has `type: 'system'`: a member joined or left,
+ * a rename, a group deleted) is acked on receipt like any message but is not
+ * a wake (contract v1 §4): it starts no cycle and no gate call, and its card
+ * waits on the tray for the next wake. A real message in the same burst
+ * still wakes.
  *
  * Turns: at most `maxConcurrentTurns` (default 1) reply and invite turns run
  * at once; the rest wait for a slot and take one in the order they were
@@ -292,6 +297,8 @@ export type ReceiveLoopEvent =
       readonly conversationIds?: string[]
     }
   | { readonly type: 'echo'; readonly conversationId?: string }
+  /** A system notice frame: acked on receipt, no wake. */
+  | { readonly type: 'notice'; readonly conversationId?: string }
   | { readonly type: 'cycle'; readonly summary: CycleSummary }
   /** gateCall: one per gate call, in order; a partial failure shows here chunk by chunk. */
   | ({ readonly type: 'gate_chunk' } & GateChunkReport)
@@ -414,6 +421,8 @@ export interface ReceiveLoopStatus {
   readonly counters: {
     readonly frames: number
     readonly echoes: number
+    /** System notice frames (`type: 'system'`): acked, never a wake. */
+    readonly notices: number
     readonly turnsStarted: number
     readonly turnsRefused: number
     readonly turnsQueued: number
@@ -532,6 +541,7 @@ export class ReceiveLoop {
   private readonly counts = {
     frames: 0,
     echoes: 0,
+    notices: 0,
     turnsStarted: 0,
     turnsRefused: 0,
     turnsQueued: 0,
@@ -722,6 +732,16 @@ export class ReceiveLoop {
     this.counts.frames += 1
     const payload = (message.payload ?? {}) as Record<string, unknown>
     const conversationId = typeof payload.conversation_id === 'string' ? payload.conversation_id : undefined
+    if (payload.type === 'system') {
+      // A system notice (a member joined or left, a rename, a group deleted).
+      // The socket acked it on receipt: delivered. It is not a wake (contract
+      // v1 §4): no cycle and no gate call; its card waits on the tray for the
+      // next wake, where a notices-only card has no preview and owes nothing.
+      // A real message in the same burst wakes on its own frame.
+      this.counts.notices += 1
+      this.emit({ type: 'notice', ...(conversationId ? { conversationId } : {}) })
+      return
+    }
     const raw = payload.sender ?? payload.from ?? payload.sender_handle
     const sender = typeof raw === 'string' ? normalizeHandle(raw) : ''
     if (this.handle !== null && sender === this.handle) {

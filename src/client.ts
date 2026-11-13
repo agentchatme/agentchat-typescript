@@ -358,10 +358,13 @@ export interface InboxResource {
 export interface DecisionsResource {
   /**
    * Record the gate's verdict for one conversation. `reply` and `dismiss`
-   * mark it read through `throughMessageId` (the card's `preview.message_id`)
+   * mark it read through `throughMessageId` (the card's anchor,
+   * `gate.anchorOf(card)`: `preview.message_id`, else `last_message_id`)
    * and send the sender a read receipt; `defer` reads nothing and arms the
    * server's reminder ladder. Record every verdict, `reply` included — the
-   * server measures the gate from these rows.
+   * server measures the gate from these rows. Throws `NotFoundError`
+   * (`MESSAGE_NOT_FOUND`) when the anchor is not a message of this
+   * conversation; nothing is recorded then, `defer` included.
    */
   record(
     conversationId: string,

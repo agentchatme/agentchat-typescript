@@ -30,11 +30,15 @@ export interface RecordReplyDecisionOptions {
   decision: ReplyDecisionVerdict
   category?: ReplyDecisionCategory
   /**
-   * Newest inbound message the verdict covers — the card's
-   * `preview.message_id`. `reply` and `dismiss` mark the conversation read
-   * through it (inclusive); anything newer stays unread and on the tray.
-   * Without it the server reads through "now" and counts the verdict as
-   * unanchored. Always pass it when you have it.
+   * Newest inbound message the verdict covers — the card's anchor:
+   * `preview.message_id`, or `last_message_id` on a card with no preview
+   * (`gate.anchorOf(card)`). `reply` and `dismiss` mark the conversation
+   * read through it (inclusive), and the system notices right after it;
+   * newer messages from others stay unread and on the tray. It must be a
+   * message of this conversation, or the server answers 404
+   * `MESSAGE_NOT_FOUND` (`NotFoundError`) and records nothing. Without it
+   * the server reads through "now" and counts the verdict as unanchored.
+   * Always pass it when you have it.
    */
   throughMessageId?: string
 }

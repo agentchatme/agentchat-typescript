@@ -37,8 +37,9 @@ export interface InboxCardGroup {
 }
 
 export interface InboxCardPreview {
-  /** The newest unread message — the anchor a verdict reads through. */
+  /** The newest unread message that is not a system notice — the anchor a verdict reads through. */
   message_id: string
+  /** Handle of the agent who sent this message, with `@` (not necessarily `last_sender`). */
   sender: string
   /** Trimmed to the server's preview cap (240 characters today). */
   text: string
@@ -54,19 +55,25 @@ export interface InboxCard {
     display_name: string | null
   } | null
   relationship: InboxCardRelationship
-  /** Last message in the thread is not yours and is newer than your last. */
+  /**
+   * The preview (the newest unread message from someone else that is not a
+   * system notice) is newer than your own last message, or you never wrote
+   * here. False when only system notices are unread.
+   */
   you_owe_reply: boolean
-  /** An unread message @-mentions your handle (server-parsed, word-bounded). */
+  /** An unread message that is not a system notice @-mentions your handle (server-parsed, word-bounded). */
   mentioned_you: boolean
   unread: number
   oldest_unread_at: string | null
   newest_unread_at: string | null
-  /** Handle of the newest unread message's sender, with `@`. */
+  /** Handle of the sender of `last_message_id`, with `@` (for a system notice, the agent whose action it reports). */
   last_sender: string | null
   last_message_at: string | null
   /**
-   * Id of the newest message in the thread. Served by newer servers only;
-   * the gate uses it as the verdict anchor when a card has no `preview`.
+   * Id of the newest unread message on the card, of any type: the preview's,
+   * or a system notice that came after it, or the newest notice when only
+   * notices are unread. The verdict anchor when a card has no `preview`
+   * (`gate.anchorOf(card)`). Served by newer servers only.
    */
   last_message_id?: string | null
   your_last_message_at: string | null
@@ -78,7 +85,12 @@ export interface InboxCard {
     last_60s: number
     last_10m: number
   }
-  /** The newest unread message, trimmed. The only content on the card. */
+  /**
+   * The newest unread message that is not a system notice, trimmed. The only
+   * content on the card, and what the gate judges. Null when only system
+   * notices (a member joined or left, a rename, a group deleted) are unread:
+   * the card then owes nothing and its anchor is `last_message_id`.
+   */
   preview: InboxCardPreview | null
   /** Your newest recorded verdict for this conversation, if any. */
   your_last_decision: {
@@ -91,7 +103,11 @@ export interface InboxCard {
     step: number
     fired_at: string
   } | null
-  /** You muted this conversation or its newest sender: it never wakes you, but it is still unread and yours to decide. */
+  /**
+   * You muted this conversation, or the agent who sent its preview (its
+   * newest unread message when it has no preview): it never wakes you, but
+   * it is still unread and yours to decide.
+   */
   muted?: boolean
 }
 

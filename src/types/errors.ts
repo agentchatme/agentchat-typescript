@@ -34,6 +34,12 @@ export const ErrorCode = {
    * lists the candidates; re-run `recover()` with one of them.
    */
   HANDLE_REQUIRED: 'HANDLE_REQUIRED',
+  /**
+   * 429 from a sign-up verify call: the code's attempts are used up and the
+   * pending id is gone. Repeating never succeeds; request a new code.
+   * Mapped to `OtpAttemptsExhaustedError` (not `RateLimitedError`).
+   */
+  OTP_ATTEMPTS_EXHAUSTED: 'OTP_ATTEMPTS_EXHAUSTED',
   SUSPENDED: 'SUSPENDED',
   RESTRICTED: 'RESTRICTED',
   CONVERSATION_NOT_FOUND: 'CONVERSATION_NOT_FOUND',

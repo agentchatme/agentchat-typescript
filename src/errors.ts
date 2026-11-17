@@ -281,6 +281,20 @@ export class HandleRequiredError extends AgentChatError {
   }
 }
 
+/**
+ * Raised for 429 OTP_ATTEMPTS_EXHAUSTED from a sign-up verify call: the
+ * wrong code that used the last attempt, or any later try with the same
+ * pending id. Not a `RateLimitedError`: repeating the request never
+ * succeeds, so nothing retries it. The way on is a new code (the start
+ * step); `details.resend_after_s` says when one may be requested.
+ */
+export class OtpAttemptsExhaustedError extends AgentChatError {
+  constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
+    super(response, status, requestId)
+    this.name = 'OtpAttemptsExhaustedError'
+  }
+}
+
 /** Raised when the server returns 5xx (after retries exhaust). */
 export class ServerError extends AgentChatError {
   constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
@@ -361,6 +375,8 @@ export function createAgentChatError(
       return new EmailExhaustedError(body, status, requestId)
     case ErrorCode.HANDLE_REQUIRED:
       return new HandleRequiredError(body, status, requestId)
+    case ErrorCode.OTP_ATTEMPTS_EXHAUSTED:
+      return new OtpAttemptsExhaustedError(body, status, requestId)
     case ErrorCode.INTERNAL_ERROR:
       return new ServerError(body, status, requestId)
     default:

@@ -75,6 +75,7 @@ export {
   GroupDeletedError,
   HandleRequiredError,
   NotFoundError,
+  OtpAttemptsExhaustedError,
   RateLimitedError,
   RecipientBackloggedError,
   RestrictedError,

@@ -8,6 +8,7 @@ import {
   GroupDeletedError,
   HandleRequiredError,
   NotFoundError,
+  OtpAttemptsExhaustedError,
   RateLimitedError,
   RecipientBackloggedError,
   RestrictedError,
@@ -256,5 +257,25 @@ describe('retry_after_s stays reachable (sign-up flows)', () => {
     expect(unmapped.retryAfterMs).toBe(30_000)
     const mapped = createAgentChatError({ code: 'RATE_LIMITED', message: 'x', details: { retry_after_s: 5 } }, 429) as RateLimitedError
     expect(mapped.retryAfterMs).toBe(5_000)
+  })
+})
+
+describe('OTP_ATTEMPTS_EXHAUSTED', () => {
+  it('maps to OtpAttemptsExhaustedError, not RateLimitedError, and keeps details', () => {
+    const err = createAgentChatError(
+      {
+        code: 'OTP_ATTEMPTS_EXHAUSTED',
+        message: 'You entered the wrong code too many times. Request a new code.',
+        details: { version: 1, flow: 'recover', next_step: 'recover', status: 'max_attempts_reached', resend_after_s: 20 },
+      },
+      429,
+      new Headers(),
+    )
+    expect(err).toBeInstanceOf(OtpAttemptsExhaustedError)
+    expect(err).toBeInstanceOf(AgentChatError)
+    expect(err).not.toBeInstanceOf(RateLimitedError)
+    expect(err.name).toBe('OtpAttemptsExhaustedError')
+    expect(err.details).toMatchObject({ resend_after_s: 20, status: 'max_attempts_reached' })
+    expect(err.retryAfterS).toBeNull()
   })
 })

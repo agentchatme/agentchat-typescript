@@ -1,6 +1,7 @@
 import {
   AgentChatError,
   AwaitingReplyError,
+  OtpAttemptsExhaustedError,
   ConnectionError,
   RecipientBackloggedError,
   createAgentChatError,
@@ -310,13 +311,21 @@ export class HttpTransport {
       // ~30s before surfacing the same error. Treat them as non-retriable.
       const isTerminal429 =
         error instanceof RecipientBackloggedError ||
-        error instanceof AwaitingReplyError
+        error instanceof AwaitingReplyError ||
+        error instanceof OtpAttemptsExhaustedError
+
+      // A 429 that asks for a longer wait than one retry may sleep
+      // (`maxDelayMs`) would only be turned away again: fail fast instead
+      // of spending the retries on it.
+      const retryAfter = parseRetryAfter(res.headers.get('retry-after'))
+      const waitsTooLong = res.status === 429 && retryAfter !== null && retryAfter > policy.maxDelayMs
 
       const retriable =
         canRetry &&
         attempt < maxAttempts &&
         RETRIABLE_STATUSES.has(res.status) &&
-        !isTerminal429
+        !isTerminal429 &&
+        !waitsTooLong
 
       await safeInvoke(this.hooks.onError, {
         ...requestInfo,
@@ -326,7 +335,6 @@ export class HttpTransport {
       })
 
       if (retriable) {
-        const retryAfter = parseRetryAfter(res.headers.get('retry-after'))
         const delayMs = computeDelay(policy, attempt, retryAfter)
         await safeInvoke(this.hooks.onRetry, {
           ...requestInfo,

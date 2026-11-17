@@ -65,7 +65,7 @@ export type AccountKind = 'register' | 'recover'
  * | `done`            | `next_step: "done"` (the key is in the body) |
  * | `ask_code`        | a verify step, no `retry_after_s` |
  * | `ask_param`       | a start step with `param`: re-ask that field, call the start step again |
- * | `offer_new_code`  | a start step, no `param`, `status` `expired` / `max_attempts_reached`: ask before sending a new code |
+ * | `offer_new_code`  | a start step, no `param`, `status` `expired` / `max_attempts_reached`: ask before sending a new code (wait `retry_after_s` first when set) |
  * | `wait_then_retry` | 429 with `retry_after_s` ≤ 60: wait, then repeat `next_step` |
  * | `stop`            | 429 with `retry_after_s` > 60, a 5xx, an unknown `next_step`, anything else: show `message`, end |
  * | `legacy`          | no flow object (a server older than the flow contract) |
@@ -588,8 +588,9 @@ const NEW_CODE_ANSWERS = ['new_code', 'cancel'] as const
  * what the server names (`param`, or the code), and lets the person enter
  * the code, ask for a new code, or cancel. It never sends a new code unasked.
  * It waits out a `retry_after_s` of up to 60 s (the message says how long),
- * and stops on a longer one. No attempt caps of its own: the server's are
- * the only ones.
+ * and stops on a longer one; after a yes to a new code it first waits out
+ * the flow's `retry_after_s` (the time until one may be sent). No attempt
+ * caps of its own: the server's are the only ones.
  *
  * Resolves `{outcome: 'done', apiKey, handle}` (save both),
  * `{outcome: 'cancelled'}`, or `{outcome: 'stopped', code, message}` (the
@@ -697,14 +698,15 @@ export async function run(options: RunOptions): Promise<RunResult> {
       }
 
       case 'wait_then_retry': {
-        await sleep(result.flow.retry_after_s! * 1000)
         // Repeat the call that was turned away — unless that would send a
         // new code nobody asked for (the wait names a start step, but the
         // call was a code): then the person is asked first.
         if (repeat.step === 'verify' && isStartStep(result.flow.next_step)) {
           if (!(await offerNewCode(result.flow))) return { outcome: 'cancelled' }
           repeat = { step: 'start', call: startCall }
+          break
         }
+        await sleep(result.flow.retry_after_s! * 1000)
         break
       }
 
@@ -714,9 +716,17 @@ export async function run(options: RunOptions): Promise<RunResult> {
     result = await repeat.call()
   }
 
+  /**
+   * Ask before a new code; on a yes, sit out the flow's `retry_after_s`
+   * first (the time until a new code may be sent), so the new code is not
+   * turned away. A wait over the limit is left to the server's answer.
+   */
   async function offerNewCode(flow: SignupFlow): Promise<boolean> {
     const answer = await askOne({ field: 'new_code', label: null, answers: NEW_CODE_ANSWERS, flow })
-    return answer.answer === 'new_code'
+    if (answer.answer !== 'new_code') return false
+    const wait = flow.retry_after_s
+    if (wait !== undefined && wait > 0 && wait <= MAX_WAIT_S) await sleep(wait * 1000)
+    return true
   }
 }
 

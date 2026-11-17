@@ -187,7 +187,7 @@ if (result.outcome === 'done') saveKey(result.apiKey, result.handle) // the hand
 | `done` | `next_step: "done"` | shows the message, returns the key and the handle |
 | `ask_code` | a verify step, no wait | asks for the code; the person can enter it, ask for a new code, or cancel |
 | `ask_param` | a start step with `param` | asks that field only (a taken handle re-asks the handle, an email at its limit the email), starts again |
-| `offer_new_code` | the code expired or took too many wrong tries | asks before sending a new code |
+| `offer_new_code` | the code expired or took too many wrong tries | asks before sending a new code; on a yes, waits out `retry_after_s` first when the answer has one |
 | `wait_then_retry` | 429 with `retry_after_s` ≤ 60 | shows the message, waits, repeats the call (`sleep` is injectable) |
 | `stop` | a longer wait, a 5xx, an unknown `next_step`, anything else | shows the message, ends |
 

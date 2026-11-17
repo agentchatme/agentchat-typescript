@@ -401,6 +401,38 @@ describe('integration.account.run — scripted conversations', () => {
     expect(srv.seen).toHaveLength(2)
   })
 
+  it('the last wrong code inside the resend minute: on a yes, waits retry_after_s, then sends', async () => {
+    const srv = server([
+      sent(),
+      error(
+        429,
+        'OTP_ATTEMPTS_EXHAUSTED',
+        'You entered the wrong code too many times. Request a new code.',
+        {
+          flow: 'register',
+          next_step: 'register',
+          status: 'max_attempts_reached',
+          attempts: 5,
+          max_attempts: 5,
+          retry_after_s: 30,
+        },
+        { 'Retry-After': '30' },
+      ),
+      sent('register', 'pnd_2'),
+      registered(),
+    ])
+    const who = person([value('999999'), NEW_CODE, value('123456')])
+    expect(await runWith(srv, who)).toMatchObject({ outcome: 'done' })
+    expect(who.asked.map((q) => q.field)).toEqual(['code', 'new_code', 'code'])
+    expect(who.slept).toEqual([30_000])
+    expect(srv.seen.map((s) => s.path)).toEqual([
+      '/v1/register',
+      '/v1/register/verify',
+      '/v1/register',
+      '/v1/register/verify',
+    ])
+  })
+
   it('a per-IP 429 on a code (≤ 60 s): waits and submits the same code again', async () => {
     const srv = server([
       sent(),

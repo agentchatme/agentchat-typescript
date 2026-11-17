@@ -71,8 +71,9 @@ function pending(id = 'pnd_1', over: Record<string, unknown> = {}) {
   }
 }
 
-const sent = (kind: Kind = 'register', id = 'pnd_1', message = 'We sent a 6-digit code to a@example.com. It expires in 10 minutes.') =>
-  json(200, { pending_id: id, message, version: 1, flow: kind, next_step: verifyStep(kind), ...pending(id) })
+const SENT_TEXT = 'We sent a 6-digit code to a@example.com. It expires in 10 minutes.'
+const sent = (kind: Kind = 'register', id = 'pnd_1', message = SENT_TEXT, over: Record<string, unknown> = {}) =>
+  json(200, { pending_id: id, message, version: 1, flow: kind, next_step: verifyStep(kind), ...pending(id, over) })
 
 const error = (
   status: number,
@@ -280,13 +281,113 @@ describe('integration.account.run — scripted conversations', () => {
     expect(who.slept).toEqual([])
   })
 
-  it('a new code asked for inside the cooldown: the server says how long, run waits, then sends', async () => {
-    const srv = server([sent('register', 'pnd_1'), cooldown(25), sent('register', 'pnd_2'), registered()])
+  it('a new code the server still turns away (OTP_COOLDOWN ≤ 60 s): run waits as it says, then sends', async () => {
+    const srv = server([
+      sent('register', 'pnd_1', SENT_TEXT, { resend_after_s: 0 }),
+      cooldown(25),
+      sent('register', 'pnd_2'),
+      registered(),
+    ])
     const who = person([NEW_CODE, value('123456')])
     expect(await runWith(srv, who)).toMatchObject({ outcome: 'done' })
     expect(who.slept).toEqual([25_000])
     expect(srv.seen.map((s) => s.path)).toEqual(['/v1/register', '/v1/register', '/v1/register', '/v1/register/verify'])
     expect(srv.seen[3]!.body).toEqual({ pending_id: 'pnd_2', code: '123456' })
+  })
+
+  describe('a new code no sooner than resend_after_s allows (register and recover)', () => {
+    // The held code answered at 10:00:00Z; it expires at 10:10:00Z (pending()).
+    const T0 = '2026-11-17T10:00:00.000Z'
+    const RECOVER_TEXT = 'If @alice is registered with a@example.com, we sent a 6-digit code there. It expires in 10 minutes.'
+    const INPUT = { email: 'a@example.com', handle: 'alice' }
+    const done = (kind: Kind) => (kind === 'register' ? registered() : recovered())
+    const codeSent = (kind: Kind, id: string, over: Record<string, unknown> = {}) =>
+      sent(kind, id, kind === 'register' ? SENT_TEXT : RECOVER_TEXT, over)
+    const startPath = (kind: Kind) => (kind === 'register' ? '/v1/register' : '/v1/agents/recover')
+    const verifyPath = (kind: Kind) => (kind === 'register' ? '/v1/register/verify' : '/v1/agents/recover/verify')
+
+    /** A person who answers after `afterMs` of wall-clock time has passed. */
+    function slowPerson(answers: Array<[number, AccountAnswer]>) {
+      const who = person(answers.map(([, a]) => a))
+      let i = 0
+      const ask = who.ask
+      who.ask = async (question: AccountQuestion) => {
+        const step = answers[i++]
+        if (step !== undefined) vi.setSystemTime(Date.now() + step[0])
+        return ask(question)
+      }
+      return who
+    }
+
+    it.each([['register' as Kind], ['recover' as Kind]])(
+      '%s: asked 20 s after a code that allows a new one at 60 s — waits the 40 s left, then sends (no turned-away call)',
+      async (kind) => {
+        vi.useFakeTimers({ toFake: ['Date'] })
+        vi.setSystemTime(new Date(T0))
+        const srv = server([codeSent(kind, 'pnd_1'), codeSent(kind, 'pnd_2'), done(kind)])
+        const who = slowPerson([
+          [20_000, NEW_CODE],
+          [0, value('123456')],
+        ])
+        const result = await runWith(srv, who, { kind, input: INPUT })
+        expect(result).toMatchObject({ outcome: 'done', handle: 'alice' })
+        expect(who.slept).toEqual([40_000])
+        expect(srv.seen.map((s) => s.path)).toEqual([startPath(kind), startPath(kind), verifyPath(kind)])
+        expect(srv.seen[2]!.body).toEqual({ pending_id: 'pnd_2', code: '123456' })
+        // Nothing new is shown for the wait: only the two code-sent sentences and the success.
+        expect(who.shown).toHaveLength(3)
+      },
+    )
+
+    it.each([['register' as Kind], ['recover' as Kind]])(
+      '%s: asked once the minute is over — sends at once',
+      async (kind) => {
+        vi.useFakeTimers({ toFake: ['Date'] })
+        vi.setSystemTime(new Date(T0))
+        const srv = server([codeSent(kind, 'pnd_1'), codeSent(kind, 'pnd_2'), done(kind)])
+        const who = slowPerson([
+          [61_000, NEW_CODE],
+          [0, value('123456')],
+        ])
+        expect(await runWith(srv, who, { kind, input: INPUT })).toMatchObject({ outcome: 'done' })
+        expect(who.slept).toEqual([])
+      },
+    )
+
+    it.each([['register' as Kind], ['recover' as Kind]])(
+      '%s: a resend wait over 60 s while the held code works — asks for that code again, no call',
+      async (kind) => {
+        vi.useFakeTimers({ toFake: ['Date'] })
+        vi.setSystemTime(new Date(T0))
+        const srv = server([codeSent(kind, 'pnd_1', { resend_after_s: 300 }), done(kind)])
+        const who = slowPerson([
+          [10_000, NEW_CODE],
+          [0, value('123456')],
+        ])
+        expect(await runWith(srv, who, { kind, input: INPUT })).toMatchObject({ outcome: 'done' })
+        expect(who.asked.map((q) => q.field)).toEqual(['code', 'code'])
+        expect(who.slept).toEqual([])
+        expect(srv.seen.map((s) => s.path)).toEqual([startPath(kind), verifyPath(kind)])
+        expect(srv.seen[1]!.body).toEqual({ pending_id: 'pnd_1', code: '123456' })
+      },
+    )
+
+    it.each([['register' as Kind], ['recover' as Kind]])(
+      '%s: a resend wait over 60 s after the held code expired — stops, no call',
+      async (kind) => {
+        vi.useFakeTimers({ toFake: ['Date'] })
+        vi.setSystemTime(new Date(T0))
+        const srv = server([codeSent(kind, 'pnd_1', { resend_after_s: 900 })])
+        const who = slowPerson([[11 * 60_000, NEW_CODE]])
+        expect(await runWith(srv, who, { kind, input: INPUT })).toEqual({
+          outcome: 'stopped',
+          code: null,
+          message: kind === 'register' ? SENT_TEXT : RECOVER_TEXT,
+        })
+        expect(srv.seen).toHaveLength(1)
+        expect(who.slept).toEqual([])
+      },
+    )
   })
 
   describe('a new code refused for longer than run waits', () => {
@@ -301,7 +402,7 @@ describe('integration.account.run — scripted conversations', () => {
 
     it('OTP_HOURLY_CAP while the held code still works: shows the message, asks for that code again', async () => {
       at('2026-11-17T10:00:00.000Z')
-      const srv = server([sent('register', 'pnd_1'), hourlyCap(), registered()])
+      const srv = server([sent('register', 'pnd_1', SENT_TEXT, { resend_after_s: 0 }), hourlyCap(), registered()])
       const who = person([NEW_CODE, value('123456')])
       expect(await runWith(srv, who)).toEqual({ outcome: 'done', apiKey: 'key_test_1', handle: 'alice' })
       expect(who.shown[1]).toBe(CAP)
@@ -314,7 +415,7 @@ describe('integration.account.run — scripted conversations', () => {
 
     it('OTP_HOURLY_CAP after the held code expired: stops', async () => {
       at('2026-11-17T10:11:00.000Z')
-      const srv = server([sent('register', 'pnd_1'), hourlyCap()])
+      const srv = server([sent('register', 'pnd_1', SENT_TEXT, { resend_after_s: 0 }), hourlyCap()])
       const who = person([NEW_CODE])
       expect(await runWith(srv, who)).toEqual({ outcome: 'stopped', code: 'OTP_HOURLY_CAP', message: CAP })
       expect(who.asked).toHaveLength(1)
@@ -322,7 +423,7 @@ describe('integration.account.run — scripted conversations', () => {
 
     it('OTP_COOLDOWN over 60 s while the held code still works: back to that code', async () => {
       at('2026-11-17T10:00:00.000Z')
-      const srv = server([sent('register', 'pnd_1'), cooldown(90), registered()])
+      const srv = server([sent('register', 'pnd_1', SENT_TEXT, { resend_after_s: 0 }), cooldown(90), registered()])
       const who = person([NEW_CODE, value('123456')])
       expect(await runWith(srv, who)).toMatchObject({ outcome: 'done' })
       expect(who.shown[1]).toBe('You can request a new code in 90 seconds.')
@@ -333,7 +434,7 @@ describe('integration.account.run — scripted conversations', () => {
     it('the held code keeps its expiry through an answer that does not repeat it (a malformed code)', async () => {
       at('2026-11-17T10:00:00.000Z')
       const srv = server([
-        sent('register', 'pnd_1'),
+        sent('register', 'pnd_1', SENT_TEXT, { resend_after_s: 0 }),
         error(400, 'VALIDATION_ERROR', 'Enter the code using only 6 digits.', {
           flow: 'register',
           next_step: 'verify',
@@ -361,7 +462,7 @@ describe('integration.account.run — scripted conversations', () => {
     it('another code refused for long (the per-IP limit) still stops', async () => {
       at('2026-11-17T10:00:00.000Z')
       const srv = server([
-        sent('register', 'pnd_1'),
+        sent('register', 'pnd_1', SENT_TEXT, { resend_after_s: 0 }),
         error(429, 'RATE_LIMITED', 'Too many attempts. Try again in 25 minutes.', {
           flow: 'register',
           next_step: 'register',
@@ -374,7 +475,7 @@ describe('integration.account.run — scripted conversations', () => {
 
     it('cancel at the held code: cancelled', async () => {
       at('2026-11-17T10:00:00.000Z')
-      const srv = server([sent('register', 'pnd_1'), hourlyCap()])
+      const srv = server([sent('register', 'pnd_1', SENT_TEXT, { resend_after_s: 0 }), hourlyCap()])
       const who = person([NEW_CODE, CANCEL])
       expect(await runWith(srv, who)).toEqual({ outcome: 'cancelled' })
     })

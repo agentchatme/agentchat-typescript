@@ -196,13 +196,13 @@ if (result.outcome === 'done') saveKey(result.apiKey, result.handle) // the hand
 How `run` waits:
 
 - Before every start call that follows a send to the same email in this run (a new code, a re-asked handle, a recover with the chosen handle), it waits out what is left of the last answer's `resend_after_s`. A start inside that window would be turned away, or, for a recover on an older server, answered like any other with no email sent. When more than 60 s are left, a new code asked for at the code question goes back to the code the person holds while it still works (`expires_in_s` counted from its answer, else `expires_at`), and otherwise the flow stops.
-- Every wait is at least 1 s (a `Retry-After: 0` is no tight loop) and at most 60 s. After 3 waits in a row without a question, it asks the person before the next one: the code again, or whether to send a new code.
+- Every wait is at least 1 s (`MIN_WAIT_MS`; a `Retry-After: 0` is no tight loop) and at most 60 s (`MAX_WAIT_S`). After 3 waits in a row without a question (`MAX_AUTO_WAITS`), it asks the person before the next one: the code again, or whether to send a new code.
 
 It never sends a new code the person did not ask for and keeps no attempt cap of its own: the server's are the only ones. The only words the helper brings are the field labels, `DEFAULT_LABELS` (`Email address`, `Handle`, `Enter the 6-digit code`); pass `labels` to change them. The choices around them ("send a new code", "cancel") are your UI's.
 
 ### One step per process: `start` / `submitCode`
 
-A CLI that exits between the code request and the code (`register --email --handle`, later `register --code`) uses the steps alone. Each makes one call, is never retried, resolves with every answer the server gives (`{flow, message, action, httpStatus, legacy, code?, apiKey?, handle?, handles?}`), and rejects only when no answer came (network, timeout, abort). `flow` is plain JSON: save it with the pending state and hand it back.
+A CLI that exits between the code request and the code (`register --email --handle`, later `register --code`) uses the steps alone. Each makes one call, is never retried, resolves with every answer the server gives (`{flow, message, action, httpStatus, calledStep, legacy, code?, apiKey?, handle?, handles?}`), and rejects only when no answer came (network, timeout, abort). `flow` is plain JSON: save it with the pending state and hand it back.
 
 ```ts
 const opts = { clientIdentity, apiBase }

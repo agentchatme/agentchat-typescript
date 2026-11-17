@@ -201,6 +201,9 @@ describe('integration.account.run — scripted conversations', () => {
 
   it('is reachable as integration.account', () => {
     expect(integration.account.run).toBe(run)
+    expect(integration.account.MIN_WAIT_MS).toBe(1_000)
+    expect(integration.account.MAX_AUTO_WAITS).toBe(3)
+    expect(integration.account.MAX_WAIT_S).toBe(60)
     expect(integration.account.DEFAULT_LABELS).toEqual({
       email: 'Email address',
       handle: 'Handle',
@@ -1003,6 +1006,7 @@ describe('integration.account.start / submitCode — one step per process', () =
     expect(started).toMatchObject({
       action: 'ask_code',
       httpStatus: 200,
+      calledStep: 'register',
       legacy: false,
       message: 'We sent a 6-digit code to a@example.com. It expires in 10 minutes.',
     })
@@ -1012,7 +1016,7 @@ describe('integration.account.start / submitCode — one step per process', () =
 
     const second = server([registered('alice')])
     const verified = await submitCode(saved, '123456', options(second))
-    expect(verified).toMatchObject({ action: 'done', apiKey: 'key_test_1', handle: 'alice', httpStatus: 201 })
+    expect(verified).toMatchObject({ action: 'done', apiKey: 'key_test_1', handle: 'alice', httpStatus: 201, calledStep: 'verify' })
     expect(second.seen[0]!.body).toEqual({ pending_id: 'pnd_1', code: '123456' })
   })
 
@@ -1067,6 +1071,14 @@ describe('integration.account.start / submitCode — one step per process', () =
   it('a network error rejects', async () => {
     const srv = server([new TypeError('fetch failed')])
     await expect(start('recover', { email: 'a@example.com' }, options(srv))).rejects.toThrow('fetch failed')
+  })
+
+  it('names the step it called (recover, recover_verify)', async () => {
+    const srv = server([sent('recover'), recovered()])
+    const first = await start('recover', { email: 'a@example.com' }, options(srv))
+    expect(first.calledStep).toBe('recover')
+    const second = await submitCode(first.flow, '123456', options(srv))
+    expect(second.calledStep).toBe('recover_verify')
   })
 
   it('never retries (one request per step)', async () => {

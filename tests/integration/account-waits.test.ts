@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { run, type AccountAnswer, type AccountQuestion } from '../../src/integration/account.js'
+import { MAX_AUTO_WAITS, MIN_WAIT_MS, run, type AccountAnswer, type AccountQuestion } from '../../src/integration/account.js'
 
 // ─── run(): when it waits, and when it asks instead ─────────────────────────
 //
@@ -339,6 +339,7 @@ describe('automatic waits: at least 1 s, at most 3 in a row', () => {
       },
     })
     expect(result).toEqual({ outcome: 'cancelled' })
+    expect(sleeps).toEqual(Array(MAX_AUTO_WAITS).fill(MIN_WAIT_MS))
     expect(sleeps).toEqual([1_000, 1_000, 1_000])
     expect(calls).toBe(4)
     expect(questions.map((q) => q.field)).toEqual(['new_code'])

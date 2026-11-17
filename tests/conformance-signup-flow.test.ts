@@ -199,6 +199,7 @@ describe('conformance — signup-flow.cases.json: start / submitCode', () => {
     expect(result.message).toBe(c.expect.message)
     expect(result.code ?? null).toBe(c.expect.code)
     expect(result.httpStatus).toBe(c.response.status)
+    expect(result.calledStep).toBe(c.request.kind)
 
     if (c.expect.action === 'legacy') {
       const reading = LEGACY_READING[c.name]

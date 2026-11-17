@@ -125,6 +125,8 @@ export interface StepResult {
   action: Exclude<SignupAction, 'legacy'>
   /** HTTP status of the answer. */
   httpStatus: number
+  /** The step this call made (`register`, `verify`, `recover`, `recover_verify`): `actionOf`'s third input. */
+  calledStep: SignupStartStep | SignupVerifyStep
   /** True when the server sent no flow object and the answer was read from its code. */
   legacy: boolean
   /** The error code, for a non-2xx answer. */
@@ -491,6 +493,7 @@ function read(
     message: error !== null ? error.message : successMessage(body),
     action,
     httpStatus,
+    calledStep,
     legacy,
     ...(error !== null ? { code: error.code } : {}),
     ...(action === 'done' ? credentials : {}),
@@ -607,10 +610,10 @@ const FIELD_ANSWERS = ['value', 'cancel'] as const
 const CODE_ANSWERS = ['value', 'new_code', 'cancel'] as const
 const NEW_CODE_ANSWERS = ['new_code', 'cancel'] as const
 
-/** The shortest wait `run` sits out (a `Retry-After: 0` is not a tight loop). */
-const MIN_WAIT_MS = 1_000
-/** Waits in a row without a question; the next one asks the person first. */
-const MAX_WAITS_IN_A_ROW = 3
+/** The shortest wait `run` sits out, in ms (a `Retry-After: 0` is not a tight loop). */
+export const MIN_WAIT_MS = 1_000
+/** Waits `run` sits out in a row without a question; before the next one it asks the person. */
+export const MAX_AUTO_WAITS = 3
 
 /**
  * The whole sign-up conversation, for an interactive setup. It follows
@@ -806,7 +809,7 @@ export async function run(options: RunOptions): Promise<RunResult> {
       }
 
       case 'wait_then_retry': {
-        if (waitsInARow >= MAX_WAITS_IN_A_ROW) {
+        if (waitsInARow >= MAX_AUTO_WAITS) {
           // Enough waiting without the person: ask before the next try.
           if (repeat.step === 'verify') {
             next = await askCode(held?.flow ?? result.flow)

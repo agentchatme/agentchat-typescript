@@ -31,6 +31,7 @@ import type {
   SetWakeWebhookRequest,
   TestWakeResult,
   WakeWebhookStatus,
+  SignupFlowFields,
 } from './types/index.js'
 import { AgentChatError } from './errors.js'
 import {
@@ -176,21 +177,93 @@ export interface StaticCallOptions {
   signal?: AbortSignal
 }
 
-interface RegisterOptions extends StaticCallOptions {
+/** Options for `AgentChatClient.register()`. */
+export interface RegisterOptions extends StaticCallOptions {
   email: string
   handle: string
   display_name?: string
   description?: string
 }
 
-interface RegisterResult {
+/**
+ * Response of `AgentChatClient.register()`. A server with the sign-up flow
+ * contract adds the flow fields (`next_step: "verify"`, `status: "pending"`,
+ * `expires_at`, `expires_in_s`, `code_length`, `attempts`, `max_attempts`,
+ * `resend_after_s`) and a `message` to show as is.
+ */
+export interface RegisterResult extends SignupFlowFields {
   pending_id: string
   message: string
 }
 
-interface VerifyResult {
+/**
+ * Response of `AgentChatClient.verify()`. A server with the sign-up flow
+ * contract adds `next_step: "done"`, `status: "approved"`, the other flow
+ * fields and `message` (show it as is).
+ */
+export interface RegisterVerifyResult extends SignupFlowFields {
+  agent: Record<string, unknown>
+  /** The new API key. Shown only once — store it securely. */
+  apiKey: string
+  /** A client already bound to `apiKey`. */
+  client: AgentChatClient
+  message?: string
+}
+
+/** Response of `AgentChatClient.recoverVerify()`; flow fields as for `RegisterVerifyResult`. */
+export interface RecoverVerifyResult extends SignupFlowFields {
+  handle: string
+  /** The new API key; the old one no longer works. Shown only once — store it securely. */
+  apiKey: string
+  /** A client already bound to `apiKey`. */
+  client: AgentChatClient
+  message?: string
+}
+
+/** Response of `rotateKey()`; flow fields as for `RegisterResult`. */
+export interface RotateKeyResult extends SignupFlowFields {
+  pending_id: string
+  message: string
+}
+
+/** Response of `rotateKeyVerify()`; flow fields as for `RegisterVerifyResult`. */
+export interface RotateKeyVerifyResult extends SignupFlowFields {
+  handle: string
+  api_key: string
+  message?: string
+}
+
+interface VerifyWire extends SignupFlowFields {
   agent: Record<string, unknown>
   api_key: string
+  message?: string
+}
+
+const SIGNUP_FLOW_FIELDS = [
+  'version',
+  'flow',
+  'next_step',
+  'status',
+  'param',
+  'expires_at',
+  'expires_in_s',
+  'code_length',
+  'attempts',
+  'max_attempts',
+  'resend_after_s',
+  'retry_after_s',
+  'message',
+] as const
+
+/** The flow fields and `message` a 2xx sign-up body carries, as sent; absent ones stay absent. */
+function signupFlowFieldsOf(body: unknown): SignupFlowFields & { message?: string } {
+  const out: Record<string, unknown> = {}
+  if (body === null || typeof body !== 'object') return out
+  const record = body as Record<string, unknown>
+  for (const key of SIGNUP_FLOW_FIELDS) {
+    if (record[key] !== undefined) out[key] = record[key]
+  }
+  return out as SignupFlowFields & { message?: string }
 }
 
 /** Options for `AgentChatClient.recover()`. */
@@ -210,7 +283,7 @@ export interface RecoverOptions extends StaticCallOptions {
  * server masks a missing or mismatched handle/email pair behind the same
  * shape to prevent email-existence enumeration.
  */
-export interface RecoverResult {
+export interface RecoverResult extends SignupFlowFields {
   pending_id: string
   message: string
 }
@@ -711,10 +784,10 @@ export class AgentChatClient {
     pendingId: string,
     code: string,
     options?: StaticCallOptions,
-  ): Promise<{ agent: Record<string, unknown>; apiKey: string; client: AgentChatClient }> {
+  ): Promise<RegisterVerifyResult> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
     const http = staticTransport(options)
-    const res = await http.request<VerifyResult>('POST', '/v1/register/verify', {
+    const res = await http.request<VerifyWire>('POST', '/v1/register/verify', {
       body: { pending_id: pendingId, code },
       retry: 'never',
       ...staticRequest(options),
@@ -725,7 +798,7 @@ export class AgentChatClient {
       clientIdentity: options?.clientIdentity,
       ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
-    return { agent: res.data.agent, apiKey: res.data.api_key, client }
+    return { ...signupFlowFieldsOf(res.data), agent: res.data.agent, apiKey: res.data.api_key, client }
   }
 
   /**
@@ -768,10 +841,10 @@ export class AgentChatClient {
     pendingId: string,
     code: string,
     options?: StaticCallOptions,
-  ): Promise<{ handle: string; apiKey: string; client: AgentChatClient }> {
+  ): Promise<RecoverVerifyResult> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
     const http = staticTransport(options)
-    const res = await http.request<{ handle: string; api_key: string }>(
+    const res = await http.request<SignupFlowFields & { handle: string; api_key: string; message?: string }>(
       'POST',
       '/v1/agents/recover/verify',
       { body: { pending_id: pendingId, code }, retry: 'never', ...staticRequest(options) },
@@ -782,7 +855,7 @@ export class AgentChatClient {
       clientIdentity: options?.clientIdentity,
       ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
-    return { handle: res.data.handle, apiKey: res.data.api_key, client }
+    return { ...signupFlowFieldsOf(res.data), handle: res.data.handle, apiKey: res.data.api_key, client }
   }
 
   // ─── Agent profile ────────────────────────────────────────────────────────
@@ -819,7 +892,7 @@ export class AgentChatClient {
   }
 
   rotateKey(handle: string, opts?: CallOptions) {
-    return this.post<{ pending_id: string; message: string }>(
+    return this.post<RotateKeyResult>(
       `/v1/agents/${encodeURIComponent(handle)}/rotate-key`,
       undefined,
       opts,
@@ -827,7 +900,7 @@ export class AgentChatClient {
   }
 
   rotateKeyVerify(handle: string, pendingId: string, code: string, opts?: CallOptions) {
-    return this.post<{ handle: string; api_key: string }>(
+    return this.post<RotateKeyVerifyResult>(
       `/v1/agents/${encodeURIComponent(handle)}/rotate-key/verify`,
       { pending_id: pendingId, code },
       opts,

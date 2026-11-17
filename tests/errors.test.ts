@@ -8,6 +8,7 @@ import {
   GroupDeletedError,
   HandleRequiredError,
   NotFoundError,
+  OtpAttemptsExhaustedError,
   RateLimitedError,
   RecipientBackloggedError,
   RestrictedError,
@@ -212,5 +213,69 @@ describe('createAgentChatError', () => {
     expect(err).toBeInstanceOf(AgentChatError)
     expect(err.code).toBe('SUSPENDED')
     expect(err.status).toBe(403)
+  })
+})
+
+describe('retry_after_s stays reachable (sign-up flows)', () => {
+  it('reads the top-level field first (OTP_EMAIL_LOCKED), then details', () => {
+    const top = createAgentChatError(
+      { code: 'OTP_EMAIL_LOCKED', message: 'locked', retry_after_s: 7200, details: { retry_after_s: 7199 } },
+      429,
+    )
+    expect(top.retryAfterS).toBe(7200)
+    const inDetails = createAgentChatError(
+      { code: 'OTP_COOLDOWN', message: 'wait', details: { version: 1, flow: 'register', next_step: 'register', retry_after_s: 30 } },
+      429,
+    )
+    expect(inDetails.retryAfterS).toBe(30)
+    expect(inDetails.details).toMatchObject({ next_step: 'register', retry_after_s: 30 })
+  })
+
+  it('is null when absent or not whole seconds', () => {
+    expect(createAgentChatError({ code: 'INVALID_CODE', message: 'x' }, 400).retryAfterS).toBeNull()
+    expect(
+      createAgentChatError({ code: 'OTP_COOLDOWN', message: 'x', details: { retry_after_s: '30' } }, 429).retryAfterS,
+    ).toBeNull()
+    expect(
+      createAgentChatError({ code: 'OTP_COOLDOWN', message: 'x', details: { retry_after_s: 1.5 } }, 429).retryAfterS,
+    ).toBeNull()
+  })
+
+  it('RateLimitedError.retryAfterMs: the header wins, else retry_after_s', () => {
+    const headers = new Headers({ 'Retry-After': '12' })
+    const withHeader = createAgentChatError(
+      { code: 'RATE_LIMITED', message: 'x', details: { retry_after_s: 30 } },
+      429,
+      headers,
+    ) as RateLimitedError
+    expect(withHeader.retryAfterMs).toBe(12_000)
+    const unmapped = createAgentChatError(
+      { code: 'OTP_COOLDOWN', message: 'x', details: { retry_after_s: 30 } },
+      429,
+    ) as RateLimitedError
+    expect(unmapped).toBeInstanceOf(RateLimitedError)
+    expect(unmapped.retryAfterMs).toBe(30_000)
+    const mapped = createAgentChatError({ code: 'RATE_LIMITED', message: 'x', details: { retry_after_s: 5 } }, 429) as RateLimitedError
+    expect(mapped.retryAfterMs).toBe(5_000)
+  })
+})
+
+describe('OTP_ATTEMPTS_EXHAUSTED', () => {
+  it('maps to OtpAttemptsExhaustedError, not RateLimitedError, and keeps details', () => {
+    const err = createAgentChatError(
+      {
+        code: 'OTP_ATTEMPTS_EXHAUSTED',
+        message: 'You entered the wrong code too many times. Request a new code.',
+        details: { version: 1, flow: 'recover', next_step: 'recover', status: 'max_attempts_reached', resend_after_s: 20 },
+      },
+      429,
+      new Headers(),
+    )
+    expect(err).toBeInstanceOf(OtpAttemptsExhaustedError)
+    expect(err).toBeInstanceOf(AgentChatError)
+    expect(err).not.toBeInstanceOf(RateLimitedError)
+    expect(err.name).toBe('OtpAttemptsExhaustedError')
+    expect(err.details).toMatchObject({ resend_after_s: 20, status: 'max_attempts_reached' })
+    expect(err.retryAfterS).toBeNull()
   })
 })

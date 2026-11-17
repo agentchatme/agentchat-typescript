@@ -102,3 +102,19 @@ export {
 } from './receive-loop.js'
 
 export { writeAtomic, renameWithRetry, type WriteAtomicOptions } from './files.js'
+
+export * as account from './account.js'
+export type {
+  AccountAnswer,
+  AccountCallOptions,
+  AccountKind,
+  AccountLabels,
+  AccountQuestion,
+  CheckKeyResult,
+  RecoverInput,
+  RegisterInput,
+  RunOptions as AccountRunOptions,
+  RunResult as AccountRunResult,
+  SignupAction,
+  StepResult as AccountStepResult,
+} from './account.js'

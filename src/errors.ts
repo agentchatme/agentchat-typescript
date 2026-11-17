@@ -11,6 +11,25 @@ export interface AgentChatErrorResponse {
   code: ErrorCodeType | (string & {})
   message: string
   details?: Record<string, unknown>
+  /**
+   * Seconds to wait, at the top level of some 429 bodies
+   * (`OTP_EMAIL_LOCKED`). Sign-up 429s also carry it in `details`.
+   */
+  retry_after_s?: number
+}
+
+/** A whole number of seconds ≥ 0, or null. */
+function wholeSeconds(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null
+}
+
+/**
+ * The body's `retry_after_s`: the top-level field (`OTP_EMAIL_LOCKED`)
+ * first, else `details.retry_after_s` (every sign-up 429, and the per-IP
+ * limit). Null when neither is a whole number of seconds.
+ */
+function retryAfterSecondsOf(response: AgentChatErrorResponse): number | null {
+  return wholeSeconds(response.retry_after_s) ?? wholeSeconds(response.details?.retry_after_s)
 }
 
 /**
@@ -29,6 +48,13 @@ export class AgentChatError extends Error {
    * server-side trace in seconds.
    */
   readonly requestId: string | null
+  /**
+   * The body's `retry_after_s` in seconds (top level, else
+   * `details.retry_after_s`), or null. The sign-up 429s carry it; so does
+   * the per-IP rate limit. `RateLimitedError.retryAfterMs` prefers the
+   * `Retry-After` header.
+   */
+  readonly retryAfterS: number | null
 
   constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
     super(response.message)
@@ -37,6 +63,7 @@ export class AgentChatError extends Error {
     this.status = status
     this.details = response.details
     this.requestId = requestId
+    this.retryAfterS = retryAfterSecondsOf(response)
     // Preserve the real subclass name on supporting runtimes even when
     // subclass constructors skip setting `this.name`.
     Object.setPrototypeOf(this, new.target.prototype)
@@ -45,8 +72,8 @@ export class AgentChatError extends Error {
 
 /**
  * Raised when the server returns 429. `retryAfterMs` prefers the
- * `Retry-After` response header; falls back to `details.retry_after_ms`
- * if present, otherwise `null`.
+ * `Retry-After` response header; falls back to `details.retry_after_ms`,
+ * then to the body's `retry_after_s` (`retryAfterS`), otherwise `null`.
  */
 export class RateLimitedError extends AgentChatError {
   readonly retryAfterMs: number | null
@@ -254,6 +281,20 @@ export class HandleRequiredError extends AgentChatError {
   }
 }
 
+/**
+ * Raised for 429 OTP_ATTEMPTS_EXHAUSTED from a sign-up verify call: the
+ * wrong code that used the last attempt, or any later try with the same
+ * pending id. Not a `RateLimitedError`: repeating the request never
+ * succeeds, so nothing retries it. The way on is a new code (the start
+ * step); `details.resend_after_s` says when one may be requested.
+ */
+export class OtpAttemptsExhaustedError extends AgentChatError {
+  constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
+    super(response, status, requestId)
+    this.name = 'OtpAttemptsExhaustedError'
+  }
+}
+
 /** Raised when the server returns 5xx (after retries exhaust). */
 export class ServerError extends AgentChatError {
   constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
@@ -272,6 +313,11 @@ export class ConnectionError extends Error {
     super(message)
     this.name = 'ConnectionError'
   }
+}
+
+function retryAfterMsOf(body: AgentChatErrorResponse): number | null {
+  const seconds = retryAfterSecondsOf(body)
+  return seconds === null ? null : seconds * 1000
 }
 
 /**
@@ -293,7 +339,7 @@ export function createAgentChatError(
         typeof body.details?.retry_after_ms === 'number'
           ? (body.details.retry_after_ms as number)
           : null
-      return new RateLimitedError(body, status, fromHeader ?? fromBody, requestId)
+      return new RateLimitedError(body, status, fromHeader ?? fromBody ?? retryAfterMsOf(body), requestId)
     }
     case ErrorCode.SUSPENDED:
     case ErrorCode.AGENT_SUSPENDED:
@@ -329,6 +375,8 @@ export function createAgentChatError(
       return new EmailExhaustedError(body, status, requestId)
     case ErrorCode.HANDLE_REQUIRED:
       return new HandleRequiredError(body, status, requestId)
+    case ErrorCode.OTP_ATTEMPTS_EXHAUSTED:
+      return new OtpAttemptsExhaustedError(body, status, requestId)
     case ErrorCode.INTERNAL_ERROR:
       return new ServerError(body, status, requestId)
     default:
@@ -338,7 +386,7 @@ export function createAgentChatError(
       if (status === 404) return new NotFoundError(body, status, requestId)
       if (status === 429) {
         const fromHeader = headers ? parseRetryAfter(headers.get('retry-after')) : null
-        return new RateLimitedError(body, status, fromHeader, requestId)
+        return new RateLimitedError(body, status, fromHeader ?? retryAfterMsOf(body), requestId)
       }
       if (status >= 500) return new ServerError(body, status, requestId)
       return new AgentChatError(body, status, requestId)

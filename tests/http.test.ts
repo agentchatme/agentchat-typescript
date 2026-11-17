@@ -9,6 +9,7 @@ import {
   UnauthorizedError,
   ServerError,
   ConnectionError,
+  OtpAttemptsExhaustedError,
 } from '../src/errors.js'
 
 /**
@@ -391,5 +392,48 @@ describe('HttpTransport', () => {
       expect(err).toBeInstanceOf(SuspendedError)
       expect((err as SuspendedError).requestId).toBe('req_xyz')
     }
+  })
+})
+
+describe('HttpTransport — 429s it would only be turned away from again', () => {
+  const tooLong = () =>
+    jsonResponse(429, { code: 'RATE_LIMITED', message: 'Too many attempts. Try again in 25 minutes.' }, { 'Retry-After': '1500' })
+
+  it('does not retry a 429 whose Retry-After exceeds the per-try cap (a PUT fails fast)', async () => {
+    const fetch = scriptedFetch([tooLong(), jsonResponse(200, { ok: true })])
+    const http = new HttpTransport({ baseUrl: 'https://api.test', fetch })
+    const started = Date.now()
+    const err = await http.request('PUT', '/v1/agents/me/wake-webhook', { body: { url: 'https://x.test' } }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(RateLimitedError)
+    expect((err as RateLimitedError).retryAfterMs).toBe(1_500_000)
+    expect((fetch as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(1)
+    expect(Date.now() - started).toBeLessThan(1_000)
+  })
+
+  it('still retries a 429 whose Retry-After fits the cap', async () => {
+    const fetch = scriptedFetch([
+      jsonResponse(429, { code: 'RATE_LIMITED', message: 'slow down' }, { 'Retry-After': '0' }),
+      jsonResponse(200, { ok: true }),
+    ])
+    const http = new HttpTransport({ baseUrl: 'https://api.test', fetch, retry: { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 2 } })
+    const res = await http.request<{ ok: boolean }>('GET', '/ping')
+    expect(res.data).toEqual({ ok: true })
+    expect((fetch as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(2)
+  })
+
+  it('never retries OTP_ATTEMPTS_EXHAUSTED (repeating never succeeds)', async () => {
+    const fetch = scriptedFetch([
+      jsonResponse(429, {
+        code: 'OTP_ATTEMPTS_EXHAUSTED',
+        message: 'You entered the wrong code too many times. Request a new code.',
+        details: { version: 1, flow: 'register', next_step: 'register', status: 'max_attempts_reached', resend_after_s: 20 },
+      }),
+      jsonResponse(200, { ok: true }),
+    ])
+    const http = new HttpTransport({ baseUrl: 'https://api.test', fetch, retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 2 } })
+    const err = await http.request('GET', '/ping').catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(OtpAttemptsExhaustedError)
+    expect(err).not.toBeInstanceOf(RateLimitedError)
+    expect((fetch as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(1)
   })
 })

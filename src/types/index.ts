@@ -127,3 +127,14 @@ export { ALLOWED_ATTACHMENT_MIME, MAX_ATTACHMENT_SIZE } from './attachment.js'
 
 export type { ApiError } from './errors.js'
 export { ErrorCode } from './errors.js'
+
+export type {
+  SignupCodeStatus,
+  SignupFlow,
+  SignupFlowFields,
+  SignupFlowKind,
+  SignupNextStep,
+  SignupParam,
+  SignupStartStep,
+  SignupVerifyStep,
+} from './signup-flow.js'

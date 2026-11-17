@@ -473,24 +473,69 @@ describe('integration.account.run — scripted conversations', () => {
     expect(srv.seen[2]!.body).toEqual({ pending_id: 'pnd_1', code: '123456' })
   })
 
-  it('the per-email lock on a code (long wait): stops', async () => {
-    const message = 'You entered the wrong code too many times. Wait 2 hours, then request a new code.'
+  it.each([['register'], ['verify']])(
+    'the per-email lock on a code (long wait, next_step %s): stops',
+    async (nextStep) => {
+      const message = 'You entered the wrong code too many times. Wait 2 hours, then request a new code.'
+      const srv = server([
+        sent(),
+        json(
+          429,
+          {
+            code: 'OTP_EMAIL_LOCKED',
+            message,
+            retry_after_s: 7200,
+            details: { version: 1, flow: 'register', next_step: nextStep, retry_after_s: 7200 },
+          },
+          { 'Retry-After': '7200' },
+        ),
+      ])
+      const who = person([value('123456')])
+      expect(await runWith(srv, who)).toEqual({ outcome: 'stopped', code: 'OTP_EMAIL_LOCKED', message })
+      expect(who.slept).toEqual([])
+    },
+  )
+
+  it('a short wait that names the start step after a code: asks before a new code, then waits', async () => {
     const srv = server([
       sent(),
-      json(
+      error(
         429,
-        {
-          code: 'OTP_EMAIL_LOCKED',
-          message,
-          retry_after_s: 7200,
-          details: { version: 1, flow: 'register', next_step: 'verify', ...pending(), retry_after_s: 7200 },
-        },
-        { 'Retry-After': '7200' },
+        'RATE_LIMITED',
+        'Too many attempts. Try again in 40 seconds.',
+        { flow: 'register', next_step: 'register', retry_after_s: 40 },
+        { 'Retry-After': '40' },
+      ),
+      sent('register', 'pnd_2'),
+      registered(),
+    ])
+    const who = person([value('123456'), NEW_CODE, value('654321')])
+    expect(await runWith(srv, who)).toMatchObject({ outcome: 'done' })
+    expect(who.asked.map((q) => q.field)).toEqual(['code', 'new_code', 'code'])
+    expect(who.slept).toEqual([40_000])
+    expect(srv.seen.map((s) => s.path)).toEqual([
+      '/v1/register',
+      '/v1/register/verify',
+      '/v1/register',
+      '/v1/register/verify',
+    ])
+  })
+
+  it('the same, declined: cancelled, no code sent, no wait', async () => {
+    const srv = server([
+      sent(),
+      error(
+        429,
+        'RATE_LIMITED',
+        'Too many attempts. Try again in 40 seconds.',
+        { flow: 'register', next_step: 'register', retry_after_s: 40 },
+        { 'Retry-After': '40' },
       ),
     ])
-    const who = person([value('123456')])
-    expect(await runWith(srv, who)).toEqual({ outcome: 'stopped', code: 'OTP_EMAIL_LOCKED', message })
+    const who = person([value('123456'), CANCEL])
+    expect(await runWith(srv, who)).toEqual({ outcome: 'cancelled' })
     expect(who.slept).toEqual([])
+    expect(srv.seen).toHaveLength(2)
   })
 
   it('the code email could not be sent (5xx): stops', async () => {
@@ -696,9 +741,11 @@ describe('integration.account.run — legacy server (no next_step)', () => {
     expect(await runWith(srv, who)).toMatchObject({ outcome: 'stopped', code: 'OTP_EMAIL_LOCKED' })
   })
 
-  it('a 429 with no wait named → stops', async () => {
+  it('a 429 with no wait named → stops (start or code)', async () => {
     const srv = server([json(429, { code: 'RATE_LIMITED', message: 'Too many requests' })])
     expect(await runWith(srv, person([]))).toMatchObject({ outcome: 'stopped', code: 'RATE_LIMITED' })
+    const onCode = server([legacySent(), json(429, { code: 'RATE_LIMITED', message: 'Too many requests' })])
+    expect(await runWith(onCode, person([value('123456')]))).toMatchObject({ outcome: 'stopped', code: 'RATE_LIMITED' })
   })
 
   it('EMAIL_EXHAUSTED → re-asks the email', async () => {
@@ -899,10 +946,16 @@ describe('AgentChatClient static sign-up calls — flow fields (additive)', () =
     const ver = await AgentChatClient.verify('pnd_1', '123456', options)
     expect(ver).toMatchObject({
       apiKey: 'key_test_1',
+      version: 1,
+      flow: 'register',
       next_step: 'done',
       status: 'approved',
       message: 'Email verified. Logged in as @alice.',
     })
+    // The wire fields sit at the top level beside the old ones; the key is not duplicated as api_key.
+    expect(Object.keys(ver).sort()).toEqual(
+      ['agent', 'apiKey', 'client', 'flow', 'message', 'next_step', 'status', 'version'].sort(),
+    )
     expect(ver.client).toBeInstanceOf(AgentChatClient)
 
     const rec = await AgentChatClient.recover('a@example.com', { handle: 'alice', ...options })

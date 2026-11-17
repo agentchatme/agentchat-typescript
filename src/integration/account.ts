@@ -406,10 +406,11 @@ function legacyFlow(
     return { version: 1, flow: kind, next_step: 'done', status: 'approved' }
   }
   if (error.status === 429) {
-    const wait = legacyWaitSeconds(error)
     if (error.code === 'OTP_ATTEMPTS_EXHAUSTED') return startFlow({ status: 'max_attempts_reached' })
-    const waitField = wait !== undefined ? { retry_after_s: wait } : {}
-    return stepCalled === 'verify' ? pendingAgain(waitField) : startFlow(waitField)
+    // A 429 that names no wait is a bare start step: stop.
+    const wait = legacyWaitSeconds(error)
+    if (wait === undefined) return startFlow()
+    return stepCalled === 'verify' ? pendingAgain({ retry_after_s: wait }) : startFlow({ retry_after_s: wait })
   }
   switch (error.code) {
     case 'HANDLE_TAKEN':

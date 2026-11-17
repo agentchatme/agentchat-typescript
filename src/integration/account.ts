@@ -11,7 +11,7 @@
  * the rules stay on the server.
  *
  *   flowOf(bodyOrError)      the flow object of a body or SDK error, or null
- *   actionOf(flow, status)   what the client does next (the conformance vocabulary)
+ *   actionOf(flow, status, calledStep)  what the client does next (the conformance vocabulary)
  *   start(kind, input, …)    one start call (sends a code)
  *   submitCode(flow, code, …) one verify call
  *   run({kind, input, ask, show, …})  the whole conversation, for a wizard
@@ -57,17 +57,17 @@ export type AccountKind = 'register' | 'recover'
 
 /**
  * What the client does next, derived only from `next_step`, `status`,
- * `param`, `retry_after_s` and the HTTP status (conformance
- * `signup-flow.cases.json`):
+ * `param`, `retry_after_s`, the HTTP status and the step called
+ * (conformance `signup-flow.cases.json`; `actionOf` has the order):
  *
  * | action            | when |
  * |-------------------|------|
  * | `done`            | `next_step: "done"` (the key is in the body) |
  * | `ask_code`        | a verify step, no `retry_after_s` |
  * | `ask_param`       | a start step with `param`: re-ask that field, call the start step again |
- * | `offer_new_code`  | a start step, no `param`, `status` `expired` / `max_attempts_reached`: ask before sending a new code (wait `retry_after_s` first when set) |
- * | `wait_then_retry` | 429 with `retry_after_s` ≤ 60: wait, then repeat `next_step` |
- * | `stop`            | 429 with `retry_after_s` > 60, a 5xx, an unknown `next_step`, anything else: show `message`, end |
+ * | `offer_new_code`  | a start step, no `param`, the code gone (`expired` / `max_attempts_reached`, or a 429 to a verify step), any wait ≤ 60: ask before sending a new code (wait first if accepted) |
+ * | `wait_then_retry` | 429 with `retry_after_s` ≤ 60 naming the step called: wait, then repeat it |
+ * | `stop`            | a 5xx, a longer wait, an unknown `next_step`, anything else: show `message`, end |
  * | `legacy`          | no flow object (a server older than the flow contract) |
  */
 export type SignupAction =
@@ -252,24 +252,46 @@ function isVerifyStep(step: string): step is SignupVerifyStep {
 
 /**
  * What the client does next (the table on `SignupAction`), from the flow
- * object and the answer's HTTP status. Pure. Order: an unknown step stops;
- * `done`; a 5xx stops; a verify step asks for the code unless it carries a
- * wait; a start step re-asks its `param`, or offers a new code when the old
- * one is gone; a 429 with a short wait waits; everything else stops.
+ * object, the answer's HTTP status and the step that was called. Pure.
+ * First match wins:
+ *
+ * - no flow → `legacy`; `next_step: "done"` → `done`;
+ * - a 5xx → `stop`;
+ * - a verify step without `retry_after_s` → `ask_code`;
+ * - a start step with `param` → `ask_param`;
+ * - a start step without `param` whose code is gone (`status` `expired` /
+ *   `max_attempts_reached`, or a 429 to a verify step), and no
+ *   `retry_after_s` or one ≤ 60 → `offer_new_code` (the client waits it out
+ *   only if the person accepts);
+ * - a 429 with `retry_after_s` ≤ 60 that names the step called →
+ *   `wait_then_retry`;
+ * - anything else (an unknown `next_step`, another 4xx to a verify step, a
+ *   longer wait) → `stop`.
+ *
+ * Knowing the called step keeps a wait from turning into a new code nobody
+ * asked for: a 429 on a code that names the start step is an offer, not a
+ * retry.
  */
-export function actionOf(flow: SignupFlow | null, httpStatus: number): SignupAction {
+export function actionOf(
+  flow: SignupFlow | null,
+  httpStatus: number,
+  calledStep: SignupStartStep | SignupVerifyStep | (string & {}),
+): SignupAction {
   if (flow === null) return 'legacy'
   const step = flow.next_step
-  if (!KNOWN_STEPS.has(step)) return 'stop'
   if (step === 'done') return 'done'
-  if (httpStatus >= 500) return 'stop'
+  if (httpStatus >= 500 || !KNOWN_STEPS.has(step)) return 'stop'
   const wait = flow.retry_after_s
   if (isVerifyStep(step) && wait === undefined) return 'ask_code'
   if (isStartStep(step)) {
     if (flow.param !== undefined) return 'ask_param'
-    if (flow.status === 'expired' || flow.status === 'max_attempts_reached') return 'offer_new_code'
+    const codeGone =
+      flow.status === 'expired' ||
+      flow.status === 'max_attempts_reached' ||
+      (httpStatus === 429 && isVerifyStep(calledStep))
+    if (codeGone && (wait === undefined || wait <= MAX_WAIT_S)) return 'offer_new_code'
   }
-  if (httpStatus === 429 && wait !== undefined && wait <= MAX_WAIT_S) return 'wait_then_retry'
+  if (httpStatus === 429 && wait !== undefined && wait <= MAX_WAIT_S && step === calledStep) return 'wait_then_retry'
   return 'stop'
 }
 
@@ -456,7 +478,8 @@ function read(
   ) {
     flow = { ...flow, pending_id: submitted.pending_id }
   }
-  let action = actionOf(flow, httpStatus) as Exclude<SignupAction, 'legacy'>
+  const calledStep = stepCalled === 'start' ? STEPS[kind].start : STEPS[kind].verify
+  let action = actionOf(flow, httpStatus, calledStep) as Exclude<SignupAction, 'legacy'>
   const credentials = error === null ? keyAndHandle(body) : {}
   // `done` means the key is in the body; without one there is nothing to save.
   if (action === 'done' && (credentials.apiKey === undefined || credentials.handle === undefined)) action = 'stop'
@@ -584,24 +607,35 @@ const FIELD_ANSWERS = ['value', 'cancel'] as const
 const CODE_ANSWERS = ['value', 'new_code', 'cancel'] as const
 const NEW_CODE_ANSWERS = ['new_code', 'cancel'] as const
 
+/** The shortest wait `run` sits out (a `Retry-After: 0` is not a tight loop). */
+const MIN_WAIT_MS = 1_000
+/** Waits in a row without a question; the next one asks the person first. */
+const MAX_WAITS_IN_A_ROW = 3
+
 /**
  * The whole sign-up conversation, for an interactive setup. It follows
  * `next_step`: shows every server `message` (through `show`), asks only for
  * what the server names (`param`, or the code), and lets the person enter
- * the code, ask for a new code, or cancel. It never sends a new code unasked.
- * It waits out a `retry_after_s` of up to 60 s (the message says how long),
- * and stops on a longer one; after a yes to a new code it first waits out
- * the flow's `retry_after_s` (the time until one may be sent).
+ * the code, ask for a new code, or cancel. It never sends a new code unasked
+ * and keeps no attempt caps of its own: the server's are the only ones.
  *
- * A new code asked for at the code question is sent no sooner than the
- * held flow's `resend_after_s` (counted from its answer) allows: up to
- * 60 s is waited out; a longer wait asks for the held code again while it
- * still works (`expires_at`), else stops. (A recover asked too soon gets
- * the decoy answer and no email, so the server's answer cannot say so.)
- * When a new code is refused for longer anyway (`OTP_HOURLY_CAP`, or
- * `OTP_COOLDOWN` over 60 s) while the held code still works, it shows the
- * message and asks for that code again instead of stopping. No attempt
- * caps of its own: the server's are the only ones.
+ * Waiting. Every wait is at least 1 s and at most 60 s; after 3 waits in a
+ * row without a question, the person is asked before the next one (the
+ * code again, or "send a new code?"). It waits out a `retry_after_s` of up
+ * to 60 s that names the step it called; after a yes to a new code it
+ * first waits out the answer's `retry_after_s`. And before every start
+ * call that follows a send to the same email in this run (a new code, a
+ * re-asked handle, a recover with the chosen handle) it waits out what is
+ * left of the last answer's `resend_after_s`: a start inside that window
+ * would be turned away, or, for recover, answered like any other with no
+ * email sent. When more than 60 s are left, a new code asked for at the
+ * code question goes back to the code the person holds while it still
+ * works, and otherwise the flow stops.
+ *
+ * A new code asked for and answered by a 429 that `run` does not wait out
+ * (`OTP_HOURLY_CAP`, a long per-IP limit, …) also goes back to the held
+ * code while it still works (`expires_in_s` from its answer, else
+ * `expires_at`), instead of stopping.
  *
  * Resolves `{outcome: 'done', apiKey, handle}` (save both),
  * `{outcome: 'cancelled'}`, or `{outcome: 'stopped', code, message}` (the
@@ -623,8 +657,11 @@ export async function run(options: RunOptions): Promise<RunResult> {
   const input: { email?: string; handle?: string; display_name?: string; description?: string } = {
     ...options.input,
   }
+  /** Waits since the last question. */
+  let waitsInARow = 0
 
   const askOne = async (question: AccountQuestion): Promise<AccountAnswer> => {
+    waitsInARow = 0
     const answer = await ask(question)
     if (!isRecord(answer) || !question.answers.includes(answer.answer)) {
       throw new TypeError(
@@ -650,6 +687,10 @@ export async function run(options: RunOptions): Promise<RunResult> {
     input[field] = answer.value.trim()
     return true
   }
+  const wait = async (ms: number) => {
+    waitsInARow += 1
+    await sleep(Math.max(MIN_WAIT_MS, ms))
+  }
 
   const required: Array<'email' | 'handle'> = kind === 'register' ? ['email', 'handle'] : ['email']
   for (const field of required) {
@@ -657,42 +698,47 @@ export async function run(options: RunOptions): Promise<RunResult> {
     if (!(await askField(field, null))) return { outcome: 'cancelled' }
   }
 
-  const startCall = (): Promise<StepResult> => {
-    const email = input.email ?? ''
-    if (kind === 'recover') {
-      return start('recover', { email, ...(input.handle ? { handle: input.handle } : {}) }, callOptions)
-    }
-    return start(
-      'register',
-      {
-        email,
-        handle: input.handle ?? '',
-        ...(input.display_name !== undefined ? { display_name: input.display_name } : {}),
-        ...(input.description !== undefined ? { description: input.description } : {}),
-      },
-      callOptions,
-    )
-  }
   type Call = { step: 'start' | 'verify'; call: () => Promise<StepResult> }
-  let repeat: Call = { step: 'start', call: startCall }
-  /**
-   * The code the person holds: the flow of the last code question, when
-   * its answer arrived, and when the code stops working (epoch ms; null
-   * when the answer did not say).
-   */
-  let held: { flow: SignupFlow; receivedAt: number; expiresAtMs: number | null } | null = null
+  const startCall: Call = {
+    step: 'start',
+    call: () => {
+      const email = input.email ?? ''
+      if (kind === 'recover') {
+        return start('recover', { email, ...(input.handle ? { handle: input.handle } : {}) }, callOptions)
+      }
+      return start(
+        'register',
+        {
+          email,
+          handle: input.handle ?? '',
+          ...(input.display_name !== undefined ? { display_name: input.display_name } : {}),
+          ...(input.description !== undefined ? { description: input.description } : {}),
+        },
+        callOptions,
+      )
+    },
+  }
+
+  /** The code the person holds: the flow of the last code question, and when it stops working (epoch ms, or null). */
+  let held: { flow: SignupFlow; expiresAtMs: number | null } | null = null
   const holdsAWorkingCode = () => held !== null && held.expiresAtMs !== null && held.expiresAtMs > Date.now()
+  /** The last answer that said when the email may get a new code (`resend_after_s`), and when it arrived. */
+  let resend: { email: string; afterMs: number; receivedAt: number } | null = null
 
   /**
-   * Ask for the code of `flow` (answered at `receivedAt`): the next call,
-   * null when the person cancelled, or STOP. A new code is sent no sooner
-   * than the server allows (`resend_after_s`, counted from the answer): a
-   * recover asked too soon is answered like any other (the decoy design)
-   * and sends nothing, so the server's answer cannot be the way to learn
-   * the wait. Up to 60 s is waited out; a longer wait goes back to the
-   * code the person holds while it still works, else stops.
+   * Before a start call: sit out what is left of the last answer's
+   * `resend_after_s` for this email. False when more than 60 s are left.
    */
-  const askCode = async (flow: SignupFlow, receivedAt: number): Promise<Call | null | typeof STOP> => {
+  const beforeStart = async (): Promise<boolean> => {
+    if (resend === null || resend.email !== (input.email ?? '')) return true
+    const leftMs = resend.afterMs - (Date.now() - resend.receivedAt)
+    if (leftMs > MAX_WAIT_S * 1000) return false
+    if (leftMs > 0) await wait(leftMs)
+    return true
+  }
+
+  /** Ask for the code of `flow`: the next call, null when the person cancelled, or STOP. */
+  const askCode = async (flow: SignupFlow): Promise<Call | null | typeof STOP> => {
     for (;;) {
       const answer = await askOne({ field: 'code', label: labels.code, answers: CODE_ANSWERS, flow })
       if (answer.answer === 'cancel') return null
@@ -700,19 +746,32 @@ export async function run(options: RunOptions): Promise<RunResult> {
         const code = answer.value.trim()
         return { step: 'verify', call: () => submitCode(flow, code, callOptions) }
       }
-      const waitMs = Math.max(0, (flow.resend_after_s ?? 0) * 1000 - (Date.now() - receivedAt))
-      if (waitMs > MAX_WAIT_S * 1000) {
-        if (holdsAWorkingCode()) continue
-        return STOP
-      }
-      if (waitMs > 0) await sleep(waitMs)
-      return { step: 'start', call: startCall }
+      if (await beforeStart()) return startCall
+      // Too long until a new code may be sent: the held code, while it works.
+      if (holdsAWorkingCode()) continue
+      return STOP
     }
   }
 
+  /**
+   * Ask before a new code; on a yes, sit out the answer's `retry_after_s`
+   * and what is left of the resend window. `true` to send, null when the
+   * person declined, STOP when the window is too long.
+   */
+  const offerNewCode = async (flow: SignupFlow): Promise<true | null | typeof STOP> => {
+    const answer = await askOne({ field: 'new_code', label: null, answers: NEW_CODE_ANSWERS, flow })
+    if (answer.answer !== 'new_code') return null
+    const retryAfterS = flow.retry_after_s
+    if (retryAfterS !== undefined && retryAfterS > 0 && retryAfterS <= MAX_WAIT_S) await wait(retryAfterS * 1000)
+    return (await beforeStart()) ? true : STOP
+  }
+
+  let repeat: Call = startCall
   let result = await repeat.call()
   let receivedAt = Date.now()
   for (;;) {
+    const after = result.flow.resend_after_s
+    if (after !== undefined) resend = { email: input.email ?? '', afterMs: after * 1000, receivedAt }
     if (result.message.length > 0) await show(result.message)
     let next: Call | null | typeof STOP = STOP
     switch (result.action) {
@@ -722,9 +781,10 @@ export async function run(options: RunOptions): Promise<RunResult> {
       case 'ask_code': {
         const flow = result.flow
         const expiresAtMs: number | null =
-          expiryOf(flow) ?? (held !== null && held.flow.pending_id === flow.pending_id ? held.expiresAtMs : null)
-        held = { flow, receivedAt, expiresAtMs }
-        next = await askCode(flow, receivedAt)
+          expiryOf(flow, receivedAt) ??
+          (held !== null && held.flow.pending_id === flow.pending_id ? held.expiresAtMs : null)
+        held = { flow, expiresAtMs }
+        next = await askCode(flow)
         break
       }
 
@@ -734,43 +794,37 @@ export async function run(options: RunOptions): Promise<RunResult> {
         const field = param === 'email' ? 'email' : param === 'handle' ? 'handle' : null
         if (field === null) break
         if (!(await askField(field, result.flow, result.handles))) return { outcome: 'cancelled' }
-        next = { step: 'start', call: startCall }
+        if (await beforeStart()) next = startCall
         break
       }
 
       case 'offer_new_code': {
         held = null
-        if (!(await offerNewCode(result.flow))) return { outcome: 'cancelled' }
-        next = { step: 'start', call: startCall }
+        const offered = await offerNewCode(result.flow)
+        next = offered === true ? startCall : offered
         break
       }
 
       case 'wait_then_retry': {
-        // Repeat the call that was turned away — unless that would send a
-        // new code nobody asked for (the wait names a start step, but the
-        // call was a code): then the person is asked first.
-        if (repeat.step === 'verify' && isStartStep(result.flow.next_step)) {
-          held = null
-          if (!(await offerNewCode(result.flow))) return { outcome: 'cancelled' }
-          next = { step: 'start', call: startCall }
-          break
+        if (waitsInARow >= MAX_WAITS_IN_A_ROW) {
+          // Enough waiting without the person: ask before the next try.
+          if (repeat.step === 'verify') {
+            next = await askCode(held?.flow ?? result.flow)
+            break
+          }
+          const again = await askOne({ field: 'new_code', label: null, answers: NEW_CODE_ANSWERS, flow: result.flow })
+          if (again.answer !== 'new_code') return { outcome: 'cancelled' }
         }
-        await sleep(result.flow.retry_after_s! * 1000)
+        await wait(result.flow.retry_after_s! * 1000)
         next = repeat
         break
       }
 
       default:
-        // A new code asked for and refused for longer than run waits
-        // ("Enter the last code you received, or try again in …"): while
-        // the code the person holds still works, go back to it.
-        if (
-          repeat.step === 'start' &&
-          held !== null &&
-          (result.code === 'OTP_HOURLY_CAP' || result.code === 'OTP_COOLDOWN') &&
-          holdsAWorkingCode()
-        ) {
-          next = await askCode(held.flow, held.receivedAt)
+        // A new code asked for and turned away for longer than run waits:
+        // while the code the person holds still works, go back to it.
+        if (result.httpStatus === 429 && repeat.step === 'start' && held !== null && holdsAWorkingCode()) {
+          next = await askCode(held.flow)
         }
     }
     if (next === null) return { outcome: 'cancelled' }
@@ -779,28 +833,19 @@ export async function run(options: RunOptions): Promise<RunResult> {
     result = await repeat.call()
     receivedAt = Date.now()
   }
-
-  /**
-   * Ask before a new code; on a yes, sit out the flow's `retry_after_s`
-   * first (the time until a new code may be sent), so the new code is not
-   * turned away. A wait over the limit is left to the server's answer.
-   */
-  async function offerNewCode(flow: SignupFlow): Promise<boolean> {
-    const answer = await askOne({ field: 'new_code', label: null, answers: NEW_CODE_ANSWERS, flow })
-    if (answer.answer !== 'new_code') return false
-    const wait = flow.retry_after_s
-    if (wait !== undefined && wait > 0 && wait <= MAX_WAIT_S) await sleep(wait * 1000)
-    return true
-  }
 }
 
-/** When the flow's code stops working (epoch ms): `expires_at`, else `expires_in_s` from now; null when neither. */
-function expiryOf(flow: SignupFlow): number | null {
+/**
+ * When the flow's code stops working (epoch ms): `expires_in_s` from when
+ * its answer arrived (no clock skew), else `expires_at`; null when neither.
+ */
+function expiryOf(flow: SignupFlow, receivedAt: number): number | null {
+  if (flow.expires_in_s !== undefined) return receivedAt + flow.expires_in_s * 1000
   if (flow.expires_at !== undefined) {
     const at = Date.parse(flow.expires_at)
     if (Number.isFinite(at)) return at
   }
-  return flow.expires_in_s !== undefined ? Date.now() + flow.expires_in_s * 1000 : null
+  return null
 }
 
 /** `run`'s marker for "end the flow on the last answer". */

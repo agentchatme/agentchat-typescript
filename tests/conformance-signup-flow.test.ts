@@ -103,7 +103,7 @@ describe('conformance — signup-flow.cases.json: flowOf / actionOf', () => {
     // From the raw body (code that calls the endpoints itself).
     const fromBody = flowOf(c.response.body)
     expectFlow(fromBody, c.expect.flow)
-    expect(actionOf(fromBody, c.response.status)).toBe(c.expect.action)
+    expect(actionOf(fromBody, c.response.status, c.request.kind)).toBe(c.expect.action)
 
     // From what the SDK surfaces (the body, or the SDK error).
     const shown = surfaced(c)

@@ -185,11 +185,18 @@ if (result.outcome === 'done') saveKey(result.apiKey, result.handle) // the hand
 | `action` | When | `run` |
 |---|---|---|
 | `done` | `next_step: "done"` | shows the message, returns the key and the handle |
-| `ask_code` | a verify step, no wait | asks for the code; the person can enter it, ask for a new code, or cancel. A new code is sent no sooner than the flow's `resend_after_s` allows (counted from the answer): up to 60 s is waited out; a longer wait asks for the held code again while it still works, else stops. A recover asked too soon gets the same answer as any other and sends no email, so the server's answer cannot be what says to wait. |
+| `ask_code` | a verify step, no wait | asks for the code; the person can enter it, ask for a new code, or cancel |
 | `ask_param` | a start step with `param` | asks that field only (a taken handle re-asks the handle, an email at its limit the email), starts again |
-| `offer_new_code` | the code expired or took too many wrong tries | asks before sending a new code; on a yes, waits out `retry_after_s` first when the answer has one |
-| `wait_then_retry` | 429 with `retry_after_s` ≤ 60 | shows the message, waits, repeats the call (`sleep` is injectable) |
-| `stop` | a longer wait, a 5xx, an unknown `next_step`, anything else | shows the message, ends — except when a new code the person asked for is refused for longer (`OTP_HOURLY_CAP`, or `OTP_COOLDOWN` over 60 s) while the code they hold has not expired (`expires_at`): then it asks for that code again |
+| `offer_new_code` | a start step and the code is gone: expired, too many wrong tries, or a 429 to the code | asks before sending a new code; on a yes, waits out `retry_after_s` first when the answer has one |
+| `wait_then_retry` | 429 with `retry_after_s` ≤ 60 that names the step called | shows the message, waits, repeats the call (`sleep` is injectable) |
+| `stop` | a longer wait, a 5xx, another error, an unknown `next_step` | shows the message, ends — except after a new code the person asked for: a 429 `run` does not wait out goes back to the code they hold while it still works |
+
+`actionOf(flow, httpStatus, calledStep)` is that table (first match wins). The step called matters: a 429 to a code that names the start step is an offer, never a retry, so a wait cannot turn into a new code nobody asked for.
+
+How `run` waits:
+
+- Before every start call that follows a send to the same email in this run (a new code, a re-asked handle, a recover with the chosen handle), it waits out what is left of the last answer's `resend_after_s`. A start inside that window would be turned away, or, for a recover on an older server, answered like any other with no email sent. When more than 60 s are left, a new code asked for at the code question goes back to the code the person holds while it still works (`expires_in_s` counted from its answer, else `expires_at`), and otherwise the flow stops.
+- Every wait is at least 1 s (a `Retry-After: 0` is no tight loop) and at most 60 s. After 3 waits in a row without a question, it asks the person before the next one: the code again, or whether to send a new code.
 
 It never sends a new code the person did not ask for and keeps no attempt cap of its own: the server's are the only ones. The only words the helper brings are the field labels, `DEFAULT_LABELS` (`Email address`, `Handle`, `Enter the 6-digit code`); pass `labels` to change them. The choices around them ("send a new code", "cancel") are your UI's.
 
@@ -214,7 +221,7 @@ switch (next.action) {
 }
 ```
 
-`flowOf(bodyOrError)` and `actionOf(flow, httpStatus)` are the pure parts, for code that calls the endpoints itself (conformance `signup-flow.cases.json`). A server older than the flow contract sends no `next_step`: `actionOf` says `legacy`, and the steps read its codes into the same flow shape (`legacy: true` on the result), so one path serves both.
+`flowOf(bodyOrError)` and `actionOf(flow, httpStatus, calledStep)` are the pure parts, for code that calls the endpoints itself (conformance `signup-flow.cases.json`). A server older than the flow contract sends no `next_step`: `actionOf` says `legacy`, and the steps read its codes into the same flow shape (`legacy: true` on the result), so one path serves both.
 
 ### `checkKey`
 

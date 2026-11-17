@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   actionOf,
   checkKey,
@@ -144,8 +144,23 @@ function person(answers: AccountAnswer[]) {
     },
     sleep: async (ms: number) => {
       slept.push(ms)
+      // Under a fake clock, a wait takes its time.
+      if (vi.isFakeTimers()) vi.setSystemTime(Date.now() + ms)
     },
   }
+}
+
+/** A person who answers each question after `[ms, answer][0]` of (fake) wall-clock time. */
+function slowPerson(answers: Array<[number, AccountAnswer]>) {
+  const who = person(answers.map(([, a]) => a))
+  let i = 0
+  const ask = who.ask
+  who.ask = async (question: AccountQuestion) => {
+    const step = answers[i++]
+    if (step !== undefined) vi.setSystemTime(Date.now() + step[0])
+    return ask(question)
+  }
+  return who
 }
 
 const value = (v: string): AccountAnswer => ({ answer: 'value', value: v })
@@ -177,6 +192,13 @@ afterEach(() => {
 // ─── run(): scripted conversations ──────────────────────────────────────────
 
 describe('integration.account.run — scripted conversations', () => {
+  // A fake wall clock (only Date): the held code answered at 10:00:00Z
+  // expires at 10:10:00Z; waits advance it.
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-11-17T10:00:00.000Z'))
+  })
+
   it('is reachable as integration.account', () => {
     expect(integration.account.run).toBe(run)
     expect(integration.account.DEFAULT_LABELS).toEqual({
@@ -306,19 +328,6 @@ describe('integration.account.run — scripted conversations', () => {
     const startPath = (kind: Kind) => (kind === 'register' ? '/v1/register' : '/v1/agents/recover')
     const verifyPath = (kind: Kind) => (kind === 'register' ? '/v1/register/verify' : '/v1/agents/recover/verify')
 
-    /** A person who answers after `afterMs` of wall-clock time has passed. */
-    function slowPerson(answers: Array<[number, AccountAnswer]>) {
-      const who = person(answers.map(([, a]) => a))
-      let i = 0
-      const ask = who.ask
-      who.ask = async (question: AccountQuestion) => {
-        const step = answers[i++]
-        if (step !== undefined) vi.setSystemTime(Date.now() + step[0])
-        return ask(question)
-      }
-      return who
-    }
-
     it.each([['register' as Kind], ['recover' as Kind]])(
       '%s: asked 20 s after a code that allows a new one at 60 s — waits the 40 s left, then sends (no turned-away call)',
       async (kind) => {
@@ -413,10 +422,10 @@ describe('integration.account.run — scripted conversations', () => {
       expect(srv.seen[2]!.body).toEqual({ pending_id: 'pnd_1', code: '123456' })
     })
 
-    it('OTP_HOURLY_CAP after the held code expired: stops', async () => {
-      at('2026-11-17T10:11:00.000Z')
+    it('OTP_HOURLY_CAP after the held code expired (10 min after its answer): stops', async () => {
+      at('2026-11-17T10:00:00.000Z')
       const srv = server([sent('register', 'pnd_1', SENT_TEXT, { resend_after_s: 0 }), hourlyCap()])
-      const who = person([NEW_CODE])
+      const who = slowPerson([[11 * 60_000, NEW_CODE]])
       expect(await runWith(srv, who)).toEqual({ outcome: 'stopped', code: 'OTP_HOURLY_CAP', message: CAP })
       expect(who.asked).toHaveLength(1)
     })
@@ -459,18 +468,33 @@ describe('integration.account.run — scripted conversations', () => {
       expect(await runWith(srv, who)).toMatchObject({ outcome: 'stopped', code: 'OTP_HOURLY_CAP' })
     })
 
-    it('another code refused for long (the per-IP limit) still stops', async () => {
+    it('any 429 not waited out (the per-IP limit, 25 min): back to the held code while it works', async () => {
       at('2026-11-17T10:00:00.000Z')
       const srv = server([
         sent('register', 'pnd_1', SENT_TEXT, { resend_after_s: 0 }),
-        error(429, 'RATE_LIMITED', 'Too many attempts. Try again in 25 minutes.', {
-          flow: 'register',
-          next_step: 'register',
-          retry_after_s: 1500,
-        }),
+        error(
+          429,
+          'RATE_LIMITED',
+          'Too many attempts. Try again in 25 minutes.',
+          { flow: 'register', next_step: 'register', retry_after_s: 1500 },
+          { 'Retry-After': '1500' },
+        ),
+        registered(),
       ])
-      const who = person([NEW_CODE])
-      expect(await runWith(srv, who)).toMatchObject({ outcome: 'stopped', code: 'RATE_LIMITED' })
+      const who = person([NEW_CODE, value('123456')])
+      expect(await runWith(srv, who)).toMatchObject({ outcome: 'done' })
+      expect(who.asked.map((q) => q.field)).toEqual(['code', 'code'])
+      expect(who.shown[1]).toBe('Too many attempts. Try again in 25 minutes.')
+      expect(srv.seen[2]!.body).toEqual({ pending_id: 'pnd_1', code: '123456' })
+    })
+
+    it('a 4xx that is not a 429 after a new code still stops', async () => {
+      at('2026-11-17T10:00:00.000Z')
+      const srv = server([
+        sent('register', 'pnd_1', SENT_TEXT, { resend_after_s: 0 }),
+        error(409, 'EMAIL_EXHAUSTED', 'Used up.', { flow: 'register', next_step: 'register' }),
+      ])
+      expect(await runWith(srv, person([NEW_CODE]))).toMatchObject({ outcome: 'stopped', code: 'EMAIL_EXHAUSTED' })
     })
 
     it('cancel at the held code: cancelled', async () => {
@@ -593,23 +617,17 @@ describe('integration.account.run — scripted conversations', () => {
     expect(srv.seen).toHaveLength(2)
   })
 
-  it('the last wrong code inside the resend minute: on a yes, waits retry_after_s, then sends', async () => {
+  it('the last wrong code inside the resend minute: on a yes, waits out resend_after_s, then sends', async () => {
     const srv = server([
       sent(),
-      error(
-        429,
-        'OTP_ATTEMPTS_EXHAUSTED',
-        'You entered the wrong code too many times. Request a new code.',
-        {
-          flow: 'register',
-          next_step: 'register',
-          status: 'max_attempts_reached',
-          attempts: 5,
-          max_attempts: 5,
-          retry_after_s: 30,
-        },
-        { 'Retry-After': '30' },
-      ),
+      error(429, 'OTP_ATTEMPTS_EXHAUSTED', 'You entered the wrong code too many times. Request a new code.', {
+        flow: 'register',
+        next_step: 'register',
+        status: 'max_attempts_reached',
+        attempts: 5,
+        max_attempts: 5,
+        resend_after_s: 30,
+      }),
       sent('register', 'pnd_2'),
       registered(),
     ])
@@ -704,7 +722,8 @@ describe('integration.account.run — scripted conversations', () => {
     const who = person([value('123456'), NEW_CODE, value('654321')])
     expect(await runWith(srv, who)).toMatchObject({ outcome: 'done' })
     expect(who.asked.map((q) => q.field)).toEqual(['code', 'new_code', 'code'])
-    expect(who.slept).toEqual([40_000])
+    // The 40 s the answer names, then the 20 s left of the email's resend minute.
+    expect(who.slept).toEqual([40_000, 20_000])
     expect(srv.seen.map((s) => s.path)).toEqual([
       '/v1/register',
       '/v1/register/verify',
@@ -933,11 +952,14 @@ describe('integration.account.run — legacy server (no next_step)', () => {
     expect(await runWith(srv, who)).toMatchObject({ outcome: 'stopped', code: 'OTP_EMAIL_LOCKED' })
   })
 
-  it('a 429 with no wait named → stops (start or code)', async () => {
+  it('a 429 with no wait named: stops on a start; on a code, asks before a new code', async () => {
     const srv = server([json(429, { code: 'RATE_LIMITED', message: 'Too many requests' })])
     expect(await runWith(srv, person([]))).toMatchObject({ outcome: 'stopped', code: 'RATE_LIMITED' })
     const onCode = server([legacySent(), json(429, { code: 'RATE_LIMITED', message: 'Too many requests' })])
-    expect(await runWith(onCode, person([value('123456')]))).toMatchObject({ outcome: 'stopped', code: 'RATE_LIMITED' })
+    const who = person([value('123456'), CANCEL])
+    expect(await runWith(onCode, who)).toEqual({ outcome: 'cancelled' })
+    expect(who.asked.map((q) => q.field)).toEqual(['code', 'new_code'])
+    expect(onCode.seen).toHaveLength(2)
   })
 
   it('EMAIL_EXHAUSTED → re-asks the email', async () => {
@@ -1104,7 +1126,9 @@ describe('integration.account.flowOf / actionOf', () => {
     )
     expect(err).toBeInstanceOf(RateLimitedError)
     expect(flowOf(err)).toEqual({ version: 1, flow: 'register', next_step: 'register', retry_after_s: 30 })
-    expect(actionOf(flowOf(err), 429)).toBe('wait_then_retry')
+    expect(actionOf(flowOf(err), 429, 'register')).toBe('wait_then_retry')
+    // The same wait on a code that names the start step is an offer, never a retry.
+    expect(actionOf(flowOf(err), 429, 'verify')).toBe('offer_new_code')
   })
 
   it('null without a next_step (legacy); unknown fields are dropped', () => {
@@ -1118,11 +1142,20 @@ describe('integration.account.flowOf / actionOf', () => {
       next_step: 'verify',
       pending_id: 'p',
     })
-    expect(actionOf(null, 200)).toBe('legacy')
+    expect(actionOf(null, 200, 'register')).toBe('legacy')
+  })
+
+  it('a 4xx to a code that is not a 429 and not a gone code stops; a 429 there offers', () => {
+    const start = { version: 1, flow: 'recover', next_step: 'recover' } as const
+    expect(actionOf(start, 404, 'recover_verify')).toBe('stop')
+    expect(actionOf(start, 400, 'recover_verify')).toBe('stop')
+    expect(actionOf(start, 429, 'recover_verify')).toBe('offer_new_code')
+    expect(actionOf({ ...start, retry_after_s: 61 }, 429, 'recover_verify')).toBe('stop')
+    expect(actionOf({ ...start, status: 'expired' }, 400, 'recover_verify')).toBe('offer_new_code')
   })
 
   it('a 5xx stops even on a verify step', () => {
-    expect(actionOf({ version: 1, flow: 'register', next_step: 'verify', pending_id: 'p' }, 500)).toBe('stop')
+    expect(actionOf({ version: 1, flow: 'register', next_step: 'verify', pending_id: 'p' }, 500, 'verify')).toBe('stop')
   })
 })
 

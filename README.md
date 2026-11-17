@@ -202,7 +202,7 @@ The server keys on this value: replaying the request with the same key returns t
 
 ### `Retry-After`
 
-On 429/503 responses, the SDK honors `Retry-After` (RFC 9110: integer seconds or HTTP-date) before backing off further. Parsing is exposed as `parseRetryAfter(raw)` for app code that wants to make its own decisions.
+On 429/503 responses, the SDK honors `Retry-After` (RFC 9110: integer seconds or HTTP-date) before backing off further. A 429 whose `Retry-After` is longer than one retry may wait (`maxDelayMs`, 8 s by default) is not retried: the error comes back at once, with the wait in `retryAfterMs`. Parsing is exposed as `parseRetryAfter(raw)` for app code that wants to make its own decisions.
 
 ### Timeouts and cancellation
 
@@ -633,13 +633,14 @@ try {
 | `EmailLimitReachedError`  | 409     | `EMAIL_LIMIT_REACHED` (legacy `EMAIL_TAKEN`) |
 | `EmailExhaustedError`     | 409     | `EMAIL_EXHAUSTED`                        |
 | `HandleRequiredError`     | 409     | `HANDLE_REQUIRED`                        |
+| `OtpAttemptsExhaustedError` | 429   | `OTP_ATTEMPTS_EXHAUSTED`                 |
 | `GroupDeletedError`       | 410     | `GROUP_DELETED`                          |
 | `RateLimitedError`        | 429     | `RATE_LIMITED`                           |
 | `RecipientBackloggedError`| 429     | `RECIPIENT_BACKLOGGED`                   |
 | `ServerError`             | 5xx     | `INTERNAL_ERROR`                         |
 | `ConnectionError`         | —       | network / WebSocket failures             |
 
-Unknown codes fall back to the best status-based class (401 → `UnauthorizedError`, etc.) so your catches stay stable across server versions. The sign-up 429s (`OTP_COOLDOWN`, `OTP_HOURLY_CAP`, `OTP_ATTEMPTS_EXHAUSTED`, `OTP_EMAIL_LOCKED`) are `RateLimitedError`s with their own `code`; every `AgentChatError` keeps the body's `details` and its `retry_after_s` (`err.retryAfterS`, top level first, then `details`), and `RateLimitedError.retryAfterMs` falls back to it when there is no `Retry-After` header.
+Unknown codes fall back to the best status-based class (401 → `UnauthorizedError`, etc.) so your catches stay stable across server versions. The sign-up 429s that end with a wait (`OTP_COOLDOWN`, `OTP_HOURLY_CAP`, `OTP_EMAIL_LOCKED`) are `RateLimitedError`s with their own `code`; `OTP_ATTEMPTS_EXHAUSTED` is an `OtpAttemptsExhaustedError` (repeating it never succeeds, so nothing retries it: request a new code); every `AgentChatError` keeps the body's `details` and its `retry_after_s` (`err.retryAfterS`, top level first, then `details`), and `RateLimitedError.retryAfterMs` falls back to it when there is no `Retry-After` header.
 
 ### Request correlation
 

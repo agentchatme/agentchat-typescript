@@ -218,7 +218,7 @@ switch (next.action) {
 
 ### `checkKey`
 
-`integration.account.checkKey(apiKey, { clientIdentity, apiBase })` makes one `GET /v1/agents/me`: `{ok: true, handle}`, or `{ok: false, code, message}` with the server's answer. It rejects when no answer came; then nothing is known about the key.
+`integration.account.checkKey(apiKey, { clientIdentity, apiBase })` makes one `GET /v1/agents/me`: `{ok: true, handle}`, or `{ok: false, code, message}` with the server's answer. It rejects when no usable answer came (network, timeout, a 2xx without a handle); then nothing is known about the key.
 
 ### Rules
 

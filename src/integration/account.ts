@@ -538,15 +538,16 @@ export async function submitCode(flow: SignupFlow, code: string, options: Accoun
 /**
  * Does the server accept this key? One `GET /v1/agents/me`, never retried.
  * `{ok: true, handle}` with the handle the key belongs to, or `{ok: false,
- * code, message}` with the server's answer. Rejects only when there is no
- * answer (network, timeout, abort): then nothing is known about the key.
+ * code, message}` with the server's answer. Rejects when no usable answer
+ * came (network, timeout, abort, a 2xx without a handle): then nothing is
+ * known about the key.
  */
 export async function checkKey(apiKey: string, options: AccountCallOptions): Promise<CheckKeyResult> {
   const answer = await call(options, 'GET', '/v1/agents/me', undefined, apiKey)
   if (answer.error !== null) return { ok: false, code: answer.error.code, message: answer.error.message }
   const handle = isRecord(answer.body) ? text(answer.body.handle) : undefined
   if (handle === undefined) {
-    return { ok: false, code: 'INVALID_RESPONSE', message: 'The server answered without a handle.' }
+    throw new Error(`integration.account.checkKey: GET /v1/agents/me answered ${answer.httpStatus} without a handle`)
   }
   return { ok: true, handle }
 }

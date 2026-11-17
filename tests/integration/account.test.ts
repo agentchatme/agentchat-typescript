@@ -844,6 +844,11 @@ describe('integration.account.checkKey', () => {
     const srv = server([new TypeError('fetch failed')])
     await expect(checkKey('key_test_1', options(srv))).rejects.toThrow('fetch failed')
   })
+
+  it('a 2xx without a handle rejects (nothing usable is known)', async () => {
+    const srv = server([json(200, { id: 'agt_1' })])
+    await expect(checkKey('key_test_1', options(srv))).rejects.toThrow(/without a handle/)
+  })
 })
 
 // ─── flowOf / actionOf (beyond the fixture) ─────────────────────────────────

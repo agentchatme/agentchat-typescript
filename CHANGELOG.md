@@ -2,6 +2,40 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## 1.4.0 — 2026-11-17
+
+### Added
+
+- `integration.account`: one sign-up helper for setup wizards and agents,
+  built on the server's sign-up answers (contract v1 §3.7: every register,
+  recover and rotate-key answer names the next step). `flowOf` and
+  `actionOf(flow, httpStatus, calledStep)` read an answer and decide the
+  client action by the contract's rule; `start` / `submitCode` take one step
+  per call (a CLI can run one step per process); `run` holds the whole
+  conversation (ask the person, show the server's sentence, follow
+  `next_step`) and returns `done` with the key and handle, `cancelled`, or
+  `stopped`; `checkKey` validates a pasted key. The person can enter a code,
+  ask for a new code, or cancel; a new code is never sent unasked; waits
+  follow the server (`retry_after_s`, `resend_after_s`) with a 1 s floor and
+  at most 3 automatic waits in a row; a refused new-code request goes back
+  to the code the person already holds while it is valid. Older servers are
+  read into the same shape (`legacy`). Exports `DEFAULT_LABELS`,
+  `MAX_WAIT_S`, `MIN_WAIT_MS`, `MAX_AUTO_WAITS` and the flow types.
+- `OtpAttemptsExhaustedError` for `OTP_ATTEMPTS_EXHAUSTED`: not retryable,
+  not a `RateLimitedError`.
+- Every `AgentChatError` has `retryAfterS` (from `retry_after_s`).
+- `register`, `verify`, `recover` and `recoverVerify` results carry the
+  server's flow fields (wire names) beside the existing fields.
+- Conformance fixtures: `signup-flow.cases.json` (53 cases) and the
+  manual 2.3.5 texts, byte-identical to the published contract.
+
+### Changed
+
+- The HTTP layer no longer retries a 429 whose `Retry-After` is longer than
+  its per-try cap; the error comes back at once with `retryAfterMs` set
+  (before, a refused wake-webhook PUT spent about 24 s on retries that could
+  not succeed).
+
 ## 1.3.2 — 2026-11-13
 
 ### Fixed

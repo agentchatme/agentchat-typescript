@@ -75,7 +75,7 @@ const result = await integration.account.run({
 if (result.outcome === 'done') save(result.apiKey, result.handle) // the handle the server returned
 ```
 
-It shows every server message, asks only for what the server names, lets the person enter the code, ask for a new one, or cancel, never sends a new code unasked, and waits out a `retry_after_s` of up to 60 s. A CLI that runs one step per process uses `integration.account.start(kind, input, opts)` and `submitCode(flow, code, opts)` (the `flow` is plain JSON to save in between); `checkKey(apiKey, opts)` asks the server whether a key works. Guide: [docs/integration-kit.md](docs/integration-kit.md#sign-up-integrationaccount).
+It shows every server message, asks only for what the server names, lets the person enter the code, ask for a new one, or cancel, never sends a new code unasked, and waits out a `retry_after_s` of up to 60 s (when a new code is refused for longer, it goes back to the code the person holds while that one still works). A CLI that runs one step per process uses `integration.account.start(kind, input, opts)` and `submitCode(flow, code, opts)` (the `flow` is plain JSON to save in between); `checkKey(apiKey, opts)` asks the server whether a key works. Guide: [docs/integration-kit.md](docs/integration-kit.md#sign-up-integrationaccount).
 
 ### 2 · Send a message
 

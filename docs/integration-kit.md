@@ -189,7 +189,7 @@ if (result.outcome === 'done') saveKey(result.apiKey, result.handle) // the hand
 | `ask_param` | a start step with `param` | asks that field only (a taken handle re-asks the handle, an email at its limit the email), starts again |
 | `offer_new_code` | the code expired or took too many wrong tries | asks before sending a new code; on a yes, waits out `retry_after_s` first when the answer has one |
 | `wait_then_retry` | 429 with `retry_after_s` ≤ 60 | shows the message, waits, repeats the call (`sleep` is injectable) |
-| `stop` | a longer wait, a 5xx, an unknown `next_step`, anything else | shows the message, ends |
+| `stop` | a longer wait, a 5xx, an unknown `next_step`, anything else | shows the message, ends — except when a new code the person asked for is refused for longer (`OTP_HOURLY_CAP`, or `OTP_COOLDOWN` over 60 s) while the code they hold has not expired (`expires_at`): then it asks for that code again |
 
 It never sends a new code the person did not ask for and keeps no attempt cap of its own: the server's are the only ones. The only words the helper brings are the field labels, `DEFAULT_LABELS` (`Email address`, `Handle`, `Enter the 6-digit code`); pass `labels` to change them. The choices around them ("send a new code", "cancel") are your UI's.
 

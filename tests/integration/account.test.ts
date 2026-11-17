@@ -289,6 +289,97 @@ describe('integration.account.run — scripted conversations', () => {
     expect(srv.seen[3]!.body).toEqual({ pending_id: 'pnd_2', code: '123456' })
   })
 
+  describe('a new code refused for longer than run waits', () => {
+    const CAP = 'Too many codes have been sent. Enter the last code you received, or try again in 30 minutes.'
+    const hourlyCap = () =>
+      error(429, 'OTP_HOURLY_CAP', CAP, { flow: 'register', next_step: 'register', retry_after_s: 1800 }, { 'Retry-After': '1800' })
+    // pending() expires at 10:10:00Z.
+    const at = (iso: string) => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(new Date(iso))
+    }
+
+    it('OTP_HOURLY_CAP while the held code still works: shows the message, asks for that code again', async () => {
+      at('2026-11-17T10:00:00.000Z')
+      const srv = server([sent('register', 'pnd_1'), hourlyCap(), registered()])
+      const who = person([NEW_CODE, value('123456')])
+      expect(await runWith(srv, who)).toEqual({ outcome: 'done', apiKey: 'key_test_1', handle: 'alice' })
+      expect(who.shown[1]).toBe(CAP)
+      expect(who.asked.map((q) => q.field)).toEqual(['code', 'code'])
+      expect(who.asked[1]!.flow).toMatchObject({ pending_id: 'pnd_1', next_step: 'verify' })
+      expect(who.slept).toEqual([])
+      expect(srv.seen.map((s) => s.path)).toEqual(['/v1/register', '/v1/register', '/v1/register/verify'])
+      expect(srv.seen[2]!.body).toEqual({ pending_id: 'pnd_1', code: '123456' })
+    })
+
+    it('OTP_HOURLY_CAP after the held code expired: stops', async () => {
+      at('2026-11-17T10:11:00.000Z')
+      const srv = server([sent('register', 'pnd_1'), hourlyCap()])
+      const who = person([NEW_CODE])
+      expect(await runWith(srv, who)).toEqual({ outcome: 'stopped', code: 'OTP_HOURLY_CAP', message: CAP })
+      expect(who.asked).toHaveLength(1)
+    })
+
+    it('OTP_COOLDOWN over 60 s while the held code still works: back to that code', async () => {
+      at('2026-11-17T10:00:00.000Z')
+      const srv = server([sent('register', 'pnd_1'), cooldown(90), registered()])
+      const who = person([NEW_CODE, value('123456')])
+      expect(await runWith(srv, who)).toMatchObject({ outcome: 'done' })
+      expect(who.shown[1]).toBe('You can request a new code in 90 seconds.')
+      expect(who.slept).toEqual([])
+      expect(srv.seen[2]!.body).toEqual({ pending_id: 'pnd_1', code: '123456' })
+    })
+
+    it('the held code keeps its expiry through an answer that does not repeat it (a malformed code)', async () => {
+      at('2026-11-17T10:00:00.000Z')
+      const srv = server([
+        sent('register', 'pnd_1'),
+        error(400, 'VALIDATION_ERROR', 'Enter the code using only 6 digits.', {
+          flow: 'register',
+          next_step: 'verify',
+          param: 'code',
+          code_length: 6,
+        }),
+        hourlyCap(),
+        registered(),
+      ])
+      const who = person([value('12a456'), NEW_CODE, value('123456')])
+      expect(await runWith(srv, who)).toMatchObject({ outcome: 'done' })
+      expect(srv.seen[3]!.body).toEqual({ pending_id: 'pnd_1', code: '123456' })
+    })
+
+    it('a held code with no known expiry (an older server): stops', async () => {
+      at('2026-11-17T10:00:00.000Z')
+      const srv = server([
+        json(200, { pending_id: 'pnd_1', message: 'Verification code sent to email' }),
+        json(429, { code: 'OTP_HOURLY_CAP', message: 'Maximum 20 verification codes per hour.' }, { 'Retry-After': '1800' }),
+      ])
+      const who = person([NEW_CODE])
+      expect(await runWith(srv, who)).toMatchObject({ outcome: 'stopped', code: 'OTP_HOURLY_CAP' })
+    })
+
+    it('another code refused for long (the per-IP limit) still stops', async () => {
+      at('2026-11-17T10:00:00.000Z')
+      const srv = server([
+        sent('register', 'pnd_1'),
+        error(429, 'RATE_LIMITED', 'Too many attempts. Try again in 25 minutes.', {
+          flow: 'register',
+          next_step: 'register',
+          retry_after_s: 1500,
+        }),
+      ])
+      const who = person([NEW_CODE])
+      expect(await runWith(srv, who)).toMatchObject({ outcome: 'stopped', code: 'RATE_LIMITED' })
+    })
+
+    it('cancel at the held code: cancelled', async () => {
+      at('2026-11-17T10:00:00.000Z')
+      const srv = server([sent('register', 'pnd_1'), hourlyCap()])
+      const who = person([NEW_CODE, CANCEL])
+      expect(await runWith(srv, who)).toEqual({ outcome: 'cancelled' })
+    })
+  })
+
   it('handle taken: re-asks the handle only, keeps the email', async () => {
     const srv = server([
       error(409, 'HANDLE_TAKEN', 'The handle @alice is taken. Try another.', {

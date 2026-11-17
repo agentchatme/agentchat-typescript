@@ -591,8 +591,12 @@ const NEW_CODE_ANSWERS = ['new_code', 'cancel'] as const
  * the code, ask for a new code, or cancel. It never sends a new code unasked.
  * It waits out a `retry_after_s` of up to 60 s (the message says how long),
  * and stops on a longer one; after a yes to a new code it first waits out
- * the flow's `retry_after_s` (the time until one may be sent). No attempt
- * caps of its own: the server's are the only ones.
+ * the flow's `retry_after_s` (the time until one may be sent). When a new
+ * code the person asked for is refused for longer (`OTP_HOURLY_CAP`, or
+ * `OTP_COOLDOWN` over 60 s) and the code they hold has not expired
+ * (`expires_at`), it shows the message and asks for that code again
+ * instead of stopping. No attempt caps of its own: the server's are the
+ * only ones.
  *
  * Resolves `{outcome: 'done', apiKey, handle}` (save both),
  * `{outcome: 'cancelled'}`, or `{outcome: 'stopped', code, message}` (the
@@ -664,27 +668,44 @@ export async function run(options: RunOptions): Promise<RunResult> {
       callOptions,
     )
   }
-  let repeat: { step: 'start' | 'verify'; call: () => Promise<StepResult> } = { step: 'start', call: startCall }
+  type Call = { step: 'start' | 'verify'; call: () => Promise<StepResult> }
+  let repeat: Call = { step: 'start', call: startCall }
+  /**
+   * The code the person holds: the flow of the last code question, and when
+   * that code stops working (epoch ms; null when the answer did not say).
+   */
+  let held: { flow: SignupFlow; expiresAtMs: number | null } | null = null
   let result = await repeat.call()
+
+  /** Ask for the code of `flow`; the next call, or null when the person cancelled. */
+  const askCode = async (flow: SignupFlow): Promise<Call | null> => {
+    const answer = await askOne({ field: 'code', label: labels.code, answers: CODE_ANSWERS, flow })
+    if (answer.answer === 'cancel') return null
+    return answer.answer === 'new_code'
+      ? { step: 'start', call: startCall }
+      : { step: 'verify', call: () => submitCode(flow, answer.value.trim(), callOptions) }
+  }
 
   for (;;) {
     if (result.message.length > 0) await show(result.message)
+    let next: Call | null
     switch (result.action) {
       case 'done':
         return { outcome: 'done', apiKey: result.apiKey!, handle: result.handle! }
 
       case 'ask_code': {
         const flow = result.flow
-        const answer = await askOne({ field: 'code', label: labels.code, answers: CODE_ANSWERS, flow })
-        if (answer.answer === 'cancel') return { outcome: 'cancelled' }
-        repeat =
-          answer.answer === 'new_code'
-            ? { step: 'start', call: startCall }
-            : { step: 'verify', call: () => submitCode(flow, answer.value.trim(), callOptions) }
+        const expiresAtMs: number | null =
+          expiryOf(flow) ?? (held !== null && held.flow.pending_id === flow.pending_id ? held.expiresAtMs : null)
+        held = { flow, expiresAtMs }
+        next = await askCode(flow)
+        if (next === null) return { outcome: 'cancelled' }
+        repeat = next
         break
       }
 
       case 'ask_param': {
+        held = null
         const param = result.flow.param
         const field = param === 'email' ? 'email' : param === 'handle' ? 'handle' : null
         if (field === null) return stopped(result)
@@ -694,6 +715,7 @@ export async function run(options: RunOptions): Promise<RunResult> {
       }
 
       case 'offer_new_code': {
+        held = null
         if (!(await offerNewCode(result.flow))) return { outcome: 'cancelled' }
         repeat = { step: 'start', call: startCall }
         break
@@ -704,6 +726,7 @@ export async function run(options: RunOptions): Promise<RunResult> {
         // new code nobody asked for (the wait names a start step, but the
         // call was a code): then the person is asked first.
         if (repeat.step === 'verify' && isStartStep(result.flow.next_step)) {
+          held = null
           if (!(await offerNewCode(result.flow))) return { outcome: 'cancelled' }
           repeat = { step: 'start', call: startCall }
           break
@@ -713,6 +736,21 @@ export async function run(options: RunOptions): Promise<RunResult> {
       }
 
       default:
+        // A new code asked for and refused for longer than run waits
+        // ("Enter the last code you received, or try again in …"): while
+        // the code the person holds still works, go back to it.
+        if (
+          repeat.step === 'start' &&
+          held !== null &&
+          (result.code === 'OTP_HOURLY_CAP' || result.code === 'OTP_COOLDOWN') &&
+          held.expiresAtMs !== null &&
+          held.expiresAtMs > Date.now()
+        ) {
+          next = await askCode(held.flow)
+          if (next === null) return { outcome: 'cancelled' }
+          repeat = next
+          break
+        }
         return stopped(result)
     }
     result = await repeat.call()
@@ -730,6 +768,15 @@ export async function run(options: RunOptions): Promise<RunResult> {
     if (wait !== undefined && wait > 0 && wait <= MAX_WAIT_S) await sleep(wait * 1000)
     return true
   }
+}
+
+/** When the flow's code stops working (epoch ms): `expires_at`, else `expires_in_s` from now; null when neither. */
+function expiryOf(flow: SignupFlow): number | null {
+  if (flow.expires_at !== undefined) {
+    const at = Date.parse(flow.expires_at)
+    if (Number.isFinite(at)) return at
+  }
+  return flow.expires_in_s !== undefined ? Date.now() + flow.expires_in_s * 1000 : null
 }
 
 function stopped(result: StepResult): RunResult {

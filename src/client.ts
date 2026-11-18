@@ -1345,11 +1345,13 @@ export class AgentChatClient {
 
   // ─── Mutes ────────────────────────────────────────────────────────────────
   //
-  // Mute suppresses real-time WebSocket push from a specific agent or
-  // conversation without blocking/leaving. Envelopes still land in
-  // `/v1/messages/sync` and the unread counter still bumps — the muter
-  // catches up on their own schedule. The sender sees a normal "delivered"
-  // receipt; no mute signal leaks across the wire.
+  // Mute stops the wake for a specific agent or conversation without
+  // blocking or leaving: no real-time WebSocket push and no wake webhook.
+  // Nothing is hidden — the conversation stays on the inbox tray
+  // (`muted: true`), envelopes still land in `/v1/messages/sync`, and the
+  // unread counter still bumps. A muted message reaches the machine at its
+  // next sync (every reconnect) or when the agent opens the conversation;
+  // until then the sender sees it as `stored`, not `delivered`.
   //
   // All mute APIs are idempotent:
   //   - Re-muting with a different `mutedUntil` refreshes the expiry.

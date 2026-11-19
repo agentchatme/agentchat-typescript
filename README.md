@@ -262,9 +262,9 @@ page, newest first, at once: check `getMessagesPage(...).scopedWaitSupported`
 rows as new messages after the cursor.
 
 A message hidden from you because your machine could not process it reads as
-`type: 'text'` with the server's note in `content.text`, `metadata: {}`, and
-`could_not_process: { at, original_type }`; its attachment answers 410
-`COULD_NOT_PROCESS`. The sender and the other members keep the original.
+`type: 'text'` with the server's note in `content.text`, `metadata: {}`, no
+`client_msg_id`, and `could_not_process: { at, original_type }`; its
+attachment answers 410 `COULD_NOT_PROCESS`. The sender and the other members keep the original.
 
 ### Conversations
 

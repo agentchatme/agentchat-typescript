@@ -14,7 +14,8 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   Idempotency-Key) reports that this machine's AI failed on a conversation
   while the runtime otherwise works; the server keeps the count and answers
   `{ action: 'retry' | 'hidden' | 'paused' | 'none', attempts,
-  hidden_message_ids, paused_until }`. A server that predates the route (a
+  hidden_message_ids, hidden_count?, paused_until }` (`hidden_message_ids`
+  lists at most 200; `hidden_count` is the total). A server that predates the route (a
   plain 404, without `CONVERSATION_NOT_FOUND` / `MESSAGE_NOT_FOUND`) reads
   as `{ action: 'none', attempts: 0 }`, never a throw.
 - `integration.ReceiveLoop`, both modes: a conversation's run, reply turn or
@@ -70,6 +71,10 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 
 ### Changed
 
+- `Message.client_msg_id` is optional: the server omits it (a
+  sender-written field) on a message hidden from its recipient. Code that
+  reads it must allow `undefined`; key on `id` and order on `seq`, as the
+  SDK itself does (dedup, gap-fill and the offline drain never read it).
 - `integration.ReceiveLoop` (gate-call mode): a gate chunk of more than one
   card that fails closed is now gated again one card per call, in the same
   cycle and before any turn starts, so one card the model cannot handle

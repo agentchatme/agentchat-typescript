@@ -797,6 +797,7 @@ export class AgentChatClient {
       hidden_message_ids: Array.isArray(r.hidden_message_ids)
         ? r.hidden_message_ids.filter((id): id is string => typeof id === 'string')
         : [],
+      ...(typeof r.hidden_count === 'number' && Number.isFinite(r.hidden_count) ? { hidden_count: r.hidden_count } : {}),
       paused_until: typeof r.paused_until === 'string' ? r.paused_until : null,
     }
   }

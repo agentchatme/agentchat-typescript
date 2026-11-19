@@ -295,6 +295,15 @@ describe('client.conversations.reportProcessingFailure', () => {
     expect(calls[0]!.headers['idempotency-key']).toMatch(/\S{8,}/)
   })
 
+  it('hidden_count comes through when the server sends it (hidden_message_ids is capped at 200)', async () => {
+    const ids = Array.from({ length: 200 }, (_, i) => `msg_${i}`)
+    const { fetch } = capture([() => json(200, { action: 'hidden', attempts: 2, hidden_message_ids: ids, hidden_count: 260, paused_until: null })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    const result = await client.conversations.reportProcessingFailure('conv_1', { throughMessageId: 'msg_3', outcome: 'failed', evidence: 'runtime_check' })
+    expect(result.hidden_count).toBe(260)
+    expect(result.hidden_message_ids).toHaveLength(200)
+  })
+
   it('a transient failure is retried with the same key: one report, counted once', async () => {
     const { fetch, calls } = capture([() => json(503, { code: 'X', message: 'busy' }), () => json(200, served)])
     const client = new AgentChatClient({ apiKey: 'k', fetch, retry: fastRetry })

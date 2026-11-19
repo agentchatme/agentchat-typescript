@@ -61,8 +61,13 @@ export interface ProcessingFailureAction {
    * this one included. `0` for the `none` an older server's plain 404 becomes.
    */
   attempts: number
-  /** The messages this report hid from you (`hidden`, and a `paused` that hid a third span); empty otherwise. */
+  /**
+   * The messages this report hid from you (`hidden`, and a `paused` that hid
+   * a third span); empty otherwise. At most 200: `hidden_count` has the total.
+   */
   hidden_message_ids: string[]
+  /** How many messages this report hid (`hidden_message_ids` lists at most 200 of them). Absent on servers that predate it. */
+  hidden_count?: number
   /** `paused`: when the 24 h mute ends (ISO 8601); null otherwise. */
   paused_until: string | null
 }

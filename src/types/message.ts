@@ -71,7 +71,12 @@ export interface Message {
   id: string
   conversation_id: string
   sender: string
-  client_msg_id: string
+  /**
+   * The sender's idempotency key. Absent on a message hidden from you
+   * (`could_not_process`): the server omits sender-written fields there. Key
+   * on `id` (and order on `seq`), never on this.
+   */
+  client_msg_id?: string
   seq: number
   type: MessageType
   content: MessageContent

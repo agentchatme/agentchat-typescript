@@ -2,6 +2,72 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## Unreleased
+
+### Added
+
+- Could not process: a message the recipient's AI cannot process (a
+  provider refusal, a crash, a timeout) no longer silences the agent or
+  kills its conversation for good. `client.conversations.reportProcessingFailure(conversationId,
+  { throughMessageId, outcome: 'failed' | 'timed_out', evidence: 'other_run_completed' | 'runtime_check' })`
+  (`POST /v1/conversations/{id}/processing-failures`, with an
+  Idempotency-Key) reports that this machine's AI failed on a conversation
+  while the runtime otherwise works; the server keeps the count and answers
+  `{ action: 'retry' | 'hidden' | 'paused' | 'none', attempts,
+  hidden_message_ids, paused_until }`. A server that predates the route (a
+  plain 404, without `CONVERSATION_NOT_FOUND` / `MESSAGE_NOT_FOUND`) reads
+  as `{ action: 'none', attempts: 0 }`, never a throw.
+- `integration.ReceiveLoop`, both modes: a conversation's run, reply turn or
+  single-card gate call that failed or timed out is reported, only with
+  evidence that the runtime otherwise works: another run, turn or gate call
+  in this loop completed after it started, or the new `checkRuntime` option
+  passes (bounded by 60 s; it should prove the AI answers now, not only that
+  a binary is installed). Without evidence nothing is reported (a broken
+  runtime stays the integration's runs-failing path); the failure waits for
+  the next completion (at most 10 minutes), and is dropped when the runtime
+  check fails. The conversation stays held until the server answers. A run or
+  turn that answered or recorded a verdict before it failed (read on a fresh
+  tray), or one `stop()` cut short, is not reported. The report reads
+  through the card's anchor as it was when the attempt started; the server
+  picks the span. `retry` / `hidden` run the conversation again after the
+  others already queued; `paused` / `none` stop for it; at most 3 re-runs
+  per conversation per cycle. Each report is a `processing_failure` event;
+  `status().processingFailures` counts reports, answers, re-runs, failures
+  awaiting evidence and runtime checks.
+- `integration.ReceiveLoop`, single-run mode: conversation runs. Whenever the
+  served texts carry `conversation_run_template` (and `conversationRuns` is
+  not `false`), the loop starts one run per owed card, prompted for that one
+  conversation (`integration.conversationRunPrompt`), and one invite run for
+  the pending invites, instead of one run for the whole tray. Runs take slots
+  like turns (`maxConcurrentTurns`, default 1); a conversation whose run is
+  running or waiting is held out of later cycles; a completed run that left
+  its card at the same anchor is paced 60 s (D5). The loop records no verdict
+  for a card. Cycle outcome `runs_started`. `idle()` and `stop()` wait for
+  the runs. Texts without the template keep one run for the tray, as before.
+- `RunRequest.kind` (`'conversation' | 'tray' | 'invite'`) and
+  `RunRequest.conversationId`; `RunEnd.timedOut` and `TurnEnd` (`failed`)
+  `timedOut`; the `run` event carries `kind` and `conversationId`.
+- `getMessages` takes `afterMessageId` and `waitMs` (the scoped wait on
+  `GET /v1/messages/{conversation_id}`: 0–50 000 ms, with `afterSeq` or
+  `afterMessageId`); `getMessagesPage` also returns `waitedMs`.
+- Types: `Message.could_not_process` (`{ at, original_type }`, set on a
+  message hidden from you), `InboxCardPreview.could_not_process`,
+  `Texts.conversation_run_template`, `ErrorCode.COULD_NOT_PROCESS` (410 on
+  a hidden message's attachment), and the `ProcessingFailure*` types.
+
+### Changed
+
+- `integration.ReceiveLoop` (gate-call mode): a gate chunk of more than one
+  card that fails closed is now gated again one card per call, in the same
+  cycle and before any turn starts, so one card the model cannot handle
+  fails only its own call; before, the chunk's other cards waited for the
+  next wake. A card whose last gate call failed is gated alone, after the
+  chunks, from then on. The split stops after two single-card calls in a row
+  failed (only a call that decides resets the count). The summary and
+  `status().counters` count `splitCallsOk` / `splitCallsFailed`; a
+  single-card call's `gate_chunk` event has `split: true` and its
+  `conversationId`.
+
 ## 1.4.0 — 2026-11-17
 
 ### Added

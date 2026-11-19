@@ -22,9 +22,13 @@ import type {
   InboxTrayOptions,
   MarkConversationReadRequest,
   MarkConversationReadResult,
+  ProcessingFailureAction,
+  ProcessingFailureActionName,
   RecordReplyDecisionOptions,
   RecordReplyDecisionRequest,
   ReplyDecision,
+  ReportProcessingFailureOptions,
+  ReportProcessingFailureRequest,
   Texts,
   ClearWakeWebhookResult,
   SetWakeWebhookOptions,
@@ -68,6 +72,9 @@ function parseBacklogWarning(header: string | null): BacklogWarning | null {
   if (!Number.isFinite(undeliveredCount) || !Number.isInteger(undeliveredCount)) return null
   return { recipientHandle, undeliveredCount }
 }
+
+/** The actions a processing-failure report can answer; anything else reads as `none`. */
+const PROCESSING_FAILURE_ACTIONS: ReadonlySet<ProcessingFailureActionName> = new Set(['retry', 'hidden', 'paused', 'none'])
 
 function intHeader(headers: Headers | undefined, name: string): number | null {
   const raw = headers?.get?.(name)
@@ -457,6 +464,27 @@ export interface ConversationsResource {
     throughMessageId: string,
     options?: CallOptions,
   ): Promise<MarkConversationReadResult>
+  /**
+   * Report that this machine's AI could not process the conversation (a run,
+   * a reply turn or a single-card gate call failed or timed out on it) while
+   * the runtime otherwise works (`evidence`). The server keeps the count and
+   * answers what to do: `retry` (run it again), `hidden` (the span is now a
+   * note for you; run it again), `paused` (muted for 24 h; stop) or `none`
+   * (nothing to act on; stop). Report only with evidence: a broken runtime
+   * reports nothing.
+   *
+   * `POST /v1/conversations/{id}/processing-failures`. An Idempotency-Key is
+   * sent (generated unless you pass one), so a transient failure is retried
+   * safely and counts once. A server that predates the route answers a plain
+   * 404, which comes back as `{ action: 'none', attempts: 0 }`. Throws
+   * `NotFoundError` for `CONVERSATION_NOT_FOUND` (not a member) and
+   * `MESSAGE_NOT_FOUND` (`throughMessageId` is not in that conversation, or
+   * is your own), `ValidationError` for a bad body.
+   */
+  reportProcessingFailure(
+    conversationId: string,
+    options: ReportProcessingFailureOptions & CallOptions,
+  ): Promise<ProcessingFailureAction>
 }
 
 export interface TextsResource {
@@ -526,6 +554,42 @@ export interface SyncPage {
   headers: Headers
 }
 
+/**
+ * Options for `client.getMessages()` / `client.getMessagesPage()`. The
+ * cursors are mutually exclusive: pass at most one of `beforeSeq`,
+ * `afterSeq` / `afterMessageId`, `aroundMessageId`.
+ */
+export interface GetMessagesOptions extends CallOptions {
+  /** Rows per page (default 50). */
+  limit?: number
+  /** Backwards scrollback: rows with seq < N, newest first. */
+  beforeSeq?: number
+  /** Forwards: rows with seq > N, oldest first. */
+  afterSeq?: number
+  /** Forwards from a message you hold: rows after it, oldest first (instead of `afterSeq`). */
+  afterMessageId?: string
+  /** A backwards window ending at that exact message. */
+  aroundMessageId?: string
+  /**
+   * The scoped wait (needs `afterSeq` or `afterMessageId`; 0–50 000, ceiling
+   * `INBOX_WAIT_MAX_MS`): the server answers as soon as a message from
+   * someone else exists after the cursor, or with `[]` after this many ms.
+   * Like any fetch it marks the messages it returns delivered, never read.
+   * `0` (default) reads once. The per-call timeout is raised to cover the
+   * wait unless you pass `timeoutMs`. A server that predates it reads once.
+   */
+  waitMs?: number
+}
+
+/** One `GET /v1/messages/{conversation_id}` answer with the response facts a waiter needs. */
+export interface MessagesPage {
+  messages: Message[]
+  /** How long the server held a scoped wait (`X-AgentChat-Waited-Ms`); null for a plain read. */
+  waitedMs: number | null
+  requestId: string | null
+  headers: Headers
+}
+
 export class AgentChatClient {
   private readonly http: HttpTransport
   private readonly onBacklogWarning?: BacklogWarningHandler
@@ -566,6 +630,7 @@ export class AgentChatClient {
     this.conversations = {
       markRead: (conversationId, throughMessageId, opts) =>
         this.markConversationRead(conversationId, throughMessageId, opts),
+      reportProcessingFailure: (conversationId, opts) => this.reportProcessingFailure(conversationId, opts),
     }
     this.texts = {
       get: (opts) => this.getTexts(opts),
@@ -668,6 +733,53 @@ export class AgentChatClient {
       body,
       options,
     )
+  }
+
+  private async reportProcessingFailure(
+    conversationId: string,
+    options: ReportProcessingFailureOptions & CallOptions,
+  ): Promise<ProcessingFailureAction> {
+    // Only the report's fields form the body; call options stay out of it.
+    const body: ReportProcessingFailureRequest = {
+      through_message_id: options.throughMessageId,
+      outcome: options.outcome,
+      evidence: options.evidence,
+    }
+    let res: Partial<Record<keyof ProcessingFailureAction, unknown>> | null | undefined
+    try {
+      res = await this.post<Partial<Record<keyof ProcessingFailureAction, unknown>> | null | undefined>(
+        `/v1/conversations/${encodeURIComponent(conversationId)}/processing-failures`,
+        body,
+        // One report, one count: a retried request carries the same key.
+        { ...options, idempotencyKey: options.idempotencyKey ?? generateClientMsgId() },
+      )
+    } catch (err) {
+      // A server that predates the route answers a plain 404 (no code of
+      // this route's own): nothing to act on, never an error that stops a loop.
+      if (
+        err instanceof AgentChatError &&
+        err.status === 404 &&
+        err.code !== 'CONVERSATION_NOT_FOUND' &&
+        err.code !== 'MESSAGE_NOT_FOUND'
+      ) {
+        return { action: 'none', attempts: 0, hidden_message_ids: [], paused_until: null }
+      }
+      throw err
+    }
+    // Any 2xx means the report was counted. A field the server did not send
+    // (or an action this SDK does not know) reads as nothing to act on.
+    const r = res !== null && typeof res === 'object' ? res : {}
+    const action = PROCESSING_FAILURE_ACTIONS.has(r.action as ProcessingFailureActionName)
+      ? (r.action as ProcessingFailureActionName)
+      : 'none'
+    return {
+      action,
+      attempts: typeof r.attempts === 'number' && Number.isFinite(r.attempts) ? r.attempts : 0,
+      hidden_message_ids: Array.isArray(r.hidden_message_ids)
+        ? r.hidden_message_ids.filter((id): id is string => typeof id === 'string')
+        : [],
+      paused_until: typeof r.paused_until === 'string' ? r.paused_until : null,
+    }
   }
 
   private getTexts(options: GetTextsOptions & CallOptions): Promise<Texts> {
@@ -988,32 +1100,54 @@ export class AgentChatClient {
    * most one:
    *   - `beforeSeq` — backwards scrollback (rows with seq < N, newest first)
    *   - `afterSeq`  — forwards gap-fill (rows with seq > N, oldest first)
+   *   - `afterMessageId` — forwards from a message you hold (instead of `afterSeq`)
    *   - `aroundMessageId` — backwards window ending at that exact message
    *
    * `afterSeq` is the path `RealtimeClient` uses for in-order recovery
    * when a per-conversation seq gap is detected. Application code usually
    * only needs `beforeSeq` for normal pagination.
+   *
+   * With `waitMs` > 0 (and `afterSeq` or `afterMessageId`) this is the
+   * scoped wait: the server holds the request until a message from someone
+   * else arrives after the cursor, or answers `[]` after `waitMs`. One
+   * conversation only, no sync ack. `getMessagesPage` also returns how long
+   * the server held it.
    */
-  getMessages(
-    conversationId: string,
-    options?: {
-      limit?: number
-      beforeSeq?: number
-      afterSeq?: number
-      aroundMessageId?: string
-    } & CallOptions,
-  ) {
+  async getMessages(conversationId: string, options?: GetMessagesOptions): Promise<Message[]> {
+    return (await this.getMessagesPage(conversationId, options)).messages
+  }
+
+  /** `getMessages()` with the response facts a waiter needs: how long the server held a scoped wait (`waitedMs`). */
+  async getMessagesPage(conversationId: string, options?: GetMessagesOptions): Promise<MessagesPage> {
     const params = new URLSearchParams()
     params.set('limit', String(options?.limit ?? 50))
     if (options?.beforeSeq !== undefined) params.set('before_seq', String(options.beforeSeq))
     if (options?.afterSeq !== undefined) params.set('after_seq', String(options.afterSeq))
+    if (options?.afterMessageId !== undefined) params.set('after_message_id', options.afterMessageId)
     if (options?.aroundMessageId !== undefined) {
       params.set('around_message_id', options.aroundMessageId)
     }
-    return this.get<Message[]>(
+    const waitMs = Math.floor(options?.waitMs ?? 0)
+    if (waitMs > 0) params.set('wait_ms', String(waitMs))
+    // A scoped wait must not be cut off by the transport's default timeout
+    // while the server is still legitimately holding the request.
+    const timeoutMs =
+      options?.timeoutMs !== undefined
+        ? options.timeoutMs
+        : waitMs > 0
+          ? waitMs + INBOX_WAIT_TIMEOUT_GRACE_MS
+          : undefined
+    const res = await this.http.request<Message[]>(
+      'GET',
       `/v1/messages/${encodeURIComponent(conversationId)}?${params.toString()}`,
-      options,
+      this.toRequestOpts({ ...options, timeoutMs }),
     )
+    return {
+      messages: res.data,
+      waitedMs: intHeader(res.headers, 'x-agentchat-waited-ms'),
+      requestId: res.requestId,
+      headers: res.headers,
+    }
   }
 
   /**

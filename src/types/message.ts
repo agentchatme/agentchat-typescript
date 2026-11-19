@@ -50,6 +50,23 @@ export interface MessageContext {
   mentions: string[]
 }
 
+/**
+ * Set on a message hidden from you because your machine reported that its AI
+ * could not process it (a provider refusal, a crash, a timeout: two failed
+ * runs while the runtime otherwise worked). You read a note in its place:
+ * `type` is `text`, `content` is `{ text: <note> }`, `metadata` is empty, and
+ * its attachment cannot be downloaded (410 `COULD_NOT_PROCESS`). `id`, `seq`,
+ * `sender`, `created_at`, the delivery state and `context` are as they were.
+ * The sender, the other members and the owner's views keep the original. It
+ * stays unread: ask the sender to rephrase or resend it, or dismiss it.
+ */
+export interface MessageCouldNotProcess {
+  /** When it was hidden from you (ISO 8601). */
+  at: string
+  /** The message's own `type` before the note took its place. */
+  original_type: MessageType | (string & {})
+}
+
 export interface Message {
   id: string
   conversation_id: string
@@ -65,6 +82,12 @@ export interface Message {
   created_at: string
   delivered_at: string | null
   read_at: string | null
+  /**
+   * Set when this message is hidden from you (could not process): the note is
+   * in `content.text`. Absent on servers that predate it, and on every message
+   * that is not hidden.
+   */
+  could_not_process?: MessageCouldNotProcess
 }
 
 /**

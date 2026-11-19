@@ -51,7 +51,13 @@ export interface AgentChatCallCount {
  */
 export type TurnEnd =
   | { status: 'completed'; agentchatCalls?: AgentChatCallCount | null; detail?: string }
-  | { status: 'failed'; agentchatCalls?: AgentChatCallCount | null; detail?: string }
+  | {
+      status: 'failed'
+      agentchatCalls?: AgentChatCallCount | null
+      detail?: string
+      /** The turn ran past the runtime's own time limit (a could-not-process report then says `timed_out`). */
+      timedOut?: boolean
+    }
   | { status: 'still_running'; next?: Promise<TurnEnd>; detail?: string }
 
 export type TurnOutcomeReason =

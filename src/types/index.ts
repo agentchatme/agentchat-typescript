@@ -15,11 +15,21 @@ export type {
 export type {
   Message,
   MessageContent,
+  MessageCouldNotProcess,
   MessageStatus,
   MessageType,
   SendableMessageType,
   SendMessageRequest,
 } from './message.js'
+
+export type {
+  ProcessingFailureAction,
+  ProcessingFailureActionName,
+  ProcessingFailureEvidence,
+  ProcessingFailureOutcome,
+  ReportProcessingFailureOptions,
+  ReportProcessingFailureRequest,
+} from './processing-failure.js'
 
 export type {
   AgentConversationContext,

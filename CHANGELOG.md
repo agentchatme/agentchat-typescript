@@ -19,19 +19,22 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   as `{ action: 'none', attempts: 0 }`, never a throw.
 - `integration.ReceiveLoop`, both modes: a conversation's run, reply turn or
   single-card gate call that failed or timed out is reported, only with
-  evidence that the runtime otherwise works: another run, turn or gate call
-  in this loop completed after it started, or the new `checkRuntime` option
-  passes (bounded by 60 s; it should prove the AI answers now, not only that
-  a binary is installed). Without evidence nothing is reported (a broken
-  runtime stays the integration's runs-failing path); the failure waits for
-  the next completion (at most 10 minutes), and is dropped when the runtime
-  check fails. The conversation stays held until the server answers. A run or
-  turn that answered or recorded a verdict before it failed (read on a fresh
-  tray), or one `stop()` cut short, is not reported. The report reads
-  through the card's anchor as it was when the attempt started; the server
-  picks the span. `retry` / `hidden` run the conversation again after the
-  others already queued; `paused` / `none` stop for it; at most 3 re-runs
-  per conversation per cycle. Each report is a `processing_failure` event;
+  evidence that the runtime otherwise works: (a) the same kind of work (a
+  gate call, a turn, a run) completed for a different conversation after it
+  started; or (b) the new `checkRuntime` option passes (bounded by 60 s; it
+  should prove the AI answers now), but only while no other conversation of
+  that kind has failed since that kind last completed. A completion on the
+  failing conversation's own card is never evidence. The failure waits
+  first: the queued work runs, and the runtime check is asked only once
+  nothing of that kind is queued. It waits at most 10 minutes, and is
+  dropped when the runtime check fails. A failure reported as its attempt
+  ends keeps the conversation held until the server answers. A run or turn that answered or
+  recorded a verdict before it failed (read on a fresh tray), or one
+  `stop()` cut short, is not reported. The report reads through the card's
+  anchor as it was when the attempt started; the server picks the span.
+  `retry` / `hidden` run the conversation again after the others already
+  queued; `paused` / `none` stop for it; at most 3 re-runs per conversation
+  per cycle. Each report is a `processing_failure` event;
   `status().processingFailures` counts reports, answers, re-runs, failures
   awaiting evidence and runtime checks.
 - `integration.ReceiveLoop`, single-run mode: conversation runs. Whenever the
@@ -46,7 +49,8 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   running or waiting is held out of later cycles; a completed run that left
   its card at the same anchor is paced 60 s (D5). The loop records no verdict
   for a card. Cycle outcome `runs_started`. `idle()` and `stop()` wait for
-  the runs. Texts without the template keep one run for the tray, as before.
+  the runs. A tray that cannot be read starts no run (`tray_failed`). Texts
+  without the template keep one run for the tray, as before.
 - `RunRequest.kind` (`'conversation' | 'tray' | 'invite'`) and
   `RunRequest.conversationId`; `RunEnd.timedOut` and `TurnEnd` (`failed`)
   `timedOut`; the `run` event carries `kind` and `conversationId`.
@@ -65,11 +69,12 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   cycle and before any turn starts, so one card the model cannot handle
   fails only its own call; before, the chunk's other cards waited for the
   next wake. A card whose last gate call failed is gated alone, after the
-  chunks, from then on. The split stops after two single-card calls in a row
-  failed (only a call that decides resets the count). The summary and
-  `status().counters` count `splitCallsOk` / `splitCallsFailed`; a
-  single-card call's `gate_chunk` event has `split: true` and its
-  `conversationId`.
+  chunks, from then on. After two single-card calls in a row failed with
+  nothing decided in the cycle, the split goes on only if `checkRuntime`
+  passes; otherwise it stops (a `split_stopped` event, `splitStopped` in the
+  summary). The summary and `status().counters` count `splitCallsOk` /
+  `splitCallsFailed`; a single-card call's `gate_chunk` event has
+  `split: true` and its `conversationId`.
 
 ## 1.4.0 — 2026-11-17
 

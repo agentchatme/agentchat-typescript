@@ -18,9 +18,9 @@
  *   closed is gated again alone, one call per card, in the same cycle, before
  *   any turn starts, so one card the model cannot handle fails only its own
  *   call; a card whose last gate call failed is gated alone, after the
- *   others, from then on. The split stops after two single-card calls in a
- *   row failed (only a call that decides resets the count, whatever the
- *   evidence: a provider outage must not read as every card's failure).
+ *   others, from then on. After two single-card calls in a row failed with
+ *   nothing decided in the cycle, the split goes on only if `checkRuntime()`
+ *   passes; otherwise it stops (`split_stopped`).
  * - `singleRun` (Claude Code, Codex, routines, a listener): the loop records
  *   nothing for cards; the run reads them and records its own verdicts.
  *   - Conversation runs, whenever the served texts carry
@@ -34,10 +34,11 @@
  *     cycles while it runs or waits. After a completed run that left its card
  *     at the same anchor, that card is paced as a silent turn is. Cards whose
  *     last run failed go after the others (and after the invite run).
+ *     A tray that cannot be read starts no run (`tray_failed`): one run for
+ *     the tray would put every conversation back in one run.
  *   - Texts without the template (an older server): when anything is owed,
  *     one run with the served wake text for the whole tray (`kind: 'tray'`).
- *     A tray that cannot be read starts that run too (in conversation-run
- *     mode only when no run is under way).
+ *     A tray that cannot be read starts that run too.
  *   An invite still pending and undismissed after two completed runs is
  *   dismissed (seen, left pending, not shown again), so an ignored invite
  *   does not cost a run on every wake; the count is in memory only
@@ -46,12 +47,18 @@
  * Could not process (both modes): when a conversation's run, its reply turn
  * or its single-card gate call fails or times out, the loop reports it
  * (`client.conversations.reportProcessingFailure`) only with evidence that
- * the runtime otherwise works: another run, turn or gate call in this loop
- * completed after the failed one started, or `checkRuntime()` passes. A
- * failure with neither waits in memory for the next completion (at most
- * `AWAITING_EVIDENCE_MS`, 10 min); one whose runtime check fails is dropped
- * (a broken runtime reports nothing: that is the integration's runs-failing
- * path, and the server's re-wakes). The conversation stays held (no other
+ * the runtime otherwise works: (a) a later completion of the same kind of
+ * work (a gate call for a gate call, a turn for a turn, a run for a run) for
+ * a different conversation, after the failed one started; or (b)
+ * `checkRuntime()` passes while no other conversation of that kind has
+ * failed since that kind last completed (several failing together is the
+ * runtime). A completion on the failing conversation's own card is never
+ * evidence. The failure waits first: the work already queued runs (cheap
+ * evidence), and the runtime check is asked only once nothing of that kind
+ * is queued. It waits at most `AWAITING_EVIDENCE_MS` (10 min); one whose
+ * runtime check fails is dropped (a broken runtime reports nothing: that is
+ * the integration's runs-failing path, and the server's re-wakes). A
+ * failure reported as its attempt ends keeps its conversation held (no other
  * cycle starts it) until the server has answered. A run or
  * turn that answered, or recorded a verdict, before it failed (read on a
  * fresh tray) is not a failure, nor is one `stop()` cut short. The report
@@ -163,19 +170,21 @@ const RECENT_CYCLES = 20
  */
 export const MAX_RERUNS_PER_CYCLE = 3
 /**
- * gateCall: after a chunk fails closed its cards are gated one per call. The
- * split stops after this many single-card calls in a row failed (only a call
- * that decides resets the count; the model may be down): the rest stay
- * undecided and the server wakes again.
+ * gateCall: after a chunk fails closed its cards are gated one per call.
+ * When this many single-card calls in a row have failed and nothing in the
+ * cycle has been decided, the split goes on only if `checkRuntime()` passes;
+ * otherwise it stops (`split_stopped`): the rest stay undecided and the
+ * server wakes again.
  */
 export const SPLIT_STOP_AFTER_FAILURES = 2
 /** `checkRuntime()`'s deadline: past it the check counts as not ok. */
 export const RUNTIME_CHECK_TIMEOUT_MS = 60_000
 /**
- * How long a failure waits for evidence (another run, turn or gate call
- * completing). A completion much later says little about the runtime when it
- * failed (an outage that has since ended): past this the failure is dropped,
- * and the conversation's next attempt starts afresh.
+ * How long a failure waits for evidence (the same kind of work completing
+ * for another conversation; one run can take this long). A completion much
+ * later says little about the runtime when it failed (an outage that has
+ * since ended): past this the failure is dropped, and the conversation's next
+ * attempt starts afresh.
  */
 export const AWAITING_EVIDENCE_MS = 10 * 60_000
 /** Completions the evidence clock remembers. */
@@ -281,10 +290,11 @@ export type RunStarter = (request: RunRequest) => Promise<RunEnd>
 
 /**
  * Whether the agent's AI answers right now (a minimal model call with no peer
- * content, through the same account), asked after a conversation's run, turn
- * or gate call failed when no other one has completed since: `ok` is the
- * evidence a could-not-process report needs. A version check alone is not
- * enough: it passes during a provider outage.
+ * content, through the same account), asked about a failed conversation run,
+ * turn or gate call once nothing else of that kind is queued: `ok` is the
+ * evidence a could-not-process report needs, when no other conversation of
+ * that kind is failing too. A version check alone is not enough: it passes
+ * during a provider outage.
  */
 export type RuntimeCheck = () => Promise<{ readonly ok: boolean; readonly detail?: string }>
 
@@ -377,6 +387,12 @@ export interface CycleSummary {
   readonly splitCallsOk: number
   /** gateCall: those single-card calls that failed closed. */
   readonly splitCallsFailed: number
+  /**
+   * gateCall: the split stopped (`split_stopped`): single-card calls kept
+   * failing with nothing decided in the cycle, and `checkRuntime()` did not
+   * pass (or there is none). The cards not reached stay undecided.
+   */
+  readonly splitStopped: boolean
   readonly truncated: boolean
   /**
    * Why the cycle could not finish, or, when some gate chunks failed, how
@@ -474,6 +490,18 @@ export type ReceiveLoopEvent =
     }
   /** A could-not-process report was made (or failed) for one conversation. */
   | ({ readonly type: 'processing_failure' } & ProcessingFailureReport)
+  /**
+   * gateCall: the split stopped. Single-card calls failed `SPLIT_STOP_AFTER_FAILURES`
+   * times in a row with nothing decided in the cycle, and `checkRuntime()`
+   * did not pass (`runtime_check_failed`) or there is none (`no_runtime_check`).
+   */
+  | {
+      readonly type: 'split_stopped'
+      readonly cycle: number
+      /** Cards left in the split's queue, undecided. */
+      readonly remaining: number
+      readonly reason: 'runtime_check_failed' | 'no_runtime_check'
+    }
   | { readonly type: 'error'; readonly error: Error }
 
 export interface ReceiveLoopSocketOptions {
@@ -518,15 +546,18 @@ export interface ReceiveLoopOptions {
    */
   readonly conversationRuns?: boolean
   /**
-   * Whether the runtime works right now (both modes). Asked after a
-   * conversation's run, reply turn or single-card gate call failed when no
-   * other one in this loop has completed since it started; `ok` is the
-   * evidence a could-not-process report needs (`runtime_check`). It must
-   * show that the agent's AI answers now (a minimal model call with no peer
-   * content, through the same account), not only that a binary is
-   * installed: an `ok` during a provider outage would report the outage as
-   * the conversation's failure. Without it, a failure is reported only once
-   * another run, turn or gate call completes (within `AWAITING_EVIDENCE_MS`).
+   * Whether the runtime works right now (both modes). Asked about a
+   * conversation's failed run, reply turn or single-card gate call once
+   * nothing else of that kind is queued, and only when no other conversation
+   * of that kind has failed since that kind last completed; `ok` is the
+   * evidence a could-not-process report needs (`runtime_check`). Also the
+   * gate split's guard: after two single-card calls in a row failed with
+   * nothing decided, the split goes on only if it passes. It must show that
+   * the agent's AI answers now (a minimal model call with no peer content,
+   * through the same account), not only that a binary is installed: an `ok`
+   * during a provider outage would report the outage as the conversation's
+   * failure. Without it, a failure is reported only once the same kind of
+   * work completes for another conversation (within `AWAITING_EVIDENCE_MS`).
    * Bounded by `RUNTIME_CHECK_TIMEOUT_MS`; a throw counts as not ok.
    */
   readonly checkRuntime?: RuntimeCheck
@@ -659,6 +690,8 @@ export interface ReceiveLoopStatus {
     readonly awaitingEvidence: number
     readonly runtimeChecksOk: number
     readonly runtimeChecksFailed: number
+    /** Gate splits stopped (`split_stopped`), since start. */
+    readonly splitsStopped: number
     /** The last `checkRuntime()` answer, or null. */
     readonly lastRuntimeCheck: { readonly at: string; readonly ok: boolean; readonly detail: string | null } | null
   }
@@ -722,10 +755,26 @@ function clears(completion: Completion, failure: Pick<Failure, 'conversationId' 
 }
 
 /**
+ * Evidence (a) that the runtime otherwise works, for one failure: a
+ * completion of the same kind of work (a gate call for a gate call, a turn
+ * for a turn, a run for a run) for a different conversation, after the
+ * failed attempt started. A completion that includes the failing
+ * conversation's own card is never evidence (of the same kind it clears the
+ * failure instead); an invite's completion is no conversation's.
+ */
+function evidences(completion: Completion, failure: Pick<Failure, 'conversationId' | 'source' | 'startedAt'>): boolean {
+  return (
+    completion.kind === failure.source &&
+    completion.at > failure.startedAt &&
+    completion.conversations.size > 0 &&
+    !completion.conversations.has(failure.conversationId)
+  )
+}
+
+/**
  * Could not process: the order of attempts and completions in this loop,
  * clock-free. Every attempt's start and every completion takes the next
- * number. A completion is evidence that the runtime works, for a failure
- * whose attempt started before it, unless it clears that failure (`clears`).
+ * number (`evidences` reads them).
  */
 class EvidenceClock {
   private last = 0
@@ -742,9 +791,9 @@ class EvidenceClock {
     return entry
   }
 
-  /** A completion since the failed attempt started that is evidence for it. */
+  /** A completion since the failed attempt started that is evidence for it (`evidences`). */
   since(failure: Pick<Failure, 'startedAt' | 'conversationId' | 'source'>): boolean {
-    return this.completions.some((c) => c.at > failure.startedAt && !clears(c, failure))
+    return this.completions.some((c) => evidences(c, failure))
   }
 }
 
@@ -775,8 +824,6 @@ interface Failure extends Attempt {
   readonly holding?: TurnHandle
 }
 
-/** What a failure says about the runtime: it works (evidence), it is broken (its check failed), or not known yet. */
-type RuntimeState = 'works' | 'broken' | 'unknown'
 
 /** gateCall: one card waiting for a single-card gate call in this cycle. */
 interface SplitItem {
@@ -802,6 +849,7 @@ interface ChunkedGate {
   chunks: GateChunkReport[]
   /** The single-card calls after them. */
   split: GateChunkReport[]
+  splitStopped: boolean
 }
 
 export class ReceiveLoop {
@@ -829,6 +877,14 @@ export class ReceiveLoop {
   private readonly evidence = new EvidenceClock()
   /** Could not process: failures waiting for a completion (the evidence a report needs), by conversation. */
   private readonly awaitingEvidence = new Map<string, Failure>()
+  /** Waiting failures the runtime check has already been asked about (once each). */
+  private readonly checkedFailures = new WeakSet<Failure>()
+  /**
+   * Per kind of work, the conversations whose attempt failed since that kind
+   * last completed. Two or more: several failing together is the runtime, so
+   * a passing `checkRuntime()` is no evidence for any of them.
+   */
+  private readonly failingSince: Record<FailureSource, Set<string>> = { gate: new Set(), turn: new Set(), run: new Set() }
   /** gateCall: conversations whose last gate call failed; gated alone, after the others. */
   private readonly gateAlone = new Set<string>()
   /**
@@ -861,6 +917,7 @@ export class ReceiveLoop {
     rerunsCapped: 0,
     runtimeChecksOk: 0,
     runtimeChecksFailed: 0,
+    splitsStopped: 0,
   }
   /** Conversations whose verdict a gate call is recording right now (an abandoned cycle's included). */
   private readonly recordsInFlight = new Set<string>()
@@ -1182,6 +1239,8 @@ export class ReceiveLoop {
       if (!run.abandoned()) this.finishCycle(summary)
       // Reply turns the server's answers asked for while the gate ran: after this cycle's own.
       this.flushTurnReruns()
+      // A cycle that queued nothing more: the runtime check for a failure still waiting.
+      void this.track(this.checkParked(this.options.mode === 'gateCall' ? 'turn' : 'run'))
     })()
     let timer: TimerHandle | null = null
     const overdue = new Promise<'overdue'>((resolve) => {
@@ -1373,6 +1432,7 @@ export class ReceiveLoop {
       splitCallsFailed: 0,
     }
     let heldDuringGate = 0
+    let splitStopped = false
     let outcome: CycleOutcome = 'invites_only'
     let failure: string | null = null
     if (owedCards.length > 0) {
@@ -1389,6 +1449,7 @@ export class ReceiveLoop {
       tally.chunksFailed = gate.chunks.length - tally.chunksOk
       tally.splitCallsOk = gate.split.filter((c) => c.outcome === 'decided').length
       tally.splitCallsFailed = gate.split.length - tally.splitCallsOk
+      splitStopped = gate.splitStopped
       failure = gateFailureText(gate.chunks, gate.split)
       if (tally.chunksOk + tally.splitCallsOk > 0) {
         outcome = 'decided'
@@ -1412,7 +1473,7 @@ export class ReceiveLoop {
       if (run.stale()) break
       tally[launchKey(await run.exclude(() => this.startInviteTurn(invite, texts)))] += 1
     }
-    const parts = { ...base, heldByTurns: heldByTurns + heldDuringGate, ...tally }
+    const parts = { ...base, heldByTurns: heldByTurns + heldDuringGate, ...tally, splitStopped }
     // Stopped (or abandoned) part-way: what was done is still reported; the
     // reason is the stop itself, not a failure.
     if (run.stale()) return this.summary('abandoned', parts)
@@ -1450,11 +1511,12 @@ export class ReceiveLoop {
    * in tray order, before any turn starts, so one card the model cannot
    * handle fails only its own call. A card whose last gate call failed is
    * kept out of the chunks and gated alone after them. A single-card call that
-   * fails is the card's failure (reported with evidence; a `retry` or `hidden`
-   * answer gates it once more at the end of the queue). The split stops after
-   * `SPLIT_STOP_AFTER_FAILURES` single-card calls in a row failed (only a
-   * call that decides resets the count), or once `checkRuntime()` says the
-   * runtime does not work.
+   * fails is the card's failure (reported with evidence; a `retry` answer
+   * gates it once more at the end of the queue). When the queue is empty, a
+   * failure still waiting gets the runtime check. After
+   * `SPLIT_STOP_AFTER_FAILURES` single-card calls in a row failed with nothing
+   * decided in the cycle, the split goes on only if `checkRuntime()` passes;
+   * otherwise it stops (`split_stopped`).
    */
   private async gateInChunks(run: CycleRun, tray: InboxTray, cards: readonly InboxCard[], texts: Texts): Promise<ChunkedGate> {
     const size = this.gateChunkSize
@@ -1469,6 +1531,7 @@ export class ReceiveLoop {
       recordFailures: 0,
       chunks: [],
       split: [],
+      splitStopped: false,
     }
     // Each card counts once: gated when a call that was not cut short carried
     // it, decided when a call gave it a usable verdict (one that was recorded,
@@ -1557,8 +1620,11 @@ export class ReceiveLoop {
           const through = decidedBy(result)
           for (const id of through) this.gateAlone.delete(id)
           await run.exclude(() => this.reportDue(this.completed('gate', through)))
-        } else if (chunk.length === 1) {
-          // A single-card call: the card's own failure.
+          continue
+        }
+        this.failedAttempt('gate', chunk.filter((card) => card.muted !== true).map((card) => card.conversation_id))
+        if (chunk.length === 1) {
+          // A single-card call: the card's own failure (waits; checked once no gate call is queued).
           this.rememberGateAlone(chunk[0]!.conversation_id)
           await run.exclude(() => this.failed(gateFailure(chunk[0]!, startedAt, 0, timedOut.value, this.now())))
         } else {
@@ -1572,53 +1638,73 @@ export class ReceiveLoop {
 
       let index = 0
       let failuresInARow = 0
-      while (queue.length > 0) {
+      splitting: for (;;) {
+        while (queue.length > 0) {
+          if (run.stale()) break splitting
+          const { card, reruns } = queue.shift()!
+          const id = card.conversation_id
+          if (decided.has(id) || split.skip.has(id)) continue
+          if (this.unheld([card]).length === 0) {
+            if (!gated.has(id)) out.held += 1
+            this.heldWhileRunning = true
+            continue
+          }
+          index += 1
+          const startedAt = this.evidence.start()
+          const timedOut = { value: false }
+          const result = await gateOne(card, timedOut)
+          if (run.abandoned()) break splitting
+          if (run.stale() && result.outcome !== 'decided') break splitting
+          take(result, [card])
+          const report: GateChunkReport = {
+            cycle: run.token,
+            index,
+            of: index + queue.length,
+            cards: 1,
+            outcome: result.outcome === 'decided' ? 'decided' : 'fail_closed',
+            undecided: result.undecided.length,
+            failure: result.failure,
+            split: true,
+            conversationId: id,
+          }
+          out.split.push(report)
+          if (report.outcome === 'decided') this.counts.splitCallsOk += 1
+          else this.counts.splitCallsFailed += 1
+          this.emit({ type: 'gate_chunk', ...report })
+          if (report.outcome === 'decided') {
+            failuresInARow = 0
+            this.gateAlone.delete(id)
+            await run.exclude(() => this.reportDue(this.completed('gate', decidedBy(result))))
+            continue
+          }
+          this.rememberGateAlone(id)
+          this.failedAttempt('gate', [id])
+          await run.exclude(() => this.failed(gateFailure(card, startedAt, reruns, timedOut.value, this.now())))
+          failuresInARow += 1
+          // Single-card calls keep failing and nothing in the cycle was decided:
+          // the model may be down. Go on only if the runtime's own check passes.
+          if (failuresInARow >= SPLIT_STOP_AFTER_FAILURES && decided.size === 0) {
+            const ok = this.options.checkRuntime ? await run.exclude(() => this.runtimeCheck()) : false
+            if (run.stale()) break splitting
+            if (!ok) {
+              out.splitStopped = true
+              this.failureCounts.splitsStopped += 1
+              this.emit({
+                type: 'split_stopped',
+                cycle: run.token,
+                remaining: queue.filter((item) => !decided.has(item.card.conversation_id)).length,
+                reason: this.options.checkRuntime ? 'runtime_check_failed' : 'no_runtime_check',
+              })
+              break splitting
+            }
+            failuresInARow = 0
+          }
+        }
+        // No gate call left in this cycle: the runtime check for a waiting
+        // gate failure, which may queue its card again (`retry`).
         if (run.stale()) break
-        const { card, reruns } = queue.shift()!
-        const id = card.conversation_id
-        if (decided.has(id) || split.skip.has(id)) continue
-        if (this.unheld([card]).length === 0) {
-          if (!gated.has(id)) out.held += 1
-          this.heldWhileRunning = true
-          continue
-        }
-        index += 1
-        const startedAt = this.evidence.start()
-        const timedOut = { value: false }
-        const result = await gateOne(card, timedOut)
-        if (run.abandoned()) break
-        if (run.stale() && result.outcome !== 'decided') break
-        take(result, [card])
-        const report: GateChunkReport = {
-          cycle: run.token,
-          index,
-          of: index + queue.length,
-          cards: 1,
-          outcome: result.outcome === 'decided' ? 'decided' : 'fail_closed',
-          undecided: result.undecided.length,
-          failure: result.failure,
-          split: true,
-          conversationId: id,
-        }
-        out.split.push(report)
-        if (report.outcome === 'decided') this.counts.splitCallsOk += 1
-        else this.counts.splitCallsFailed += 1
-        this.emit({ type: 'gate_chunk', ...report })
-        if (report.outcome === 'decided') {
-          failuresInARow = 0
-          this.gateAlone.delete(id)
-          await run.exclude(() => this.reportDue(this.completed('gate', decidedBy(result))))
-          continue
-        }
-        this.rememberGateAlone(id)
-        const runtime = await run.exclude(() => this.failed(gateFailure(card, startedAt, reruns, timedOut.value, this.now())))
-        // The runtime's own check failed: the model is down, not the cards.
-        if (runtime === 'broken') break
-        // Only a call that decided resets the count: single-card calls that
-        // keep failing look like the model, whatever a check says (a provider
-        // outage must never read as every card's failure).
-        failuresInARow += 1
-        if (failuresInARow >= SPLIT_STOP_AFTER_FAILURES) break
+        await run.exclude(() => this.checkParked('gate'))
+        if (queue.length === 0) break
       }
     } finally {
       if (this.activeSplit === split) this.activeSplit = null
@@ -1676,19 +1762,19 @@ export class ReceiveLoop {
     const texts = await this.options.texts.ensure()
     if (run.stale()) return this.summary('abandoned', base)
     if (texts === null) return this.summary('texts_missing', { ...base, failure: 'the served texts are not available' })
-    const conversationRuns = this.options.conversationRuns !== false && conversationRunTemplate(texts) !== null
-    // Conversation runs decide what is owed first (a notices-only card is not), then check readiness.
-    if (conversationRuns && tray !== null) return this.conversationRunCycle(run, tray, texts)
+    if (this.options.conversationRuns !== false && conversationRunTemplate(texts) !== null) {
+      // Conversation runs decide what is owed first (a notices-only card is not), then check readiness.
+      if (tray !== null) return this.conversationRunCycle(run, tray, texts)
+      // The tray could not be read: no run. One run for the tray would put
+      // every conversation back in one run, which the walls exist to prevent.
+      // Runs under way read it again when they end; the server re-wakes.
+      if (this.runWork.size > 0 || this.waiting.length > 0) this.heldWhileRunning = true
+      return this.summary('tray_failed', { ...base, failure: this.lastError })
+    }
     const unready = await this.checkReady()
     if (run.stale()) return this.summary('abandoned', base)
     if (unready !== null) return this.summary('tools_unavailable', { ...base, failure: unready })
 
-    // The tray could not be read. While conversation runs are under way their
-    // ends read it again; with none, one run for the tray, as without the template.
-    if (conversationRuns && (this.runWork.size > 0 || this.waiting.length > 0)) {
-      this.heldWhileRunning = true
-      return this.summary('tray_failed', { ...base, failure: this.lastError })
-    }
 
     const prompt =
       cards === 0 && (invites ?? 0) > 0
@@ -1804,6 +1890,7 @@ export class ReceiveLoop {
         // `unanswered` wake lifts it.
         this.pacer.hold(`conversation:${attempt.conversationId}`, attempt.anchor)
       } else if (end.status === 'failed' && !this.stopped) {
+        this.failedAttempt('run', [attempt.conversationId])
         // A run that answered, or recorded a verdict, before it failed did not
         // fail on this conversation: only an untouched card is a failure.
         if (untouched(attempt.card, await this.readTray())) {
@@ -1826,6 +1913,8 @@ export class ReceiveLoop {
       }
     }
     if (!this.stopped && completion !== null) await this.reportDue(completion)
+    // The last run of the queue has ended: the runtime check for a failure still waiting.
+    await this.checkParked('run')
   }
 
   /** The invite run: one run for the pending invites, holding each of them until it ends. */
@@ -1883,6 +1972,7 @@ export class ReceiveLoop {
       this.afterTurnEnded()
     }
     if (!this.stopped && completion !== null) await this.reportDue(completion)
+    await this.checkParked('run')
   }
 
   /** The runtime's `startRun`, never rejecting: a throw is a run that did not start. */
@@ -2034,6 +2124,7 @@ export class ReceiveLoop {
       if (end.status === 'completed') completion = this.completed('turn', [reply.conversationId])
       // Recorded also when the turn ends after stop(): what it did is a fact.
       const recorded = await this.track(this.recordReplyOutcome(handle, reply, end))
+      if (end.status === 'failed' && !this.stopped) this.failedAttempt('turn', [reply.conversationId])
       // A failed turn that left its card untouched (read on a fresh tray) is
       // the conversation's failure. One that answered or recorded a verdict
       // before it failed is not.
@@ -2056,6 +2147,8 @@ export class ReceiveLoop {
       }
     }
     if (!this.stopped && completion !== null) await this.track(this.reportDue(completion))
+    // The last turn of the queue has ended: the runtime check for a failure still waiting.
+    await this.track(this.checkParked('turn'))
   }
 
   private async recordReplyOutcome(
@@ -2190,6 +2283,7 @@ export class ReceiveLoop {
    */
   private completed(kind: CompletionKind, conversations: readonly string[]): Completion {
     const completion = this.evidence.complete(kind, conversations)
+    if (kind !== 'invite') this.failingSince[kind].clear()
     for (const id of conversations) {
       const failure = this.awaitingEvidence.get(id)
       if (failure !== undefined && clears(completion, failure)) this.awaitingEvidence.delete(id)
@@ -2210,7 +2304,7 @@ export class ReceiveLoop {
         this.awaitingEvidence.delete(failure.conversationId)
         continue
       }
-      if (failure.startedAt < completion.at && !clears(completion, failure)) {
+      if (evidences(completion, failure)) {
         this.awaitingEvidence.delete(failure.conversationId)
         due.push(failure)
       }
@@ -2218,43 +2312,84 @@ export class ReceiveLoop {
     for (const failure of due) await this.reportFailure(failure, 'other_run_completed')
   }
 
+  /** An attempt of this kind failed for these conversations (whatever comes of it): see `failingSince`. */
+  private failedAttempt(kind: FailureSource, conversations: readonly string[]): void {
+    for (const id of conversations) this.failingSince[kind].add(id)
+  }
+
   /**
-   * A conversation's run, reply turn or single-card gate call failed. Reported
-   * only with evidence that the runtime otherwise works: another run, turn or
-   * gate call in this loop completed since it started, or `checkRuntime()`
-   * passes now. Without either it waits for the next completion; when the
-   * runtime's own check fails it is dropped (a broken runtime is the existing
-   * runs-failing path, not this conversation's fault). Nothing is reported
-   * after `stop()`: a run the stop cut short did not fail on its conversation.
+   * A conversation's run, reply turn or single-card gate call failed. It is
+   * reported only with evidence that the runtime otherwise works:
+   * (a) a later completion of the same kind of work for another conversation
+   * (`evidences`), or (b) `checkRuntime()` passing while no other
+   * conversation of that kind has failed since that kind last completed.
+   * Without (a) it waits: the work already queued runs first (cheap
+   * evidence), and the runtime check is asked only once nothing of that kind
+   * is queued (`checkParked`). It waits at most `AWAITING_EVIDENCE_MS`.
+   * Nothing is reported after `stop()`: a run the stop cut short did not
+   * fail on its conversation.
    */
-  private async failed(failure: Failure): Promise<RuntimeState> {
-    if (this.stopped) return 'unknown'
+  private async failed(failure: Failure): Promise<void> {
+    if (this.stopped) return
     // The newest failure of a conversation stands for it: never two reports for one failure.
     this.awaitingEvidence.delete(failure.conversationId)
     if (this.evidence.since(failure)) {
       await this.reportFailure(failure, 'other_run_completed')
-      return 'works'
+      return
     }
-    // Nothing to report (an older client, a card with no anchor): no check either.
-    if (!this.canReport(failure)) return 'unknown'
-    if (this.options.checkRuntime) {
-      const ok = await this.runtimeCheck()
-      if (this.stopped) return 'unknown'
-      if (ok) {
-        await this.reportFailure(failure, 'runtime_check')
-        return 'works'
-      }
-      return 'broken'
-    }
-    // Waits for the next completion; the tracker entry it held is let go by its owner.
-    const { holding: _holding, ...waiting } = failure
-    this.awaitingEvidence.set(failure.conversationId, waiting)
+    // Nothing to report (an older client, a card with no anchor): nothing kept, no check.
+    if (!this.canReport(failure)) return
+    // It keeps `holding`: a re-run on a later answer ends it first (a no-op once its owner has).
+    this.awaitingEvidence.set(failure.conversationId, failure)
     while (this.awaitingEvidence.size > SILENT_MEMORY) {
       const oldest = this.awaitingEvidence.keys().next().value
       if (oldest === undefined) break
       this.awaitingEvidence.delete(oldest)
     }
-    return 'unknown'
+    // A gate failure is checked when the cycle's gate calls are done (the split's end).
+    if (failure.source !== 'gate') await this.checkParked(failure.source)
+  }
+
+  /**
+   * Evidence (b), once nothing of this kind is queued: ask `checkRuntime()`
+   * about the failure still waiting for evidence, if it is the only
+   * conversation of that kind failing since that kind last completed. Several
+   * failing together is the runtime: none of them is reported on (b), and
+   * they keep waiting for (a). Each failure is asked about once. A check that
+   * fails drops it (a broken runtime reports nothing).
+   */
+  private async checkParked(kind: FailureSource): Promise<void> {
+    if (!this.options.checkRuntime || this.stopped || !this.idleFor(kind)) return
+    const failing = this.failingSince[kind]
+    const due = [...this.awaitingEvidence.values()].filter(
+      (failure) =>
+        failure.source === kind &&
+        !this.checkedFailures.has(failure) &&
+        this.now() - failure.failedAt <= AWAITING_EVIDENCE_MS &&
+        [...failing].every((id) => id === failure.conversationId),
+    )
+    if (due.length === 0) return
+    for (const failure of due) this.checkedFailures.add(failure)
+    const ok = await this.runtimeCheck()
+    for (const failure of due) {
+      // Done with meanwhile (evidence came, a newer failure replaced it, the loop stopped)?
+      if (this.stopped || this.awaitingEvidence.get(failure.conversationId) !== failure) continue
+      if (!ok) {
+        this.awaitingEvidence.delete(failure.conversationId)
+        continue
+      }
+      // Another conversation of that kind failed while the check ran: the runtime; it waits for (a).
+      if (![...failing].every((id) => id === failure.conversationId)) continue
+      this.awaitingEvidence.delete(failure.conversationId)
+      await this.reportFailure(failure, 'runtime_check')
+    }
+  }
+
+  /** Nothing of this kind is running or queued: the runtime check may be asked now. */
+  private idleFor(kind: FailureSource): boolean {
+    if (kind === 'gate') return this.activeSplit === null || this.activeSplit.queue.length === 0
+    if (kind === 'turn' && this.activeSplit !== null) return false
+    return this.activeTurns === 0 && this.waiting.length === 0
   }
 
   private canReport(failure: Failure): boolean {
@@ -2460,6 +2595,7 @@ export class ReceiveLoop {
       chunksFailed: 0,
       splitCallsOk: 0,
       splitCallsFailed: 0,
+      splitStopped: false,
       truncated: false,
       failure: null,
       ...parts,

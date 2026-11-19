@@ -1401,7 +1401,7 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
     expect(() => gateLoop({ client, gateChunkSize: 0 })).toThrow('ReceiveLoop: gateChunkSize must be an integer from 1 to 50')
   })
 
-  it('every chunk fails: fail_closed, nothing recorded; the split stops after two single-card calls fail in a row (the model may be down)', async () => {
+  it('every chunk fails: fail_closed, nothing recorded; with nothing decided and no runtime check, the split stops after two single-card failures in a row', async () => {
     const { client, state, record } = fakeClient()
     state.tray = trayOf(cardsUpTo(15))
     const callModel = vi.fn(async () => 'I would dismiss most of these.')
@@ -1419,6 +1419,8 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
       chunksFailed: 2,
       splitCallsOk: 0,
       splitCallsFailed: 2,
+      // Nothing decided and no runtime check to say the model works: the split stops.
+      splitStopped: true,
       failure:
         '2 of 2 gate chunks failed; chunk 1: no usable verdicts in the answer; 2 of 2 single-card calls failed; conv_chunk00: no usable verdicts in the answer',
     })

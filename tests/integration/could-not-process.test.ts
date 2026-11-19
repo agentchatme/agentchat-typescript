@@ -253,6 +253,18 @@ describe('conversation runs (single-run mode, texts with conversation_run_templa
     await tray.loop.stop()
   })
 
+  it('a tray that cannot be read starts no run (tray_failed): one run for the tray would undo the walls', async () => {
+    const { client, state } = fakeClient()
+    state.tray = new Error('timeout')
+    const r = runs()
+    const { loop } = runLoop({ client, startRun: r.startRun })
+    loop.wake()
+    await until(() => loop.status().lastCycle !== null)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'tray_failed', failure: 'timeout' })
+    expect(r.started).toHaveLength(0)
+    await loop.stop()
+  })
+
   it('maxConcurrentTurns: 2 runs two conversations at once', async () => {
     const { client, state } = fakeClient()
     state.tray = trayOf([A, B, P])
@@ -388,7 +400,7 @@ describe('could not process: the report (conversation runs)', () => {
     await loop.stop()
   })
 
-  it('retry, then hidden, then the run goes through: each re-run after the runs already queued', async () => {
+  it('retry, then hidden, then the run goes through: the queued run is the evidence first, the runtime check (nothing queued) next', async () => {
     const { client, state, report } = fakeClient([answer('retry'), answer('hidden', { attempts: 2, hidden_message_ids: ['msg_poison03'] })])
     state.tray = trayOf([P, A])
     const r = runs()
@@ -396,16 +408,18 @@ describe('could not process: the report (conversation runs)', () => {
     const { loop } = runLoop({ client, startRun: r.startRun, checkRuntime })
     loop.wake()
     await until(() => r.started.length === 1)
-    r.ends[0]!({ status: 'failed' }) // P, 1st
-    await until(() => report.mock.calls.length === 1)
-    expect(report.mock.calls[0]![1]).toEqual({ throughMessageId: 'msg_poison03', outcome: 'failed', evidence: 'runtime_check' })
-    // retry: P goes again, after A (already queued).
+    r.ends[0]!({ status: 'failed' }) // P, 1st: A is queued, so the failure waits for it (no runtime check yet)
     await until(() => r.started.length === 2)
     expect(r.started[1]!.conversationId).toBe(A.conversation_id)
-    r.ends[1]!({ status: 'completed' })
+    expect(checkRuntime).not.toHaveBeenCalled()
+    expect(report).not.toHaveBeenCalled()
+    r.ends[1]!({ status: 'completed' }) // A completes after P started: evidence (a)
+    await until(() => report.mock.calls.length === 1)
+    expect(report.mock.calls[0]![1]).toEqual({ throughMessageId: 'msg_poison03', outcome: 'failed', evidence: 'other_run_completed' })
+    // retry: P goes again.
     await until(() => r.started.length === 3)
     expect(r.started[2]!.conversationId).toBe(P.conversation_id)
-    r.ends[2]!({ status: 'failed', timedOut: true }) // P, 2nd: past its time limit
+    r.ends[2]!({ status: 'failed', timedOut: true }) // P, 2nd: nothing else queued, only P failing: the runtime check
     await until(() => report.mock.calls.length === 2)
     expect(report.mock.calls[1]![1]).toEqual({ throughMessageId: 'msg_poison03', outcome: 'timed_out', evidence: 'runtime_check' })
     await until(() => r.started.length === 4)
@@ -413,8 +427,42 @@ describe('could not process: the report (conversation runs)', () => {
     r.ends[3]!({ status: 'completed' }) // P, 3rd: around the hidden span
     await loop.idle()
     expect(r.ids()).toEqual([P.conversation_id, A.conversation_id, P.conversation_id, P.conversation_id])
-    expect(loop.status().processingFailures).toMatchObject({ reported: 2, retry: 1, hidden: 1, reruns: 2, runtimeChecksOk: 2 })
+    expect(checkRuntime).toHaveBeenCalledTimes(1)
+    expect(loop.status().processingFailures).toMatchObject({ reported: 2, retry: 1, hidden: 1, reruns: 2, runtimeChecksOk: 1 })
     expect(loop.status().processingFailures.lastRuntimeCheck).toMatchObject({ ok: true, detail: null })
+    await loop.stop()
+  })
+
+  it('several conversations failing together is the runtime: a passing runtime check reports none of them', async () => {
+    const { client, state, report } = fakeClient()
+    state.tray = trayOf([P, A])
+    const checkRuntime = vi.fn(async () => ({ ok: true }))
+    const startRun = vi.fn(async (): Promise<RunEnd> => ({ status: 'failed', detail: 'the provider is down' }))
+    const { loop } = runLoop({ client, startRun, checkRuntime })
+    loop.wake()
+    await until(() => startRun.mock.calls.length === 2)
+    await loop.idle()
+    expect(report).not.toHaveBeenCalled()
+    expect(checkRuntime).not.toHaveBeenCalled()
+    // Both still wait for evidence (a): a later completion of another conversation's run.
+    expect(loop.status().processingFailures.awaitingEvidence).toBe(2)
+    await loop.stop()
+  })
+
+  it('only a completion of the same kind of work counts: an invite run completing is no evidence for a conversation run', async () => {
+    const { client, state, report } = fakeClient()
+    state.tray = trayOf([P], { invites: [INVITE] })
+    const r = runs()
+    const { loop } = runLoop({ client, startRun: r.startRun })
+    loop.wake()
+    await until(() => r.started.length === 1)
+    r.ends[0]!({ status: 'failed' }) // P
+    await until(() => r.started.length === 2)
+    expect(r.started[1]!.kind).toBe('invite')
+    r.ends[1]!({ status: 'completed' })
+    await loop.idle()
+    expect(report).not.toHaveBeenCalled()
+    expect(loop.status().processingFailures.awaitingEvidence).toBe(1)
     await loop.stop()
   })
 
@@ -544,17 +592,21 @@ describe('could not process: the report (conversation runs)', () => {
     const { client, state, report } = fakeClient([new Error('network down')])
     state.tray = trayOf([P, A])
     const r = runs()
-    const { loop, events } = runLoop({ client, startRun: r.startRun, checkRuntime: async () => ({ ok: true }) })
+    const { loop, events } = runLoop({ client, startRun: r.startRun })
     loop.wake()
     await until(() => r.started.length === 1)
     r.ends[0]!({ status: 'failed' })
-    await until(() => report.mock.calls.length === 1)
     await until(() => r.started.length === 2)
-    r.ends[1]!({ status: 'completed' })
+    r.ends[1]!({ status: 'completed' }) // the evidence: the report goes out, and fails
+    await until(() => report.mock.calls.length === 1)
     await loop.idle()
     expect(loop.status().processingFailures).toMatchObject({ reported: 0, reportErrors: 1 })
     expect(reportsIn(events)[0]).toMatchObject({ result: null, error: 'network down', next: 'stop' })
     expect(events.some((e) => e.type === 'error' && e.error.message === 'network down')).toBe(true)
+    // The loop goes on: the next wake runs.
+    loop.wake()
+    await until(() => r.started.length === 3)
+    r.ends[2]!({ status: 'completed' })
     await loop.stop()
   })
 
@@ -788,20 +840,35 @@ describe('could not process: the gate-chunk split (gate-call mode)', () => {
     await second.loop.stop()
   })
 
-  it('a runtime check that passes during a provider outage cannot keep the split going: two single-card failures in a row stop it', async () => {
-    const { client, state, report } = fakeClient([answer('retry'), answer('retry'), answer('retry')])
-    state.tray = trayOf([A, B, D])
-    const callModel = vi.fn(async () => {
-      throw new Error('503 from the provider')
-    })
-    const { loop } = gateLoop({ client, callModel, checkRuntime: async () => ({ ok: true }) })
-    loop.wake()
-    await until(() => loop.status().lastCycle !== null)
-    // The chunk, then A and B alone (each reported: the weak check said ok), then the split stops.
-    expect(callModel).toHaveBeenCalledTimes(3)
-    expect(report).toHaveBeenCalledTimes(2)
-    expect(loop.status().lastCycle).toMatchObject({ outcome: 'fail_closed', chunksFailed: 1, splitCallsFailed: 2 })
-    await loop.stop()
+  it('the split guard: two single-card failures in a row with nothing decided go on only while checkRuntime passes, else split_stopped; several failing together reports none', async () => {
+    const cards = [A, B, D, card('conv_echo000001', 'msg_echo0001')]
+    for (const checkOk of [true, false]) {
+      const { client, state, report } = fakeClient(Array.from({ length: 5 }, () => answer('retry')))
+      state.tray = trayOf(cards)
+      const callModel = vi.fn(async () => {
+        throw new Error('503 from the provider')
+      })
+      const checkRuntime = vi.fn(async () => ({ ok: checkOk }))
+      const { loop, events } = gateLoop({ client, callModel, checkRuntime })
+      loop.wake()
+      await until(() => loop.status().lastCycle !== null)
+      const stops = events.filter((e) => e.type === 'split_stopped')
+      if (checkOk) {
+        // The chunk, then all four alone (the check passed after two); nothing reported: all of them failing is the runtime.
+        expect(callModel).toHaveBeenCalledTimes(5)
+        expect(checkRuntime).toHaveBeenCalledTimes(2) // the guard after cards 1-2 and after cards 3-4
+        expect(stops).toEqual([])
+        expect(loop.status().lastCycle).toMatchObject({ outcome: 'fail_closed', splitCallsFailed: 4, splitStopped: false })
+      } else {
+        // The chunk, two alone, then the check fails: the split stops with two cards left.
+        expect(callModel).toHaveBeenCalledTimes(3)
+        expect(stops).toEqual([expect.objectContaining({ remaining: 2, reason: 'runtime_check_failed' })])
+        expect(loop.status().lastCycle).toMatchObject({ outcome: 'fail_closed', splitCallsFailed: 2, splitStopped: true })
+        expect(loop.status().processingFailures.splitsStopped).toBe(1)
+      }
+      expect(report).not.toHaveBeenCalled()
+      await loop.stop()
+    }
   })
 
   it('a gate failure from an earlier cycle answered retry mid-gate re-gates the card as this cycle read it, once', async () => {
@@ -868,37 +935,48 @@ describe('could not process: reply turns (gate-call mode)', () => {
     await loop.stop()
   })
 
-  it('a lone failing turn: the next cycle’s gate call on its card is the evidence; the gate’s own verdict starts the next turn (no duplicate)', async () => {
-    const { client, state, report } = fakeClient([answer('hidden', { attempts: 2, hidden_message_ids: ['msg_poison03'] })])
+  it('a gate call on the failing conversation’s own card is no evidence; with nothing else queued the runtime check is', async () => {
+    const { client, state, report } = fakeClient([answer('none')])
     state.tray = trayOf([P])
     const t = turns()
     const callModel = vi.fn(async (prompt: string) => allAs('reply', prompt))
-    const { loop, events } = gateLoop({ client, callModel, startTurn: t.startTurn })
+    const { loop } = gateLoop({ client, callModel, startTurn: t.startTurn })
     loop.wake()
     await until(() => t.started.length === 1)
     t.ends[0]!({ status: 'failed' })
     await until(() => loop.status().processingFailures.awaitingEvidence === 1, 'the failure waiting for evidence')
-    expect(report).not.toHaveBeenCalled()
-
-    // The server re-wakes: the gate decides P again; that call completing is the evidence for the turn's failure.
+    // The server re-wakes: the gate decides P again. Its own card: no evidence, no report; the gate's verdict starts the next turn.
     loop.wake()
     await until(() => t.started.length === 2)
-    expect(report.mock.calls[0]).toEqual([P.conversation_id, { throughMessageId: 'msg_poison03', outcome: 'failed', evidence: 'other_run_completed' }])
-    // The gate is deciding P right now: its verdict is P's next attempt.
-    expect(reportsIn(events)[0]).toMatchObject({ source: 'turn', next: 'running' })
     await briefly()
-    // One turn for P from the gate's verdict; the re-run left it to that verdict.
-    expect(t.started).toHaveLength(2)
+    expect(report).not.toHaveBeenCalled()
     expect(loop.status().counters).toMatchObject({ turnsStarted: 2, turnsRefused: 0 })
     t.ends[1]!({ status: 'completed', agentchatCalls: { made: 2, failed: 0 } })
     await loop.stop()
+
+    // With a runtime check: once nothing else is queued, the check is the evidence.
+    const checked = fakeClient([answer('none')])
+    checked.state.tray = trayOf([P])
+    const u = turns()
+    const second = gateLoop({ client: checked.client, callModel, startTurn: u.startTurn, checkRuntime: async () => ({ ok: true }) })
+    second.loop.wake()
+    await until(() => u.started.length === 1)
+    u.ends[0]!({ status: 'failed' })
+    await until(() => checked.report.mock.calls.length === 1)
+    expect(checked.report.mock.calls[0]![1]).toMatchObject({ evidence: 'runtime_check' })
+    await second.loop.stop()
   })
 
   it('a reply turn asked for while a gate is deciding starts after that cycle’s own turns', async () => {
     const { client, state, report } = fakeClient([answer('retry')])
-    state.tray = trayOf([P])
+    state.tray = trayOf([P, B])
     const t = turns()
-    const callModel = vi.fn(async (prompt: string) => allAs('reply', prompt))
+    let gateA: (text: string) => void = () => undefined
+    const callModel = vi.fn((prompt: string) => {
+      // The second cycle's gate (A) answers only when the test says so.
+      if (idsIn(prompt).includes(A.conversation_id)) return new Promise<string>((r) => (gateA = () => r(allAs('reply', prompt))))
+      return Promise.resolve(allAs('reply', prompt))
+    })
     const callsAtAdmission: number[] = []
     const startTurn = vi.fn(async (request: TurnRequest) => {
       callsAtAdmission.push(callModel.mock.calls.length)
@@ -906,19 +984,28 @@ describe('could not process: reply turns (gate-call mode)', () => {
     })
     const { loop } = gateLoop({ client, callModel, startTurn, maxConcurrentTurns: 2 })
     loop.wake()
-    await until(() => t.started.length === 1)
-    t.ends[0]!({ status: 'failed' })
+    await until(() => t.started.length === 2, 'P and B')
+    t.ends[0]!({ status: 'failed' }) // P: B is still running, so it waits
     await until(() => loop.status().processingFailures.awaitingEvidence === 1)
-    // The next cycle gates A only; A's chunk is the evidence for P's turn; the server says retry.
+    // The next cycle gates A; while that call is out, B's turn completes: evidence for P; the server says retry.
     state.tray = trayOf([A])
     loop.wake()
-    await until(() => t.started.length === 3, 'A’s turn and P’s re-run')
-    expect(report).toHaveBeenCalledTimes(1)
-    expect(t.started.map((r) => (r as { conversationId: string }).conversationId)).toEqual([P.conversation_id, A.conversation_id, P.conversation_id])
-    // Both started once the gate had answered.
-    expect(callsAtAdmission).toEqual([1, 2, 2])
+    await until(() => callModel.mock.calls.length === 2, 'the gate call for A under way')
     t.ends[1]!({ status: 'completed', agentchatCalls: { made: 1, failed: 0 } })
+    await until(() => report.mock.calls.length === 1)
+    await briefly()
+    expect(t.started).toHaveLength(2) // P's re-run waits for the gate
+    gateA('')
+    await until(() => t.started.length === 4, 'A’s turn, then P’s re-run')
+    expect(t.started.map((r) => (r as { conversationId: string }).conversationId)).toEqual([
+      P.conversation_id,
+      B.conversation_id,
+      A.conversation_id,
+      P.conversation_id,
+    ])
+    expect(callsAtAdmission.slice(2)).toEqual([2, 2]) // both after the gate had answered
     t.ends[2]!({ status: 'completed', agentchatCalls: { made: 1, failed: 0 } })
+    t.ends[3]!({ status: 'completed', agentchatCalls: { made: 1, failed: 0 } })
     await loop.stop()
   })
 

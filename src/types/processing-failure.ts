@@ -11,10 +11,11 @@
 export type ProcessingFailureOutcome = 'failed' | 'timed_out'
 
 /**
- * Why the machine knows its runtime otherwise works: another run, turn or
- * gate call completed after the failed one started, or the integration's own
- * runtime check passed. Without either, nothing is reported (a broken runtime
- * is not the conversation's fault).
+ * Why the machine knows its runtime otherwise works: the same kind of work
+ * (a gate call, a turn, a run) completed for another conversation after the
+ * failed one started, or the integration's own runtime check passed while no
+ * other conversation of that kind was failing. Without either, nothing is
+ * reported (a broken runtime is not the conversation's fault).
  */
 export type ProcessingFailureEvidence = 'other_run_completed' | 'runtime_check'
 

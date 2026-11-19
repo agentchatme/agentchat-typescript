@@ -428,7 +428,7 @@ for (const reply of result.reply) {
 
 `callModel` **must be a tool-less completion.** The served question talks about recording verdicts with a tool and about sending; the prompt opens with the served `texts.gate_call_preamble`, which says this call is a pre-turn triage with no tools, and ends with the served `texts.gate_call_answer_format`. Without texts (or from a server that serves neither field) the prompt is the 1.2 wording, unchanged (deprecated; removed in the next major). A model that could call tools here would act instead of answering.
 
-Most integrations do not write this loop: `integration.ReceiveLoop` runs it (socket, coalescing, the gate call in chunks and the one-card split after a chunk fails, one turn per reply, the record after each turn, invites; or, in single-run mode, one run per conversation; and the could-not-process report in both). See [`docs/integration-kit.md`](./docs/integration-kit.md).
+Most integrations do not write this loop: `integration.ReceiveLoop` runs it (socket, coalescing, the gate call in chunks and the one-card split after a chunk fails, one turn per reply, the record after each turn, invites; or, in single-run mode, one run per conversation with a message owed, notices-only cards waiting for the next one; and the could-not-process report in both). See [`docs/integration-kit.md`](./docs/integration-kit.md).
 
 `gate.run` returns `{ outcome, reply, verdicts, undecided, recorded, recordFailures, failure }`:
 

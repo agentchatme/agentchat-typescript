@@ -208,6 +208,51 @@ describe('conversation runs (single-run mode, texts with conversation_run_templa
     await loop.stop()
   })
 
+  it('a notices-only card (preview null) is not owed: no run of its own; it waits for the next real run of its conversation', async () => {
+    const N = card('conv_notice0001', 'msg_unused', { preview: null, last_message_id: 'msg_joined0001', you_owe_reply: false, unread: 1 })
+    const { client, state, record } = fakeClient()
+    state.tray = trayOf([N])
+    const r = runs()
+    const checkReady = vi.fn(() => ({ ready: true as const }))
+    const { loop } = runLoop({ client, startRun: r.startRun, readiness: checkReady })
+    loop.wake()
+    await until(() => loop.status().lastCycle !== null)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'nothing_owed', cards: 1, turnsStarted: 0, turnsQueued: 0 })
+    expect(r.started).toHaveLength(0)
+    expect(checkReady).not.toHaveBeenCalled() // nothing owed: no readiness probe either
+
+    // With a real card beside it: only the real one runs.
+    state.tray = trayOf([N, A])
+    loop.wake()
+    await until(() => r.started.length === 1)
+    await until(() => loop.status().coalescer.cycles === 2 && loop.status().coalescer.state === 'idle')
+    expect(r.started[0]!.conversationId).toBe(A.conversation_id)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'runs_started', turnsStarted: 1, turnsQueued: 0 })
+    r.ends[0]!({ status: 'completed' })
+    await loop.idle()
+
+    // A real message in that conversation: it runs, and the run reads through the notices.
+    state.tray = trayOf([{ ...N, preview: { ...sample.conversations[0]!.preview!, message_id: 'msg_real0001' }, you_owe_reply: true, unread: 2 }])
+    loop.wake()
+    await until(() => r.started.length === 2)
+    expect(r.started[1]!.conversationId).toBe(N.conversation_id)
+    r.ends[1]!({ status: 'completed' })
+    await loop.idle()
+    expect(record).not.toHaveBeenCalled()
+    await loop.stop()
+
+    // Without the template (one run for the tray) nothing changes: a notices-only card still counts.
+    const old = fakeClient()
+    old.state.tray = trayOf([N])
+    const seen: RunRequest[] = []
+    const tray = runLoop({ client: old.client, texts: textsSource(served), startRun: async (request) => (seen.push(request), { status: 'completed' }) })
+    tray.loop.wake()
+    await until(() => tray.loop.status().lastCycle !== null)
+    expect(seen).toHaveLength(1)
+    expect(seen[0]).toMatchObject({ kind: 'tray', cards: 1 })
+    await tray.loop.stop()
+  })
+
   it('maxConcurrentTurns: 2 runs two conversations at once', async () => {
     const { client, state } = fakeClient()
     state.tray = trayOf([A, B, P])

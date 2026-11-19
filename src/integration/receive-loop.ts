@@ -27,7 +27,9 @@
  *     `conversation_run_template` (`conversationRuns: false` turns them off):
  *     one run (`startRun`) per owed card, prompted for that one conversation
  *     (`conversationRunPrompt`), and one invite run (the served invite prompt)
- *     for the pending invites. A conversation's run takes a slot as a turn
+ *     for the pending invites. Owed: an unmuted card with a preview; a
+ *     notices-only card (`preview: null`) waits on the tray for the next run
+ *     of its conversation. A conversation's run takes a slot as a turn
  *     does (below): it is never run twice at once and is held out of later
  *     cycles while it runs or waits. After a completed run that left its card
  *     at the same anchor, that card is paced as a silent turn is. Cards whose
@@ -1674,18 +1676,18 @@ export class ReceiveLoop {
     const texts = await this.options.texts.ensure()
     if (run.stale()) return this.summary('abandoned', base)
     if (texts === null) return this.summary('texts_missing', { ...base, failure: 'the served texts are not available' })
+    const conversationRuns = this.options.conversationRuns !== false && conversationRunTemplate(texts) !== null
+    // Conversation runs decide what is owed first (a notices-only card is not), then check readiness.
+    if (conversationRuns && tray !== null) return this.conversationRunCycle(run, tray, texts)
     const unready = await this.checkReady()
     if (run.stale()) return this.summary('abandoned', base)
     if (unready !== null) return this.summary('tools_unavailable', { ...base, failure: unready })
 
-    if (this.options.conversationRuns !== false && conversationRunTemplate(texts) !== null) {
-      if (tray !== null) return this.conversationRunCycle(run, tray, texts)
-      // The tray could not be read. While runs are under way their ends read
-      // it again; with none, one run for the tray, as without the template.
-      if (this.runWork.size > 0 || this.waiting.length > 0) {
-        this.heldWhileRunning = true
-        return this.summary('tray_failed', { ...base, failure: this.lastError })
-      }
+    // The tray could not be read. While conversation runs are under way their
+    // ends read it again; with none, one run for the tray, as without the template.
+    if (conversationRuns && (this.runWork.size > 0 || this.waiting.length > 0)) {
+      this.heldWhileRunning = true
+      return this.summary('tray_failed', { ...base, failure: this.lastError })
     }
 
     const prompt =
@@ -1712,8 +1714,9 @@ export class ReceiveLoop {
 
   /**
    * Conversation runs (single-run mode, texts with `conversation_run_template`):
-   * one run per owed card, prompted for that one conversation, and one invite
-   * run for the pending invites. A conversation whose run is running or
+   * one run per owed card (unmuted, with a preview: a notices-only card is not
+   * owed), prompted for that one conversation, and one invite run for the
+   * pending invites. A conversation whose run is running or
    * waiting for a slot is held out (the tracker), and so is one paced after a
    * completed run that left its card at the same anchor (D5). Runs take a slot
    * each (`maxConcurrentTurns`) in the order queued: the cards whose last run
@@ -1730,9 +1733,17 @@ export class ReceiveLoop {
     const openInvites = invites.filter((invite) => !this.tracker.inviteRunning(invite.invite_id))
     const owedInvites = openInvites.filter((invite) => !this.pacer.held(`invite:${invite.invite_id}`, null))
     const paced = unheld.length - runCards.length + (openInvites.length - owedInvites.length)
-    const owedCards = runCards.filter((card) => card.muted !== true)
+    // Owed: an unmuted card with a preview. A notices-only card (preview null:
+    // its only unread messages are system notices) gets no run of its own: a
+    // whole run to look at "X joined" would cost the owner for nothing. It
+    // waits on the tray, and the next run of that conversation reads through
+    // it. Notices never wake (contract v1 §4), so nothing loops.
+    const owedCards = runCards.filter((card) => card.muted !== true && card.preview != null)
     const base = { cards: cards.length, invites: invites.length, heldByTurns, paced, truncated: tray.truncated === true }
     if (owedCards.length === 0 && owedInvites.length === 0) return this.summary('nothing_owed', base)
+    const unready = await this.checkReady()
+    if (run.stale()) return this.summary('abandoned', base)
+    if (unready !== null) return this.summary('tools_unavailable', { ...base, failure: unready })
 
     const tally = { turnsStarted: 0, turnsRefused: 0, turnsQueued: 0 }
     const failedLast = owedCards.filter((card) => this.awaitingEvidence.has(card.conversation_id))

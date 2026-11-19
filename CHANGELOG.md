@@ -38,7 +38,10 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   served texts carry `conversation_run_template` (and `conversationRuns` is
   not `false`), the loop starts one run per owed card, prompted for that one
   conversation (`integration.conversationRunPrompt`), and one invite run for
-  the pending invites, instead of one run for the whole tray. Runs take slots
+  the pending invites, instead of one run for the whole tray. A
+  notices-only card (`preview: null`) is not owed: it gets no run of its
+  own and waits for the next run of its conversation (a tray of such cards
+  only is `nothing_owed`). Runs take slots
   like turns (`maxConcurrentTurns`, default 1); a conversation whose run is
   running or waiting is held out of later cycles; a completed run that left
   its card at the same anchor is paced 60 s (D5). The loop records no verdict

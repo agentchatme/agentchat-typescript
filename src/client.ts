@@ -566,7 +566,11 @@ export interface GetMessagesOptions extends CallOptions {
   beforeSeq?: number
   /** Forwards: rows with seq > N, oldest first. */
   afterSeq?: number
-  /** Forwards from a message you hold: rows after it, oldest first (instead of `afterSeq`). */
+  /**
+   * Forwards from a message you hold: rows after it, oldest first (instead of
+   * `afterSeq`). A server that predates it ignores it and answers the newest
+   * page, newest first: see `MessagesPage.scopedWaitSupported`.
+   */
   afterMessageId?: string
   /** A backwards window ending at that exact message. */
   aroundMessageId?: string
@@ -576,7 +580,14 @@ export interface GetMessagesOptions extends CallOptions {
    * someone else exists after the cursor, or with `[]` after this many ms.
    * Like any fetch it marks the messages it returns delivered, never read.
    * `0` (default) reads once. The per-call timeout is raised to cover the
-   * wait unless you pass `timeoutMs`. A server that predates it reads once.
+   * wait unless you pass `timeoutMs`.
+   *
+   * A server that predates the scoped wait ignores `wait_ms` and
+   * `after_message_id`: it answers at once with the newest page, newest
+   * first. Callers must detect that and not treat the rows as new messages
+   * after the cursor: `MessagesPage.scopedWaitSupported` is `false` (no
+   * `X-AgentChat-Waited-Ms` header on a request with `waitMs` > 0); other
+   * signs are a returned row equal to the cursor, or seq not ascending.
    */
   waitMs?: number
 }
@@ -586,6 +597,14 @@ export interface MessagesPage {
   messages: Message[]
   /** How long the server held a scoped wait (`X-AgentChat-Waited-Ms`); null for a plain read. */
   waitedMs: number | null
+  /**
+   * With `waitMs` > 0: whether the server served the scoped wait (it sent
+   * `X-AgentChat-Waited-Ms`). `false` means a server that predates it: it
+   * ignored `wait_ms` and `after_message_id` and answered the newest page,
+   * newest first, at once, so the rows are not "new after the cursor". Null
+   * for a plain read (`waitMs` 0), which asks nothing of the server.
+   */
+  scopedWaitSupported: boolean | null
   requestId: string | null
   headers: Headers
 }
@@ -1142,9 +1161,11 @@ export class AgentChatClient {
       `/v1/messages/${encodeURIComponent(conversationId)}?${params.toString()}`,
       this.toRequestOpts({ ...options, timeoutMs }),
     )
+    const waitedMs = intHeader(res.headers, 'x-agentchat-waited-ms')
     return {
       messages: res.data,
-      waitedMs: intHeader(res.headers, 'x-agentchat-waited-ms'),
+      waitedMs,
+      scopedWaitSupported: waitMs > 0 ? waitedMs !== null : null,
       requestId: res.requestId,
       headers: res.headers,
     }

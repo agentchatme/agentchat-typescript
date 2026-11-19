@@ -52,8 +52,9 @@
  * a different conversation, after the failed one started; or (b)
  * `checkRuntime()` passes while no other conversation of that kind has
  * failed since that kind last completed (several failing together is the
- * runtime). A completion on the failing conversation's own card is never
- * evidence. The failure waits first: the work already queued runs (cheap
+ * runtime), and never for a timeout (`timed_out`: a brownout, a hung hook;
+ * the check does not exercise those). A completion on the failing
+ * conversation's own card is never evidence. The failure waits first: the work already queued runs (cheap
  * evidence), and the runtime check is asked only once nothing of that kind
  * is queued. It waits at most `AWAITING_EVIDENCE_MS` (10 min); one whose
  * runtime check fails is dropped (a broken runtime reports nothing: that is
@@ -549,8 +550,9 @@ export interface ReceiveLoopOptions {
    * Whether the runtime works right now (both modes). Asked about a
    * conversation's failed run, reply turn or single-card gate call once
    * nothing else of that kind is queued, and only when no other conversation
-   * of that kind has failed since that kind last completed; `ok` is the
-   * evidence a could-not-process report needs (`runtime_check`). Also the
+   * of that kind has failed since that kind last completed, and never for
+   * a timeout (`timed_out` needs another completion); `ok` is the evidence a
+   * could-not-process report needs (`runtime_check`). Also the
    * gate split's guard: after two single-card calls in a row failed with
    * nothing decided, the split goes on only if it passes. It must show that
    * the agent's AI answers now (a minimal model call with no peer content,
@@ -2355,8 +2357,10 @@ export class ReceiveLoop {
    * about the failure still waiting for evidence, if it is the only
    * conversation of that kind failing since that kind last completed. Several
    * failing together is the runtime: none of them is reported on (b), and
-   * they keep waiting for (a). Each failure is asked about once. A check that
-   * fails drops it (a broken runtime reports nothing).
+   * they keep waiting for (a). A `timed_out` failure is never reported on
+   * (b): a timeout is ambiguous (a brownout, a hung hook) and the check does
+   * not exercise those paths; it waits for (a). Each failure is asked about
+   * once. A check that fails drops it (a broken runtime reports nothing).
    */
   private async checkParked(kind: FailureSource): Promise<void> {
     if (!this.options.checkRuntime || this.stopped || !this.idleFor(kind)) return
@@ -2364,6 +2368,9 @@ export class ReceiveLoop {
     const due = [...this.awaitingEvidence.values()].filter(
       (failure) =>
         failure.source === kind &&
+        // A timeout is ambiguous (a brownout, a hung hook) and the runtime
+        // check does not exercise those paths: only (a) can report it.
+        failure.outcome !== 'timed_out' &&
         !this.checkedFailures.has(failure) &&
         this.now() - failure.failedAt <= AWAITING_EVIDENCE_MS &&
         [...failing].every((id) => id === failure.conversationId),

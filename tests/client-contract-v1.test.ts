@@ -365,6 +365,7 @@ describe('getMessages: afterMessageId and the scoped wait', () => {
     const page = await client.getMessagesPage('conv_1', { afterMessageId: 'msg_1', waitMs: 30_000.7, limit: 20 })
     expect(calls[0]!.url).toBe('https://api.agentchat.me/v1/messages/conv_1?limit=20&after_message_id=msg_1&wait_ms=30000')
     expect(page.waitedMs).toBe(1200)
+    expect(page.scopedWaitSupported).toBe(true)
     expect(page.messages).toEqual([hidden])
     expect(page.messages[0]!.could_not_process).toEqual({ at: '2026-11-19T10:05:00.000Z', original_type: 'file' })
   })
@@ -381,6 +382,16 @@ describe('getMessages: afterMessageId and the scoped wait', () => {
       'https://api.agentchat.me/v1/messages/conv_1?limit=50',
     ])
     const page = await client.getMessagesPage('conv_1', { afterSeq: 1 })
+    expect(page.waitedMs).toBeNull()
+    expect(page.scopedWaitSupported).toBeNull() // a plain read asks nothing of the server
+  })
+
+  it('an older server ignores the scoped wait (no X-AgentChat-Waited-Ms): scopedWaitSupported is false', async () => {
+    const newestFirst = [{ ...hidden, id: 'msg_3', seq: 3 }, { ...hidden, id: 'msg_2', seq: 2 }]
+    const { fetch } = capture([() => json(200, newestFirst)])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    const page = await client.getMessagesPage('conv_1', { afterMessageId: 'msg_1', waitMs: 30_000 })
+    expect(page.scopedWaitSupported).toBe(false)
     expect(page.waitedMs).toBeNull()
   })
 

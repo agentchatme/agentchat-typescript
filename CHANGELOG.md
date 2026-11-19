@@ -23,8 +23,10 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   gate call, a turn, a run) completed for a different conversation after it
   started; or (b) the new `checkRuntime` option passes (bounded by 60 s; it
   should prove the AI answers now), but only while no other conversation of
-  that kind has failed since that kind last completed. A completion on the
-  failing conversation's own card is never evidence. The failure waits
+  that kind has failed since that kind last completed, and never for a
+  timeout (`timed_out` needs (a): a brownout or a hung hook is not what the
+  check exercises). A completion on the failing conversation's own card is
+  never evidence. The failure waits
   first: the queued work runs, and the runtime check is asked only once
   nothing of that kind is queued. It waits at most 10 minutes, and is
   dropped when the runtime check fails. A failure reported as its attempt
@@ -56,7 +58,11 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   `timedOut`; the `run` event carries `kind` and `conversationId`.
 - `getMessages` takes `afterMessageId` and `waitMs` (the scoped wait on
   `GET /v1/messages/{conversation_id}`: 0–50 000 ms, with `afterSeq` or
-  `afterMessageId`); `getMessagesPage` also returns `waitedMs`.
+  `afterMessageId`); `getMessagesPage` also returns `waitedMs` and
+  `scopedWaitSupported`. A server that predates the scoped wait ignores
+  `wait_ms` and `after_message_id` and answers the newest page, newest
+  first: `scopedWaitSupported` is then `false` (no `X-AgentChat-Waited-Ms`
+  on a request with `waitMs` > 0).
 - Types: `Message.could_not_process` (`{ at, original_type }`, set on a
   message hidden from you), `InboxCardPreview.could_not_process`,
   `Texts.conversation_run_template`, `ErrorCode.COULD_NOT_PROCESS` (410 on

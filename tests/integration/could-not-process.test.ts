@@ -419,9 +419,9 @@ describe('could not process: the report (conversation runs)', () => {
     // retry: P goes again.
     await until(() => r.started.length === 3)
     expect(r.started[2]!.conversationId).toBe(P.conversation_id)
-    r.ends[2]!({ status: 'failed', timedOut: true }) // P, 2nd: nothing else queued, only P failing: the runtime check
+    r.ends[2]!({ status: 'failed' }) // P, 2nd: nothing else queued, only P failing: the runtime check
     await until(() => report.mock.calls.length === 2)
-    expect(report.mock.calls[1]![1]).toEqual({ throughMessageId: 'msg_poison03', outcome: 'timed_out', evidence: 'runtime_check' })
+    expect(report.mock.calls[1]![1]).toEqual({ throughMessageId: 'msg_poison03', outcome: 'failed', evidence: 'runtime_check' })
     await until(() => r.started.length === 4)
     expect(r.started[3]!.conversationId).toBe(P.conversation_id)
     r.ends[3]!({ status: 'completed' }) // P, 3rd: around the hidden span
@@ -431,6 +431,38 @@ describe('could not process: the report (conversation runs)', () => {
     expect(loop.status().processingFailures).toMatchObject({ reported: 2, retry: 1, hidden: 1, reruns: 2, runtimeChecksOk: 1 })
     expect(loop.status().processingFailures.lastRuntimeCheck).toMatchObject({ ok: true, detail: null })
     await loop.stop()
+  })
+
+  it('a run that timed out is reported only on another run completing, never on the runtime check alone', async () => {
+    // Alone: the check is not even asked (a timeout is ambiguous: a brownout, a hung hook).
+    const alone = fakeClient()
+    alone.state.tray = trayOf([P])
+    const checkRuntime = vi.fn(async () => ({ ok: true }))
+    const startRun = vi.fn(async (): Promise<RunEnd> => ({ status: 'failed', timedOut: true }))
+    const first = runLoop({ client: alone.client, startRun, checkRuntime })
+    first.loop.wake()
+    await until(() => startRun.mock.calls.length === 1)
+    await first.loop.idle()
+    expect(alone.report).not.toHaveBeenCalled()
+    expect(checkRuntime).not.toHaveBeenCalled()
+    expect(first.loop.status().processingFailures.awaitingEvidence).toBe(1)
+    await first.loop.stop()
+
+    // With another conversation's run completing after it started: reported, timed_out.
+    const { client, state, report } = fakeClient([answer('retry')])
+    state.tray = trayOf([P, A])
+    const r = runs()
+    const second = runLoop({ client, startRun: r.startRun, checkRuntime })
+    second.loop.wake()
+    await until(() => r.started.length === 1)
+    r.ends[0]!({ status: 'failed', timedOut: true })
+    await until(() => r.started.length === 2)
+    r.ends[1]!({ status: 'completed' })
+    await until(() => report.mock.calls.length === 1)
+    expect(report.mock.calls[0]![1]).toEqual({ throughMessageId: 'msg_poison03', outcome: 'timed_out', evidence: 'other_run_completed' })
+    await until(() => r.started.length === 3)
+    r.ends[2]!({ status: 'completed' })
+    await second.loop.stop()
   })
 
   it('several conversations failing together is the runtime: a passing runtime check reports none of them', async () => {
@@ -890,16 +922,30 @@ describe('could not process: the gate-chunk split (gate-call mode)', () => {
     await loop.stop()
   })
 
-  it('a gate call past its deadline is reported as timed_out', async () => {
+  it('a gate call past its deadline is reported as timed_out, only when another gate call completes after it (not on the runtime check)', async () => {
+    const hangs = (prompt: string) =>
+      prompt.includes('POISON') ? new Promise<string>(() => undefined) : Promise.resolve(allAs('dismiss', prompt))
+    // Alone, with a passing runtime check: not reported.
+    const alone = fakeClient([answer('none')])
+    alone.state.tray = trayOf([POISON])
+    const checkRuntime = vi.fn(async () => ({ ok: true }))
+    const first = gateLoop({ client: alone.client, callModel: vi.fn(hangs), gateCallTimeoutMs: 20, checkRuntime })
+    first.loop.wake()
+    await until(() => first.loop.status().lastCycle !== null)
+    expect(alone.report).not.toHaveBeenCalled()
+    expect(checkRuntime).not.toHaveBeenCalled()
+    await first.loop.stop()
+
+    // In a chunk with A: the chunk times out, POISON alone times out, A alone decides after it: evidence (a).
     const { client, state, report } = fakeClient([answer('none')])
-    state.tray = trayOf([POISON])
-    const callModel = vi.fn(() => new Promise<string>(() => undefined))
-    const { loop } = gateLoop({ client, callModel, gateCallTimeoutMs: 20, checkRuntime: async () => ({ ok: true }) })
-    loop.wake()
+    state.tray = trayOf([POISON, A])
+    const second = gateLoop({ client, callModel: vi.fn(hangs), gateCallTimeoutMs: 20, checkRuntime })
+    second.loop.wake()
     await until(() => report.mock.calls.length === 1)
-    expect(report.mock.calls[0]![1]).toMatchObject({ outcome: 'timed_out', evidence: 'runtime_check' })
-    await loop.stop()
+    expect(report.mock.calls[0]![1]).toEqual({ throughMessageId: 'msg_poison03', outcome: 'timed_out', evidence: 'other_run_completed' })
+    await second.loop.stop()
   })
+
 })
 
 describe('could not process: reply turns (gate-call mode)', () => {
@@ -1009,16 +1055,20 @@ describe('could not process: reply turns (gate-call mode)', () => {
     await loop.stop()
   })
 
-  it('a turn that timed out is reported as timed_out; a failed turn whose card cannot be read again is not reported', async () => {
+  it('a turn that timed out is reported as timed_out only when another turn completes after it; a failed turn whose card cannot be read again is not reported', async () => {
     const { client, state, report } = fakeClient([answer('none')])
-    state.tray = trayOf([P])
+    state.tray = trayOf([P, A])
     const t = turns()
-    const { loop } = gateLoop({ client, callModel: async (prompt: string) => allAs('reply', prompt), startTurn: t.startTurn, checkRuntime: async () => ({ ok: true }) })
+    const checkRuntime = vi.fn(async () => ({ ok: true }))
+    const { loop } = gateLoop({ client, callModel: async (prompt: string) => allAs('reply', prompt), startTurn: t.startTurn, checkRuntime })
     loop.wake()
     await until(() => t.started.length === 1)
-    t.ends[0]!({ status: 'failed', timedOut: true })
+    t.ends[0]!({ status: 'failed', timedOut: true }) // P
+    await until(() => t.started.length === 2)
+    t.ends[1]!({ status: 'completed', agentchatCalls: { made: 1, failed: 0 } }) // A: evidence (a)
     await until(() => report.mock.calls.length === 1)
-    expect(report.mock.calls[0]![1]).toMatchObject({ outcome: 'timed_out', evidence: 'runtime_check' })
+    expect(report.mock.calls[0]![1]).toEqual({ throughMessageId: 'msg_poison03', outcome: 'timed_out', evidence: 'other_run_completed' })
+    expect(checkRuntime).not.toHaveBeenCalled()
     await loop.stop()
 
     const unread = fakeClient()
@@ -1034,4 +1084,5 @@ describe('could not process: reply turns (gate-call mode)', () => {
     expect(unread.report).not.toHaveBeenCalled()
     await second.loop.stop()
   })
+
 })

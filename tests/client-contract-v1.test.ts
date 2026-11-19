@@ -271,3 +271,148 @@ describe('static calls take fetch, timeoutMs and signal', () => {
     await expect(AgentChatClient.recover('a@example.com', { fetch, signal: controller.signal })).rejects.toThrow()
   })
 })
+
+// ─── could not process: the report, the scoped wait, a hidden message ──────
+
+describe('client.conversations.reportProcessingFailure', () => {
+  const served = { action: 'hidden', attempts: 2, hidden_message_ids: ['msg_1', 'msg_2', 'msg_3'], paused_until: null }
+
+  it('POSTs the report (wire names only) with an Idempotency-Key and returns the server answer', async () => {
+    const { fetch, calls } = capture([() => json(200, served)])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    const result = await client.conversations.reportProcessingFailure('conv_1', {
+      throughMessageId: 'msg_3',
+      outcome: 'failed',
+      evidence: 'other_run_completed',
+      timeoutMs: 5_000,
+    })
+    expect(result).toEqual(served)
+    expect(calls[0]).toMatchObject({
+      method: 'POST',
+      url: 'https://api.agentchat.me/v1/conversations/conv_1/processing-failures',
+      body: { through_message_id: 'msg_3', outcome: 'failed', evidence: 'other_run_completed' },
+    })
+    expect(calls[0]!.headers['idempotency-key']).toMatch(/\S{8,}/)
+  })
+
+  it('hidden_count comes through when the server sends it (hidden_message_ids is capped at 200)', async () => {
+    const ids = Array.from({ length: 200 }, (_, i) => `msg_${i}`)
+    const { fetch } = capture([() => json(200, { action: 'hidden', attempts: 2, hidden_message_ids: ids, hidden_count: 260, paused_until: null })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    const result = await client.conversations.reportProcessingFailure('conv_1', { throughMessageId: 'msg_3', outcome: 'failed', evidence: 'runtime_check' })
+    expect(result.hidden_count).toBe(260)
+    expect(result.hidden_message_ids).toHaveLength(200)
+  })
+
+  it('a transient failure is retried with the same key: one report, counted once', async () => {
+    const { fetch, calls } = capture([() => json(503, { code: 'X', message: 'busy' }), () => json(200, served)])
+    const client = new AgentChatClient({ apiKey: 'k', fetch, retry: fastRetry })
+    await client.conversations.reportProcessingFailure('conv_1', { throughMessageId: 'msg_3', outcome: 'timed_out', evidence: 'runtime_check' })
+    expect(calls).toHaveLength(2)
+    expect(calls[0]!.headers['idempotency-key']).toBe(calls[1]!.headers['idempotency-key'])
+  })
+
+  it('a field the server did not send, or an action this SDK does not know, reads as nothing to act on', async () => {
+    const { fetch } = capture([() => json(200, { action: 'quarantined', attempts: 'x', hidden_message_ids: ['msg_1', 7] }), () => new Response(null, { status: 204 })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    const opts = { throughMessageId: 'msg_1', outcome: 'failed', evidence: 'runtime_check' } as const
+    await expect(client.conversations.reportProcessingFailure('conv_1', opts)).resolves.toEqual({
+      action: 'none',
+      attempts: 0,
+      hidden_message_ids: ['msg_1'],
+      paused_until: null,
+    })
+    await expect(client.conversations.reportProcessingFailure('conv_1', opts)).resolves.toEqual({
+      action: 'none',
+      attempts: 0,
+      hidden_message_ids: [],
+      paused_until: null,
+    })
+  })
+
+  it.each([
+    ['a plain-text 404 (an older server without the route)', () => new Response('404 Not Found', { status: 404 })],
+    ['an empty 404', () => new Response(null, { status: 404 })],
+    ['a 404 with a code of no route of its own', () => json(404, { code: 'NOT_FOUND', message: 'Not Found' })],
+  ])('%s → { action: none }, never a throw', async (_what, respond) => {
+    const { fetch } = capture([respond])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    await expect(
+      client.conversations.reportProcessingFailure('conv_1', { throughMessageId: 'msg_1', outcome: 'failed', evidence: 'runtime_check' }),
+    ).resolves.toEqual({ action: 'none', attempts: 0, hidden_message_ids: [], paused_until: null })
+  })
+
+  it.each(['CONVERSATION_NOT_FOUND', 'MESSAGE_NOT_FOUND'])('404 %s throws NotFoundError', async (code) => {
+    const { fetch } = capture([() => json(404, { code, message: 'no' })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    const call = client.conversations.reportProcessingFailure('conv_1', { throughMessageId: 'msg_1', outcome: 'failed', evidence: 'runtime_check' })
+    await expect(call).rejects.toBeInstanceOf(NotFoundError)
+    await expect(call).rejects.toMatchObject({ code })
+  })
+})
+
+describe('getMessages: afterMessageId and the scoped wait', () => {
+  const hidden = {
+    id: 'msg_2',
+    conversation_id: 'conv_1',
+    sender: '@example-nova',
+    client_msg_id: 'c2',
+    seq: 2,
+    type: 'text',
+    content: { text: '[Hidden from you: this message from @example-nova could not be processed on your side, so it is not shown.]' },
+    metadata: {},
+    status: 'delivered',
+    created_at: '2026-11-19T10:00:00.000Z',
+    delivered_at: '2026-11-19T10:00:01.000Z',
+    read_at: null,
+    could_not_process: { at: '2026-11-19T10:05:00.000Z', original_type: 'file' },
+  }
+
+  it('sends after_message_id and wait_ms, raises the timeout over the wait, and returns how long the server held it', async () => {
+    const { fetch, calls } = capture([() => json(200, [hidden], { 'X-AgentChat-Waited-Ms': '1200' })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch, timeoutMs: 1_000 })
+    const page = await client.getMessagesPage('conv_1', { afterMessageId: 'msg_1', waitMs: 30_000.7, limit: 20 })
+    expect(calls[0]!.url).toBe('https://api.agentchat.me/v1/messages/conv_1?limit=20&after_message_id=msg_1&wait_ms=30000')
+    expect(page.waitedMs).toBe(1200)
+    expect(page.scopedWaitSupported).toBe(true)
+    expect(page.messages).toEqual([hidden])
+    expect(page.messages[0]!.could_not_process).toEqual({ at: '2026-11-19T10:05:00.000Z', original_type: 'file' })
+  })
+
+  it('getMessages returns the rows; no wait_ms when 0; the cursors as before', async () => {
+    const { fetch, calls } = capture([() => json(200, [hidden])])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    await expect(client.getMessages('conv_1', { afterSeq: 1, waitMs: 0 })).resolves.toEqual([hidden])
+    await client.getMessages('conv_1', { beforeSeq: 9 })
+    await client.getMessages('conv_1')
+    expect(calls.map((c) => c.url)).toEqual([
+      'https://api.agentchat.me/v1/messages/conv_1?limit=50&after_seq=1',
+      'https://api.agentchat.me/v1/messages/conv_1?limit=50&before_seq=9',
+      'https://api.agentchat.me/v1/messages/conv_1?limit=50',
+    ])
+    const page = await client.getMessagesPage('conv_1', { afterSeq: 1 })
+    expect(page.waitedMs).toBeNull()
+    expect(page.scopedWaitSupported).toBeNull() // a plain read asks nothing of the server
+  })
+
+  it('an older server ignores the scoped wait (no X-AgentChat-Waited-Ms): scopedWaitSupported is false', async () => {
+    const newestFirst = [{ ...hidden, id: 'msg_3', seq: 3 }, { ...hidden, id: 'msg_2', seq: 2 }]
+    const { fetch } = capture([() => json(200, newestFirst)])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    const page = await client.getMessagesPage('conv_1', { afterMessageId: 'msg_1', waitMs: 30_000 })
+    expect(page.scopedWaitSupported).toBe(false)
+    expect(page.waitedMs).toBeNull()
+  })
+
+  it('a scoped wait is not cut off by the default timeout while the server holds it', async () => {
+    let seenSignal: AbortSignal | undefined
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      seenSignal = init?.signal ?? undefined
+      await new Promise((r) => setTimeout(r, 60))
+      return json(200, [])
+    }) as unknown as typeof globalThis.fetch
+    const client = new AgentChatClient({ apiKey: 'k', fetch, timeoutMs: 20 })
+    await expect(client.getMessages('conv_1', { afterMessageId: 'msg_1', waitMs: 100 })).resolves.toEqual([])
+    expect(seenSignal?.aborted).toBe(false)
+  })
+})

@@ -1830,3 +1830,96 @@ describe('RealtimeClient — reconnect stability window', () => {
     vi.useRealTimers()
   })
 })
+
+// ─── A message hidden from its recipient carries no client_msg_id ──────────
+//
+// The server omits sender-written fields on a message hidden from you
+// (could not process): `client_msg_id` among them. Dedup keys on `id`,
+// ordering and gap-fill on `seq`, so such a message flows like any other.
+
+describe('RealtimeClient — a hidden message without client_msg_id', () => {
+  const NOTE = '[Hidden from you: this message from @other could not be processed on your side, so it is not shown.]'
+  function hiddenPayload(payload: Record<string, unknown>): Record<string, unknown> {
+    const { client_msg_id: _gone, ...rest } = payload
+    return {
+      ...rest,
+      type: 'text',
+      content: { text: NOTE },
+      metadata: {},
+      could_not_process: { at: '2026-11-19T10:05:00.000Z', original_type: 'file' },
+    }
+  }
+  const hiddenFrame = (conversationId: string, seq: number): WsMessage =>
+    ({ type: 'message.new', payload: hiddenPayload(messageNew(conversationId, seq).payload as Record<string, unknown>) }) as unknown as WsMessage
+
+  it('live: dispatched in order, a redelivered copy deduped by id, acked', async () => {
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false })
+    const seen: Array<Record<string, unknown>> = []
+    rt.on('message.new', (evt) => {
+      seen.push(evt.payload as Record<string, unknown>)
+    })
+    await rt.connect()
+    const ws = handshake(MockWebSocket.latest())
+    ws.simulateMessage(messageNew('c', 1))
+    ws.simulateMessage(hiddenFrame('c', 2))
+    ws.simulateMessage(hiddenFrame('c', 2)) // redelivered
+    ws.simulateMessage(messageNew('c', 3))
+    await settle()
+    expect(seen.map((p) => p.seq)).toEqual([1, 2, 3])
+    expect(seen[1]).not.toHaveProperty('client_msg_id')
+    expect(seen[1]).toMatchObject({ id: 'msg_2', content: { text: NOTE }, could_not_process: { original_type: 'file' } })
+    // Acked by id: the first copy once dispatched, the redelivered copy as a dedup hit.
+    expect(sentFrames(ws, 'ack').map((f) => String(f.message_id)).sort()).toEqual(['msg_1', 'msg_2', 'msg_2', 'msg_3'])
+    rt.disconnect()
+  })
+
+  it('gap-fill: a hidden row fetched by getMessages closes the gap', async () => {
+    vi.useFakeTimers()
+    const getMessages = vi.fn(async (): Promise<Message[]> => [hiddenPayload(messageNew('c', 2).payload as Record<string, unknown>) as unknown as Message])
+    const mockClient = { getMessages, sync: vi.fn(), syncAck: vi.fn() } as unknown as import('../src/client.js').AgentChatClient
+    const onGap = vi.fn()
+    const rt = new RealtimeClient({
+      apiKey: 'k',
+      webSocket: MockWebSocketCtor,
+      reconnect: false,
+      client: mockClient,
+      autoDrainOnConnect: false,
+      onSequenceGap: onGap,
+    })
+    const seen: number[] = []
+    rt.on('message.new', (evt) => {
+      seen.push((evt.payload as { seq: number }).seq)
+    })
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage({ type: 'hello.ok' })
+    ws.simulateMessage(messageNew('c', 1))
+    ws.simulateMessage(messageNew('c', 3))
+    await vi.advanceTimersByTimeAsync(2_100)
+    await vi.runAllTimersAsync()
+    expect(getMessages).toHaveBeenCalledOnce()
+    expect(seen).toEqual([1, 2, 3])
+    expect(onGap.mock.calls[0]![0]).toMatchObject({ recovered: true, reason: 'gap_filled' })
+    rt.disconnect()
+  })
+
+  it('offline drain: a hidden sync row is dispatched and the page acked past it', async () => {
+    const rows = [syncRow('c', 1), hiddenPayload(syncRow('c', 2)), syncRow('c', 3)]
+    const sync = vi.fn(async () => rows)
+    const syncAck = vi.fn(async () => ({ acked: 3 }))
+    const client = { sync, syncAck, getMessages: vi.fn(async () => []) } as unknown as import('../src/client.js').AgentChatClient
+    const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor, reconnect: false, client })
+    const onMessage = vi.fn()
+    rt.on('message.new', onMessage)
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage({ type: 'hello.ok' })
+    await settle()
+    expect(onMessage).toHaveBeenCalledTimes(3)
+    expect((onMessage.mock.calls[1]![0] as WsMessage).payload).not.toHaveProperty('client_msg_id')
+    expect(syncAck).toHaveBeenCalledWith(rows[2]!.delivery_id)
+    rt.disconnect()
+  })
+})

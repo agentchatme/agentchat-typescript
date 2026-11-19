@@ -7,7 +7,13 @@ import type { InboxCard, InboxTray, ReplyDecision, Texts, TrayInvite } from '../
 import { MockWebSocket, MockWebSocketCtor, sentFrames } from '../helpers/mock-websocket.js'
 import { json, raw } from './fixtures.js'
 
-const texts = json<Texts>('texts.sample.json')
+/**
+ * The served texts as an older server served them, without
+ * `conversation_run_template`: these tests pin single-run mode's one run for
+ * the tray (conversation runs: could-not-process.test.ts). Gate-call mode
+ * reads no such field.
+ */
+const { conversation_run_template: _runs, ...texts } = json<Texts>('texts.sample.json')
 const sample = json<InboxTray>('tray.sample.json')
 const v1 = json<InboxTray>('tray.v1.sample.json')
 const DIRECT = sample.conversations[0]! // owes a reply, anchor msg_nova0first00001a
@@ -1259,7 +1265,7 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
 
   afterEach(() => vi.useRealTimers())
 
-  it('a 50-card tray is gated in five calls of 10; a cut-off answer in chunk 3 leaves only its 10 cards undecided', async () => {
+  it('a 50-card tray is gated in five calls of 10; a cut-off answer in chunk 3 fails only that call, and its 10 cards are gated one per call', async () => {
     const { client, state, record } = fakeClient()
     const cards = cardsUpTo(50)
     state.tray = trayOf(cards)
@@ -1273,36 +1279,46 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
     const { loop, events } = gateLoop({ client, callModel })
     loop.wake()
     await until(() => loop.status().lastCycle !== null, 'the cycle')
-    expect(callModel).toHaveBeenCalledTimes(5)
+    // Five chunk calls, then one call for each of chunk 3's cards.
+    expect(callModel).toHaveBeenCalledTimes(15)
     // Each chunk's prompt is the §3.6 prompt for its own cards, in tray order, N = 10.
     for (let k = 0; k < 5; k++) {
       expect(prompts[k]).toBe(buildPrompt(trayOf(cards.slice(k * 10, k * 10 + 10)), { texts }))
       expect(prompts[k]).toContain('Your tray, as the server built it: 10 conversations.')
     }
-    // Chunks 1, 2, 4 and 5 recorded, each through its card's anchor; chunk 3's cards stay on the tray.
-    expect(record.mock.calls.map(([id]) => id)).toEqual(ids([...cards.slice(0, 20), ...cards.slice(30)]))
+    // The split: chunk 3's cards, in tray order, each alone with the prompt of a one-card tray.
+    for (let k = 0; k < 10; k++) expect(prompts[5 + k]).toBe(buildPrompt(trayOf([cards[20 + k]!]), { texts }))
+    // Chunks 1, 2, 4 and 5 recorded first, each through its card's anchor; then chunk 3's, one call each.
+    expect(record.mock.calls.map(([id]) => id)).toEqual(ids([...cards.slice(0, 20), ...cards.slice(30), ...cards.slice(20, 30)]))
     expect(record.mock.calls[0]).toEqual(['conv_chunk00', { decision: 'dismiss', category: undefined, throughMessageId: 'msg_chunk00' }])
     const failure = '1 of 5 gate chunks failed; chunk 3: no usable verdicts in the answer'
     expect(loop.status().lastCycle).toMatchObject({
       outcome: 'decided',
       cards: 50,
       gated: 50,
-      dismiss: 40,
-      recorded: 40,
-      undecided: 10,
+      dismiss: 50,
+      recorded: 50,
+      undecided: 0,
       chunksOk: 4,
       chunksFailed: 1,
+      splitCallsOk: 10,
+      splitCallsFailed: 0,
       failure,
     })
-    expect(chunkEvents(events).map((e) => [e.index, e.of, e.cards, e.outcome, e.undecided])).toEqual([
+    const planned = chunkEvents(events).filter((e) => e.split !== true)
+    expect(planned.map((e) => [e.index, e.of, e.cards, e.outcome, e.undecided])).toEqual([
       [1, 5, 10, 'decided', 0],
       [2, 5, 10, 'decided', 0],
       [3, 5, 10, 'fail_closed', 10],
       [4, 5, 10, 'decided', 0],
       [5, 5, 10, 'decided', 0],
     ])
-    expect(chunkEvents(events)[2]!.failure).toBe('no usable verdicts in the answer')
-    expect(loop.status().counters).toMatchObject({ chunksOk: 4, chunksFailed: 1 })
+    expect(planned[2]!.failure).toBe('no usable verdicts in the answer')
+    const split = chunkEvents(events).filter((e) => e.split === true)
+    expect(split.map((e) => [e.index, e.of, e.cards, e.outcome, e.conversationId])).toEqual(
+      cards.slice(20, 30).map((card, k) => [k + 1, 10, 1, 'decided', card.conversation_id]),
+    )
+    expect(loop.status().counters).toMatchObject({ chunksOk: 4, chunksFailed: 1, splitCallsOk: 10, splitCallsFailed: 0 })
     expect(loop.status().lastError).toBe(failure)
     await loop.stop()
   })
@@ -1391,14 +1407,15 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
     expect(() => gateLoop({ client, gateChunkSize: 0 })).toThrow('ReceiveLoop: gateChunkSize must be an integer from 1 to 50')
   })
 
-  it('every chunk fails: fail_closed, nothing recorded, the count of failed chunks in the summary', async () => {
+  it('every chunk fails: fail_closed, nothing recorded; with nothing decided and no runtime check, the split stops after two single-card failures in a row', async () => {
     const { client, state, record } = fakeClient()
     state.tray = trayOf(cardsUpTo(15))
     const callModel = vi.fn(async () => 'I would dismiss most of these.')
     const { loop } = gateLoop({ client, callModel })
     loop.wake()
     await until(() => loop.status().lastCycle !== null)
-    expect(callModel).toHaveBeenCalledTimes(2)
+    // Two chunk calls, then two single-card calls, then the split stops.
+    expect(callModel).toHaveBeenCalledTimes(4)
     expect(record).not.toHaveBeenCalled()
     expect(loop.status().lastCycle).toMatchObject({
       outcome: 'fail_closed',
@@ -1406,7 +1423,12 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
       undecided: 15,
       chunksOk: 0,
       chunksFailed: 2,
-      failure: '2 of 2 gate chunks failed; chunk 1: no usable verdicts in the answer',
+      splitCallsOk: 0,
+      splitCallsFailed: 2,
+      // Nothing decided and no runtime check to say the model works: the split stops.
+      splitStopped: true,
+      failure:
+        '2 of 2 gate chunks failed; chunk 1: no usable verdicts in the answer; 2 of 2 single-card calls failed; conv_chunk00: no usable verdicts in the answer',
     })
     await loop.stop()
   })
@@ -1459,7 +1481,7 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
     await loop.stop()
   })
 
-  it('each chunk has its own deadline: a chunk past it fails closed alone; the next one gets a fresh signal', async () => {
+  it('each chunk has its own deadline: a chunk past it fails closed alone; the next one gets a fresh signal; its cards are then gated one per call', async () => {
     vi.useFakeTimers()
     const { client, state, record } = fakeClient()
     const cards = cardsUpTo(21)
@@ -1478,17 +1500,19 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
     const { loop } = gateLoop({ client, callModel, gateCallTimeoutMs: 8_000 })
     loop.wake()
     await untilFake(() => loop.status().lastCycle !== null, 'the cycle', 100)
-    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(18_000)
-    expect(callModel).toHaveBeenCalledTimes(3)
-    expect(abortedAtCall).toEqual([false, false, false])
-    expect(signals.map((s) => s.aborted)).toEqual([false, true, false])
-    expect(record.mock.calls.map(([id]) => id)).toEqual(ids([...cards.slice(0, 10), ...cards.slice(20)]))
+    // 5 + 8 + 5 s for the chunks, then 10 single-card calls of 5 s for chunk 2's cards.
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(68_000)
+    expect(callModel).toHaveBeenCalledTimes(13)
+    expect(abortedAtCall).toEqual(Array<boolean>(13).fill(false))
+    expect(signals.map((s) => s.aborted)).toEqual([false, true, ...Array<boolean>(11).fill(false)])
+    expect(record.mock.calls.map(([id]) => id)).toEqual(ids([...cards.slice(0, 10), ...cards.slice(20), ...cards.slice(10, 20)]))
     expect(loop.status().lastCycle).toMatchObject({
       outcome: 'decided',
-      recorded: 11,
-      undecided: 10,
+      recorded: 21,
+      undecided: 0,
       chunksOk: 2,
       chunksFailed: 1,
+      splitCallsOk: 10,
       failure: '1 of 3 gate chunks failed; chunk 2: model call failed: no answer within 8000 ms',
     })
     await loop.stop()
@@ -1691,11 +1715,18 @@ describe('ReceiveLoop — the gate in chunks (gateChunkSize)', () => {
     const { loop, events } = gateLoop({ client, callModel })
     loop.wake()
     await until(() => loop.status().lastCycle !== null)
-    expect(callModel).toHaveBeenCalledTimes(1)
+    // One chunk call, then two single-card calls (the split stops after two failures in a row).
+    expect(callModel).toHaveBeenCalledTimes(3)
     expect(record).not.toHaveBeenCalled()
-    // As from a single gate call: the bare reason.
-    expect(loop.status().lastCycle).toMatchObject({ outcome: 'fail_closed', chunksOk: 0, chunksFailed: 1, failure: 'no usable verdicts in the answer' })
-    expect(chunkEvents(events).map((e) => [e.index, e.of, e.outcome])).toEqual([[1, 2, 'fail_closed']])
+    // As from a single gate call: the bare reason, then the single-card calls'.
+    expect(loop.status().lastCycle).toMatchObject({
+      outcome: 'fail_closed',
+      chunksOk: 0,
+      chunksFailed: 1,
+      splitCallsFailed: 2,
+      failure: 'no usable verdicts in the answer; 2 of 2 single-card calls failed; conv_chunk00: no usable verdicts in the answer',
+    })
+    expect(chunkEvents(events).filter((e) => e.split !== true).map((e) => [e.index, e.of, e.outcome])).toEqual([[1, 2, 'fail_closed']])
     await loop.stop()
 
     // Three planned chunks, the middle one muted only: two calls; the count is of those two.

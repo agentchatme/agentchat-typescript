@@ -24,6 +24,8 @@ export {
   type WakeWebhookResource,
   type SyncOptions,
   type SyncPage,
+  type GetMessagesOptions,
+  type MessagesPage,
   type StaticCallOptions,
 } from './client.js'
 

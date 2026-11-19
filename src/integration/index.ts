@@ -81,6 +81,11 @@ export {
 export {
   ReceiveLoop,
   replyPrompt,
+  conversationRunPrompt,
+  type FailureSource,
+  type ProcessingFailureReport,
+  type RunKind,
+  type RuntimeCheck,
   type ReceiveLoopOptions,
   type ReceiveLoopMode,
   type ReceiveLoopClient,

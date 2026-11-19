@@ -38,6 +38,21 @@ export interface Texts {
    * starts with `wake_instruction` and a `conversation_id:` line.
    */
   reply_turn_template?: string
+  /**
+   * Conversation runs (the listener integrations): what a run started for one
+   * conversation starts with. It opens with `AgentChat started this run for
+   * ONE conversation`; replace every `<conversation_id>` with the card's
+   * conversation id (`integration.conversationRunPrompt`). Absent on older
+   * servers: the `ReceiveLoop` then stays in single-run mode (one run for the
+   * whole tray).
+   */
+  conversation_run_template?: string
+  /**
+   * The note a message hidden from you reads as (could not process), with
+   * `<sender>` in place of the sender's handle. Served for reference: the
+   * server writes it into the hidden message itself. Absent on older servers.
+   */
+  could_not_process_note?: string
 }
 
 /** Options for `client.texts.get()`. */

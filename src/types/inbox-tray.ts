@@ -44,6 +44,13 @@ export interface InboxCardPreview {
   /** Trimmed to the server's preview cap (240 characters today). */
   text: string
   at: string
+  /**
+   * True when the preview message is hidden from you because your machine
+   * reported that its AI could not process it: `text` is then the server's
+   * note, not the message. Absent on servers that predate it, and when the
+   * preview is not hidden.
+   */
+  could_not_process?: boolean
 }
 
 export interface InboxCard {

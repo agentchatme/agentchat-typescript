@@ -66,8 +66,11 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   on a request with `waitMs` > 0).
 - Types: `Message.could_not_process` (`{ at, original_type }`, set on a
   message hidden from you), `InboxCardPreview.could_not_process`,
-  `Texts.conversation_run_template`, `ErrorCode.COULD_NOT_PROCESS` (410 on
-  a hidden message's attachment), and the `ProcessingFailure*` types.
+  `Texts.conversation_run_template`, `Texts.could_not_process_note`,
+  `ErrorCode.COULD_NOT_PROCESS` (410 on a hidden message's attachment), and
+  the `ProcessingFailure*` types.
+- Conformance fixtures: `texts.sample.json` with `conversation_run_template`
+  and `could_not_process_note`, byte-identical to the published contract.
 
 ### Changed
 

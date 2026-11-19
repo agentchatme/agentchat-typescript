@@ -26,6 +26,8 @@ import { json } from './fixtures.js'
 // mode, the gate-chunk split, and the failure report with the server's answer.
 
 const served = json<Texts>('texts.sample.json')
+/** The same texts as an older server served them: no conversation runs. */
+const { conversation_run_template: _runs, ...oldTexts } = served
 const sample = json<InboxTray>('tray.sample.json')
 const v1 = json<InboxTray>('tray.v1.sample.json')
 const INVITE = v1.invites![0]!
@@ -245,7 +247,7 @@ describe('conversation runs (single-run mode, texts with conversation_run_templa
     const old = fakeClient()
     old.state.tray = trayOf([N])
     const seen: RunRequest[] = []
-    const tray = runLoop({ client: old.client, texts: textsSource(served), startRun: async (request) => (seen.push(request), { status: 'completed' }) })
+    const tray = runLoop({ client: old.client, texts: textsSource(oldTexts), startRun: async (request) => (seen.push(request), { status: 'completed' }) })
     tray.loop.wake()
     await until(() => tray.loop.status().lastCycle !== null)
     expect(seen).toHaveLength(1)
@@ -321,7 +323,7 @@ describe('conversation runs (single-run mode, texts with conversation_run_templa
   })
 
   it('old texts (no conversation_run_template) and conversationRuns: false keep one run for the whole tray', async () => {
-    for (const setup of [{ texts: served }, { texts, conversationRuns: false }]) {
+    for (const setup of [{ texts: oldTexts }, { texts, conversationRuns: false }]) {
       const { client, state } = fakeClient()
       state.tray = trayOf([A, B])
       const seen: RunRequest[] = []
@@ -344,10 +346,28 @@ describe('conversation runs (single-run mode, texts with conversation_run_templa
     }
   })
 
+  it('the published texts (conformance texts.sample.json) carry the template: it starts conversation runs', async () => {
+    expect(served.conversation_run_template).toMatch(/^AgentChat started this run for ONE conversation/)
+    const { client, state } = fakeClient()
+    state.tray = trayOf([A])
+    const r = runs()
+    const { loop } = runLoop({ client, texts: textsSource(served), startRun: r.startRun })
+    loop.wake()
+    await until(() => r.started.length === 1)
+    expect(r.started[0]).toMatchObject({
+      kind: 'conversation',
+      conversationId: A.conversation_id,
+      prompt: served.conversation_run_template!.trim().split('<conversation_id>').join(A.conversation_id),
+    })
+    expect(r.started[0]!.prompt).not.toContain('<conversation_id>')
+    r.ends[0]!({ status: 'completed' })
+    await loop.stop()
+  })
+
   it('conversationRunPrompt: every placeholder replaced; a template without one gets a conversation_id line; no template falls back to the reply prompt', () => {
     expect(conversationRunPrompt(texts, 'conv_x')).toBe(TEMPLATE.split('<conversation_id>').join('conv_x'))
     expect(conversationRunPrompt({ ...texts, conversation_run_template: ' Just this one. ' }, 'conv_x')).toBe('Just this one.\n\nconversation_id: conv_x')
-    expect(conversationRunPrompt({ ...served, conversation_run_template: '  ' }, 'conv_x')).toBe(
+    expect(conversationRunPrompt({ ...oldTexts, conversation_run_template: '  ' }, 'conv_x')).toBe(
       served.reply_turn_template!.split('<conversation_id>').join('conv_x'),
     )
     // The id goes in as it is ($& is not a replacement pattern here).

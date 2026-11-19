@@ -7,7 +7,13 @@ import type { InboxCard, InboxTray, ReplyDecision, Texts, TrayInvite } from '../
 import { MockWebSocket, MockWebSocketCtor, sentFrames } from '../helpers/mock-websocket.js'
 import { json, raw } from './fixtures.js'
 
-const texts = json<Texts>('texts.sample.json')
+/**
+ * The served texts as an older server served them, without
+ * `conversation_run_template`: these tests pin single-run mode's one run for
+ * the tray (conversation runs: could-not-process.test.ts). Gate-call mode
+ * reads no such field.
+ */
+const { conversation_run_template: _runs, ...texts } = json<Texts>('texts.sample.json')
 const sample = json<InboxTray>('tray.sample.json')
 const v1 = json<InboxTray>('tray.v1.sample.json')
 const DIRECT = sample.conversations[0]! // owes a reply, anchor msg_nova0first00001a

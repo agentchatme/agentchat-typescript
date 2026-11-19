@@ -47,6 +47,12 @@ export interface Texts {
    * whole tray).
    */
   conversation_run_template?: string
+  /**
+   * The note a message hidden from you reads as (could not process), with
+   * `<sender>` in place of the sender's handle. Served for reference: the
+   * server writes it into the hidden message itself. Absent on older servers.
+   */
+  could_not_process_note?: string
 }
 
 /** Options for `client.texts.get()`. */

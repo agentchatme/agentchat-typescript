@@ -1617,6 +1617,38 @@ describe('could not process: the hold is checked when a run or turn starts', () 
   })
 })
 
+describe('could not process: no wake loop', () => {
+  it('a card whose gate call keeps failing, a runtime check that fails and a turn that runs on: one wake is one cycle, not a spin', async () => {
+    const X = card('conv_xray000001', 'msg_xray0001', {
+      preview: { ...sample.conversations[0]!.preview!, message_id: 'msg_xray0001', text: 'POISON x' },
+    })
+    const { client, state, report } = fakeClient()
+    state.tray = trayOf([B, X])
+    const t = turns()
+    const callModel = vi.fn(async (prompt: string) => {
+      if (prompt.includes('POISON')) throw new Error('refused')
+      return allAs('reply', prompt)
+    })
+    const checkRuntime = vi.fn(async () => ({ ok: false }))
+    const { loop } = gateLoop({ client, callModel, startTurn: t.startTurn, checkRuntime })
+    loop.wake()
+    await until(() => t.started.length === 1, 'B’s turn') // it runs on and does not end
+    await loop.idle()
+    await briefly()
+    const calls = callModel.mock.calls.length
+    const checks = checkRuntime.mock.calls.length
+    const cycles = loop.status().coalescer.cycles
+    loop.wake()
+    await new Promise((r) => setTimeout(r, 200))
+    await loop.idle()
+    expect(loop.status().coalescer.cycles - cycles).toBeLessThanOrEqual(2)
+    expect(callModel.mock.calls.length - calls).toBeLessThanOrEqual(2)
+    expect(checkRuntime.mock.calls.length - checks).toBeLessThanOrEqual(2)
+    expect(report).not.toHaveBeenCalled()
+    await loop.stop()
+  })
+})
+
 describe('Pacer: could-not-process holds beside D5 paces', () => {
   it('bounds paces and holds apart; a tray read lifts only holds made before it; a moved anchor lifts one, an absent card only on a complete tray', () => {
     let clock = 1_000

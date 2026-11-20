@@ -1099,6 +1099,8 @@ export class ReceiveLoop {
   private started = false
   private stopped = false
   private heldWhileRunning = false
+  /** A cycle left a card out because its could-not-process report was out: `letGo` reads the tray again. */
+  private heldWhileReporting = false
   private activeTurns = 0
   private noProgressStreak = 0
   private moreTimer: TimerHandle | null = null
@@ -1673,9 +1675,12 @@ export class ReceiveLoop {
    * answer may hold it.
    */
   private unheld(cards: readonly InboxCard[]): InboxCard[] {
-    return this.tracker
-      .withoutRunning(cards)
-      .filter((card) => !this.recordsInFlight.has(card.conversation_id) && !this.reporting.has(card.conversation_id))
+    return this.tracker.withoutRunning(cards).filter((card) => {
+      if (this.recordsInFlight.has(card.conversation_id)) return false
+      if (!this.reporting.has(card.conversation_id)) return true
+      this.heldWhileReporting = true
+      return false
+    })
   }
 
   /**
@@ -2158,8 +2163,6 @@ export class ReceiveLoop {
     await this.reportDue(due)
     // The last run of the queue has ended: the runtime check for a failure still waiting.
     await this.checkParked('run')
-    // A card a cycle left out while a report was out is read again.
-    this.afterTurnEnded()
   }
 
   /** The invite run: one run for the pending invites, holding each of them until it ends. */
@@ -2222,7 +2225,6 @@ export class ReceiveLoop {
     }
     await this.reportDue(due)
     await this.checkParked('run')
-    this.afterTurnEnded()
   }
 
   /** The runtime's `startRun`, never rejecting: a throw is a run that did not start. */
@@ -2430,8 +2432,6 @@ export class ReceiveLoop {
     await this.track(this.reportDue(due))
     // The last turn of the queue has ended: the runtime check for a failure still waiting.
     await this.track(this.checkParked('turn'))
-    // A card a cycle left out while a report was out is read again.
-    this.afterTurnEnded()
   }
 
   private async recordReplyOutcome(
@@ -2620,7 +2620,12 @@ export class ReceiveLoop {
     this.reporting.set(failure.conversationId, (this.reporting.get(failure.conversationId) ?? 0) + 1)
   }
 
-  /** The answers are in (or the report is off): those conversations are no longer held for it, and what waits for them goes on. */
+  /**
+   * The answers are in (or the report is off): those conversations are no
+   * longer held for it, what waits for them goes on, and a card a cycle left
+   * out meanwhile for a report is read again (only then: a wake for
+   * anything else could spin while a turn runs).
+   */
   private letGo(failures: readonly Failure[]): void {
     if (failures.length === 0) return
     for (const { conversationId } of failures) {
@@ -2628,7 +2633,12 @@ export class ReceiveLoop {
       if (left > 0) this.reporting.set(conversationId, left)
       else this.reporting.delete(conversationId)
     }
-    if (!this.stopped && this.waiting.length > 0) void this.pump()
+    if (this.stopped) return
+    if (this.waiting.length > 0) void this.pump()
+    if (this.heldWhileReporting) {
+      this.heldWhileReporting = false
+      this.wakeFrom('more')
+    }
   }
 
   /** An attempt of this kind failed for these conversations (whatever comes of it): see `failingSince`. */
@@ -2715,8 +2725,6 @@ export class ReceiveLoop {
       }
     } finally {
       this.letGo(due)
-      // A card a cycle left out while the check ran is read again.
-      this.afterTurnEnded()
     }
   }
 

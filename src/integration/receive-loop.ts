@@ -60,16 +60,30 @@
  * runtime check fails is dropped (a broken runtime reports nothing: that is
  * the integration's runs-failing path, and the server's re-wakes). A
  * failure reported as its attempt ends keeps its conversation held (no other
- * cycle starts it) until the server has answered. A run or
+ * cycle starts it) until the server has answered. So does one reported
+ * later (on another conversation's completion, or on the runtime check),
+ * from the moment its report is due: no cycle gates or runs it, and a run or
+ * turn of it waiting for a slot waits for the answer. A run or
  * turn that answered, or recorded a verdict, before it failed (read on a
  * fresh tray) is not a failure, nor is one `stop()` cut short. The report
  * reads through the card's anchor as it was when the failed attempt started;
  * the server picks the span and answers: `retry` or `hidden` → that
  * conversation goes again, after the others already queued (a gate call
  * after `hidden` in the next cycle, on the fresh card); `paused` or `none`
- * → the loop stops for it. At most `MAX_RERUNS_PER_CYCLE` (3) re-runs per
- * conversation per cycle. `status().processingFailures` counts it all; each
- * report is a `processing_failure` event.
+ * → the loop stops for it and holds it at the anchor it reported: no later
+ * cycle runs it or gates it again (a message elsewhere, a wake frame, a
+ * reconnect, an `unanswered` re-wake included), and a run or turn of it at
+ * that anchor does not start: one waiting for a slot is dropped, one
+ * decided before the answer came is checked again at its start, and a run
+ * of it already under way that ends silent there does not lift the hold. A
+ * failed message is not
+ * redelivered to the model; new messages flow: a newer message in that
+ * conversation moves its anchor and ends the hold (its failures are reported
+ * afresh), and so does a verdict or mark-read that takes the card off the
+ * tray. In memory: a restart may try it once more, and that report holds it
+ * again. At most `MAX_RERUNS_PER_CYCLE` (3) re-runs per
+ * conversation per cycle. `status().processingFailures` counts it all and
+ * lists what is held (`held`); each report is a `processing_failure` event.
  *
  * Wakes: a `message.new` frame that is not the echo of the agent's own send,
  * a `wake` frame (a reminder, or unanswered cards), every accepted HELLO (a
@@ -99,7 +113,8 @@
  * unless a newer message moves its anchor or an `unanswered` wake names it;
  * after an invite turn that left the invite pending, no second invite turn
  * for it within `paceMs` unless an `unanswered` wake arrives (those name no
- * invites). In memory.
+ * invites). In memory. The could-not-process hold above is the same hold
+ * without the time limit, and an `unanswered` wake does not lift it.
  *
  * There is no retry ladder here. A cycle that could not finish (the tray
  * could not be read, the model failed, a turn was refused or failed) leaves
@@ -141,8 +156,10 @@ import { normalizeHandle } from './anchor.js'
 
 /** Largest tray the server builds: the loop always reads all of it. */
 const TRAY_LIMIT = 50
-/** Silent-turn and pacing memory, bounded. */
+/** Silent-turn and pacing memory, bounded (could-not-process holds to the same bound, apart). */
 const SILENT_MEMORY = 1_000
+/** A conversation's key in the tracker and the pacer. */
+const CONVERSATION_KEY = 'conversation:'
 /** D5 pacing: how long a silent turn's card (or an invite after its turn) is not gated again. */
 export const PACE_MS = 60_000
 /** A running turn older than this is shown as overdue in `status()`. */
@@ -322,7 +339,7 @@ export type WakeSource = 'message' | 'wake_frame' | 'connect' | 'invite' | 'exte
 export type CycleOutcome =
   /** The tray had no cards and no invites. */
   | 'empty'
-  /** Cards were there, but only muted ones, paced ones or ones a turn holds. */
+  /** Cards were there, but only muted ones, paced ones, ones a turn holds, or ones held after a could-not-process answer. */
   | 'nothing_owed'
   | 'tray_failed'
   | 'texts_missing'
@@ -367,10 +384,17 @@ export interface CycleSummary {
   readonly turnsRefused: number
   /** Reply or invite turns (conversation runs: runs) waiting for a slot (`maxConcurrentTurns`). */
   readonly turnsQueued: number
-  /** Cards left out because a turn for their conversation is running or waiting. */
+  /** Cards left out because a turn for their conversation is running or waiting (or its could-not-process report is out). */
   readonly heldByTurns: number
   /** Cards and invites left out by D5 pacing (a recent silent turn). */
   readonly paced: number
+  /**
+   * Cards left out because a could-not-process report through their anchor
+   * was answered `none` or `paused`: not run again until a newer message.
+   * Always set by `ReceiveLoop` (optional in the type, so summaries built
+   * elsewhere keep compiling).
+   */
+  readonly heldAfterFailure?: number
   /** gateCall: gate calls (one per chunk of at most `gateChunkSize` cards) whose answer gave verdicts. */
   readonly chunksOk: number
   /**
@@ -456,9 +480,30 @@ export interface ProcessingFailureReport {
    * `hidden`, but its next attempt is already under way: running, queued, or
    * being gated now), `stop` (`paused`, `none`, or the report failed),
    * `rerun_capped` (`retry` / `hidden`, but it already ran again
-   * `MAX_RERUNS_PER_CYCLE` times in this cycle).
+   * `MAX_RERUNS_PER_CYCLE` times in this cycle). After a `paused` or `none`
+   * answer the conversation is also held at `throughMessageId` until a newer
+   * message arrives (`status().processingFailures.held`).
    */
   readonly next: 'rerun' | 'running' | 'stop' | 'rerun_capped'
+}
+
+/** The server's answer that holds a conversation after a could-not-process report. */
+export type FailureHoldReason = 'none' | 'paused'
+
+/**
+ * A conversation the loop does not run again until a newer message moves its
+ * card's anchor: the server answered `none` or `paused` to a could-not-process
+ * report through `anchor`. In memory: a restart may try it once more (that
+ * report answers the same and holds it again).
+ */
+export interface HeldConversation {
+  readonly conversationId: string
+  /** The anchor the failed attempt read through (the report's `throughMessageId`). */
+  readonly anchor: string
+  /** When the answer came (ISO 8601). */
+  readonly since: string
+  /** The server's answer. */
+  readonly reason: FailureHoldReason
 }
 
 export type ReceiveLoopEvent =
@@ -694,46 +739,160 @@ export interface ReceiveLoopStatus {
     readonly runtimeChecksFailed: number
     /** Gate splits stopped (`split_stopped`), since start. */
     readonly splitsStopped: number
+    /**
+     * Runs and reply turns not started because their conversation is held
+     * after a could-not-process answer (dropped from the queue, or stopped at
+     * their start), since start. Always set by `ReceiveLoop`.
+     */
+    readonly startsHeld?: number
     /** The last `checkRuntime()` answer, or null. */
     readonly lastRuntimeCheck: { readonly at: string; readonly ok: boolean; readonly detail: string | null } | null
+    /**
+     * Conversations not run again until a new message arrives: the server
+     * answered `none` or `paused` to their report (oldest first). As of the
+     * last tray read: a card read since (a verdict, a mark-read) or moved to
+     * a newer anchor leaves the list at the next one. Always set by
+     * `ReceiveLoop` (optional in the type, so status objects built elsewhere
+     * keep compiling).
+     */
+    readonly held?: HeldConversation[]
   }
   readonly lastError: string | null
 }
 
-/** D5 pacing, in memory: a key (`conversation:<id>` / `invite:<id>`) held until a time, for one anchor. */
-class Pacer {
-  private readonly until = new Map<string, { anchor: string | null; until: number }>()
+/** A key held at one anchor: a D5 pace (until a time), or a could-not-process hold (until the anchor moves). */
+interface PaceEntry {
+  readonly anchor: string | null
+  /** When a pace ends (epoch ms); a could-not-process hold has no end (`Infinity`). */
+  readonly until: number
+  /** A could-not-process hold: the server's answer, when it came, and its place among holds and tray reads. */
+  readonly failure?: { readonly reason: FailureHoldReason; readonly since: number; readonly seq: number }
+}
+
+/**
+ * D5 pacing, in memory: a key (`conversation:<id>` / `invite:<id>`) held
+ * until a time, for one anchor. A could-not-process hold (`holdFailed`) is
+ * the same hold with no end time: its conversation is held at that anchor
+ * until a newer message moves the anchor (`check` or `keepFailedOn` sees
+ * another anchor), the card leaves a complete tray (`keepFailedOn`), or a
+ * later answer of the server runs it again (`release`). A pace at the same
+ * anchor (a run of it already under way when the answer came, ending
+ * silent) does not replace it. An `unanswered` wake lifts paces only
+ * (`releasePace`): a re-wake of the same failed input would send the same
+ * messages to the model again. Paces and holds are bounded apart, so a burst
+ * of paces never pushes a hold out.
+ */
+/** @internal Exported for the kit's tests only (not part of the package's API). */
+export class Pacer {
+  private readonly until = new Map<string, PaceEntry>()
+  /** Orders holds and tray reads: a read lifts only holds older than its start. */
+  private seq = 0
   constructor(
     private readonly paceMs: number,
     private readonly now: () => number,
   ) {}
 
+  /** A D5 pace. It never replaces a could-not-process hold at the same anchor (that input stays held). */
   hold(key: string, anchor: string | null): void {
-    this.until.delete(key)
-    this.until.set(key, { anchor, until: this.now() + this.paceMs })
-    while (this.until.size > SILENT_MEMORY) {
-      const oldest = this.until.keys().next().value
-      if (oldest === undefined) break
-      this.until.delete(oldest)
+    const prior = this.until.get(key)
+    if (prior?.failure !== undefined && prior.anchor === anchor) return
+    this.set(key, { anchor, until: this.now() + this.paceMs })
+  }
+
+  /** Could not process: hold the key at this anchor until a newer message moves it (held again at it: since the first time). */
+  holdFailed(key: string, anchor: string, reason: FailureHoldReason): void {
+    const prior = this.until.get(key)
+    const since = prior?.failure !== undefined && prior.anchor === anchor ? prior.failure.since : this.now()
+    this.set(key, { anchor, until: Number.POSITIVE_INFINITY, failure: { reason, since, seq: ++this.seq } })
+  }
+
+  /** What holds the key at this anchor now: a pace, a could-not-process hold, or nothing (a stale entry goes). */
+  check(key: string, anchor: string | null): 'paced' | 'failed' | null {
+    const entry = this.until.get(key)
+    if (!entry) return null
+    if (entry.anchor !== anchor || this.now() >= entry.until) {
+      this.until.delete(key)
+      return null
     }
+    return entry.failure ? 'failed' : 'paced'
   }
 
   held(key: string, anchor: string | null): boolean {
-    const entry = this.until.get(key)
-    if (!entry) return false
-    if (entry.anchor !== anchor || this.now() >= entry.until) {
-      this.until.delete(key)
-      return false
-    }
-    return true
+    return this.check(key, anchor) !== null
   }
 
+  /** A could-not-process hold on the key at exactly this anchor; changes nothing (a queued run's anchor may be older than the card's). */
+  heldFailedAt(key: string, anchor: string | null): boolean {
+    const entry = this.until.get(key)
+    return entry?.failure !== undefined && entry.anchor === anchor
+  }
+
+  /** Lift whatever holds the key (a pace or a could-not-process hold). */
   release(key: string): void {
     this.until.delete(key)
   }
 
+  /** Lift a pace; a could-not-process hold stays. */
+  releasePace(key: string): void {
+    if (this.until.get(key)?.failure === undefined) this.until.delete(key)
+  }
+
   releaseInvites(): void {
     for (const key of [...this.until.keys()]) if (key.startsWith('invite:')) this.until.delete(key)
+  }
+
+  /** Taken before a tray read: `keepFailedOn` lifts only holds made before it. */
+  mark(): number {
+    return this.seq
+  }
+
+  /**
+   * After a tray read from `mark` (`anchors`: each card's key and anchor):
+   * a hold whose card shows another anchor is over (a newer message came),
+   * and, on a complete tray (`complete`: not truncated), so is one whose
+   * card is gone (read meanwhile: a verdict, a mark-read). Only holds made
+   * before the read started: a read that began earlier says nothing of a
+   * later hold.
+   */
+  keepFailedOn(anchors: ReadonlyMap<string, string | null>, mark: number, complete: boolean): void {
+    for (const [key, entry] of this.until) {
+      if (entry.failure === undefined || entry.failure.seq > mark) continue
+      const shown = anchors.get(key)
+      if (shown === undefined ? complete : shown !== entry.anchor) this.until.delete(key)
+    }
+  }
+
+  /** The could-not-process holds, oldest first (by `since`). */
+  failed(): Array<{ key: string; anchor: string; reason: FailureHoldReason; since: number }> {
+    const out: Array<{ key: string; anchor: string; reason: FailureHoldReason; since: number }> = []
+    for (const [key, entry] of this.until) {
+      if (entry.failure !== undefined && entry.anchor !== null) {
+        out.push({ key, anchor: entry.anchor, reason: entry.failure.reason, since: entry.failure.since })
+      }
+    }
+    return out.sort((a, b) => a.since - b.since)
+  }
+
+  private set(key: string, entry: PaceEntry): void {
+    this.until.delete(key)
+    this.until.set(key, entry)
+    let paces = 0
+    let holds = 0
+    for (const held of this.until.values()) {
+      if (held.failure === undefined) paces += 1
+      else holds += 1
+    }
+    // Oldest first, each kind to its own bound.
+    for (const [key, held] of this.until) {
+      if (paces <= SILENT_MEMORY && holds <= SILENT_MEMORY) break
+      if (held.failure === undefined && paces > SILENT_MEMORY) {
+        this.until.delete(key)
+        paces -= 1
+      } else if (held.failure !== undefined && holds > SILENT_MEMORY) {
+        this.until.delete(key)
+        holds -= 1
+      }
+    }
   }
 }
 
@@ -833,7 +992,8 @@ interface SplitItem {
   readonly reruns: number
 }
 
-type Launch = 'started' | 'refused' | 'queued'
+/** `held`: not started, held after a could-not-process answer that came after its card was read. */
+type Launch = 'started' | 'refused' | 'queued' | 'held'
 
 /** What the gate's chunks of one cycle came to, together. */
 interface ChunkedGate {
@@ -841,6 +1001,8 @@ interface ChunkedGate {
   gated: number
   /** Cards left out of their chunk (or their single-card call) because a turn took them meanwhile. */
   held: number
+  /** Cards left out of their chunk because a could-not-process answer held them meanwhile. */
+  heldAfterFailure: number
   /** The replies, call by call, each call's in the model's order. */
   reply: GateReply[]
   verdicts: Record<'reply' | 'dismiss' | 'defer', number>
@@ -920,9 +1082,16 @@ export class ReceiveLoop {
     runtimeChecksOk: 0,
     runtimeChecksFailed: 0,
     splitsStopped: 0,
+    startsHeld: 0,
   }
   /** Conversations whose verdict a gate call is recording right now (an abandoned cycle's included). */
   private readonly recordsInFlight = new Set<string>()
+  /**
+   * Could not process: conversations whose report is out on another's
+   * completion (`takeDue`): held out of the gate and of new runs, and a run
+   * or turn of theirs waiting for a slot waits, until the server answers.
+   */
+  private readonly reporting = new Map<string, number>()
   /** Turns holding a slot (admitted, not yet ended or released). */
   private readonly slotted = new Set<TurnHandle>()
 
@@ -1145,6 +1314,12 @@ export class ReceiveLoop {
         ...this.failureCounts,
         awaitingEvidence: this.awaitingEvidence.size,
         lastRuntimeCheck: this.lastRuntimeCheck === null ? null : { ...this.lastRuntimeCheck },
+        held: this.pacer.failed().map(({ key, anchor, reason, since }) => ({
+          conversationId: key.slice(CONVERSATION_KEY.length),
+          anchor,
+          since: new Date(since).toISOString(),
+          reason,
+        })),
       },
       lastError: this.lastError,
     }
@@ -1185,8 +1360,9 @@ export class ReceiveLoop {
       ? payload.conversation_ids.filter((x): x is string => typeof x === 'string')
       : []
     if (reason === 'unanswered') {
-      // The server says these are still unanswered: pacing yields.
-      for (const conversationId of named) this.pacer.release(`conversation:${conversationId}`)
+      // The server says these are still unanswered: pacing yields. A
+      // could-not-process hold does not: the same input would fail the same way.
+      for (const conversationId of named) this.pacer.releasePace(`${CONVERSATION_KEY}${conversationId}`)
       this.pacer.releaseInvites()
     }
     this.wakeFrom('wake_frame', id, {
@@ -1393,20 +1569,22 @@ export class ReceiveLoop {
   }
 
   private async gateCallCycle(run: CycleRun): Promise<CycleSummary> {
+    const mark = this.pacer.mark()
     const tray = await this.readTray()
     if (run.stale()) return this.summary('abandoned')
     if (tray === null) return this.summary('tray_failed', { failure: this.lastError })
     const cards = cardsOf(tray)
+    this.forgetCleared(tray, mark)
     const invites = trayInvites(tray)
     const unheld = this.unheld(cards)
     const heldByTurns = cards.length - unheld.length
     if (heldByTurns > 0) this.heldWhileRunning = true
-    const gateCards = unheld.filter((card) => !this.pacer.held(`conversation:${card.conversation_id}`, anchorFrom(card)))
+    const { open: gateCards, paced: pacedCards, heldAfterFailure } = this.paceCards(unheld)
     const openInvites = invites.filter((invite) => !this.tracker.inviteRunning(invite.invite_id))
     const owedInvites = openInvites.filter((invite) => !this.pacer.held(`invite:${invite.invite_id}`, null))
-    const paced = unheld.length - gateCards.length + (openInvites.length - owedInvites.length)
+    const paced = pacedCards + (openInvites.length - owedInvites.length)
     const owedCards = gateCards.filter((card) => card.muted !== true)
-    const base = { cards: cards.length, invites: invites.length, heldByTurns, paced, truncated: tray.truncated === true }
+    const base = { cards: cards.length, invites: invites.length, heldByTurns, paced, heldAfterFailure, truncated: tray.truncated === true }
     if (cards.length === 0 && invites.length === 0) return this.summary('empty', base)
     if (owedCards.length === 0 && owedInvites.length === 0) return this.summary('nothing_owed', base)
 
@@ -1432,6 +1610,7 @@ export class ReceiveLoop {
       chunksFailed: 0,
       splitCallsOk: 0,
       splitCallsFailed: 0,
+      heldAfterFailure,
     }
     let heldDuringGate = 0
     let splitStopped = false
@@ -1440,6 +1619,7 @@ export class ReceiveLoop {
     if (owedCards.length > 0) {
       const gate = await this.gateInChunks(run, tray, gateCards, texts)
       heldDuringGate = gate.held
+      tally.heldAfterFailure += gate.heldAfterFailure
       tally.gated = gate.gated
       tally.reply = gate.verdicts.reply
       tally.dismiss = gate.verdicts.dismiss
@@ -1468,7 +1648,7 @@ export class ReceiveLoop {
       } else if (owedInvites.length === 0 && !run.stale()) {
         // Every owed card became held by a turn while the gate ran (muted
         // cards alone cost no call): no call was made.
-        return this.summary('nothing_owed', { ...base, heldByTurns: heldByTurns + heldDuringGate })
+        return this.summary('nothing_owed', { ...base, heldByTurns: heldByTurns + heldDuringGate, heldAfterFailure: tally.heldAfterFailure })
       }
     }
     for (const invite of owedInvites) {
@@ -1488,10 +1668,55 @@ export class ReceiveLoop {
   /**
    * Held out of the gate: a running or waiting turn, or a verdict still being
    * recorded (an abandoned cycle's last call): gating it again could record
-   * the same verdict twice (a second defer climbs the ladder).
+   * the same verdict twice (a second defer climbs the ladder). Also a
+   * conversation whose could-not-process report is out (`reporting`): its
+   * answer may hold it.
    */
   private unheld(cards: readonly InboxCard[]): InboxCard[] {
-    return this.tracker.withoutRunning(cards).filter((card) => !this.recordsInFlight.has(card.conversation_id))
+    return this.tracker
+      .withoutRunning(cards)
+      .filter((card) => !this.recordsInFlight.has(card.conversation_id) && !this.reporting.has(card.conversation_id))
+  }
+
+  /**
+   * The cards neither paced (D5) nor held after a could-not-process answer
+   * (`none` / `paused` through the anchor they still show), and how many of
+   * each were left out. A card whose anchor moved is no longer held.
+   */
+  private paceCards(cards: readonly InboxCard[]): { open: InboxCard[]; paced: number; heldAfterFailure: number } {
+    const open: InboxCard[] = []
+    let paced = 0
+    let heldAfterFailure = 0
+    for (const card of cards) {
+      const state = this.pacer.check(`${CONVERSATION_KEY}${card.conversation_id}`, anchorFrom(card))
+      if (state === 'paced') paced += 1
+      else if (state === 'failed') heldAfterFailure += 1
+      else open.push(card)
+    }
+    return { open, paced, heldAfterFailure }
+  }
+
+  /** Held after a could-not-process answer, at the anchor this card still shows. */
+  private heldAfterFailure(card: InboxCard): boolean {
+    return this.pacer.check(`${CONVERSATION_KEY}${card.conversation_id}`, anchorFrom(card)) === 'failed'
+  }
+
+  /**
+   * A tray read after `mark`, every card on it (a turn's included): a held
+   * conversation whose card shows a newer anchor is no longer held, and on
+   * a complete tray (not truncated) neither is one whose card is gone (read
+   * meanwhile: a verdict, a mark-read). A truncated tray proves nothing
+   * about the cards it does not show.
+   */
+  private forgetCleared(tray: InboxTray, mark: number): void {
+    const anchors = new Map(cardsOf(tray).map((card) => [`${CONVERSATION_KEY}${card.conversation_id}`, anchorFrom(card)] as const))
+    this.pacer.keepFailedOn(anchors, mark, tray.truncated !== true)
+  }
+
+  /** The start of a run or reply turn: held after a could-not-process answer at the anchor it was started for. */
+  private failureHeld(handle: TurnHandle): boolean {
+    const turn = handle.turn
+    return turn.kind === 'reply' && this.pacer.heldFailedAt(`${CONVERSATION_KEY}${turn.conversationId}`, turn.anchor)
   }
 
   /**
@@ -1526,6 +1751,7 @@ export class ReceiveLoop {
     const out: ChunkedGate = {
       gated: 0,
       held: 0,
+      heldAfterFailure: 0,
       reply: [],
       verdicts: { reply: 0, dismiss: 0, defer: 0 },
       undecided: 0,
@@ -1579,7 +1805,11 @@ export class ReceiveLoop {
       const of = Math.ceil(chunked.length / size)
       for (let index = 1; index <= of; index++) {
         if (run.stale()) break
-        const planned = chunked.slice((index - 1) * size, index * size)
+        // A card held after a could-not-process answer since the tray was
+        // read (a turn's report, answered while this gate ran) is not gated.
+        const slice = chunked.slice((index - 1) * size, index * size)
+        const planned = slice.filter((card) => !this.heldAfterFailure(card))
+        out.heldAfterFailure += slice.length - planned.length
         const chunk = this.unheld(planned)
         out.held += planned.length - chunk.length
         if (chunk.length < planned.length) this.heldWhileRunning = true
@@ -1621,7 +1851,7 @@ export class ReceiveLoop {
           // left undecided keeps its standing (alone, its failure waiting).
           const through = decidedBy(result)
           for (const id of through) this.gateAlone.delete(id)
-          await run.exclude(() => this.reportDue(this.completed('gate', through)))
+          await run.exclude(() => this.reportDue(this.takeDue(this.completed('gate', through))))
           continue
         }
         this.failedAttempt('gate', chunk.filter((card) => card.muted !== true).map((card) => card.conversation_id))
@@ -1645,7 +1875,7 @@ export class ReceiveLoop {
           if (run.stale()) break splitting
           const { card, reruns } = queue.shift()!
           const id = card.conversation_id
-          if (decided.has(id) || split.skip.has(id)) continue
+          if (decided.has(id) || split.skip.has(id) || this.heldAfterFailure(card)) continue
           if (this.unheld([card]).length === 0) {
             if (!gated.has(id)) out.held += 1
             this.heldWhileRunning = true
@@ -1676,7 +1906,7 @@ export class ReceiveLoop {
           if (report.outcome === 'decided') {
             failuresInARow = 0
             this.gateAlone.delete(id)
-            await run.exclude(() => this.reportDue(this.completed('gate', decidedBy(result))))
+            await run.exclude(() => this.reportDue(this.takeDue(this.completed('gate', decidedBy(result)))))
             continue
           }
           this.rememberGateAlone(id)
@@ -1748,12 +1978,14 @@ export class ReceiveLoop {
   }
 
   private async singleRunCycle(run: CycleRun): Promise<CycleSummary> {
+    const mark = this.pacer.mark()
     const tray = await this.readTray()
     if (run.stale()) return this.summary('abandoned')
     let cards: number | null = null
     let invites: number | null = null
     let base = { cards: 0, invites: 0, heldByTurns: 0, truncated: false }
     if (tray !== null) {
+      this.forgetCleared(tray, mark)
       cards = cardsOf(tray).filter((card) => card.muted !== true).length
       invites = trayInvites(tray).length
       base = { cards: cardsOf(tray).length, invites, heldByTurns: 0, truncated: tray.truncated === true }
@@ -1817,23 +2049,25 @@ export class ReceiveLoop {
     const unheld = this.unheld(cards)
     const heldByTurns = cards.length - unheld.length
     if (heldByTurns > 0) this.heldWhileRunning = true
-    const runCards = unheld.filter((card) => !this.pacer.held(`conversation:${card.conversation_id}`, anchorFrom(card)))
+    // Paced after a run that left its card (D5), or held after the server
+    // answered `none` / `paused` to a report through the anchor it still shows.
+    const { open: runCards, paced: pacedCards, heldAfterFailure } = this.paceCards(unheld)
     const openInvites = invites.filter((invite) => !this.tracker.inviteRunning(invite.invite_id))
     const owedInvites = openInvites.filter((invite) => !this.pacer.held(`invite:${invite.invite_id}`, null))
-    const paced = unheld.length - runCards.length + (openInvites.length - owedInvites.length)
+    const paced = pacedCards + (openInvites.length - owedInvites.length)
     // Owed: an unmuted card with a preview. A notices-only card (preview null:
     // its only unread messages are system notices) gets no run of its own: a
     // whole run to look at "X joined" would cost the owner for nothing. It
     // waits on the tray, and the next run of that conversation reads through
     // it. Notices never wake (contract v1 §4), so nothing loops.
     const owedCards = runCards.filter((card) => card.muted !== true && card.preview != null)
-    const base = { cards: cards.length, invites: invites.length, heldByTurns, paced, truncated: tray.truncated === true }
+    const base = { cards: cards.length, invites: invites.length, heldByTurns, paced, heldAfterFailure, truncated: tray.truncated === true }
     if (owedCards.length === 0 && owedInvites.length === 0) return this.summary('nothing_owed', base)
     const unready = await this.checkReady()
     if (run.stale()) return this.summary('abandoned', base)
     if (unready !== null) return this.summary('tools_unavailable', { ...base, failure: unready })
 
-    const tally = { turnsStarted: 0, turnsRefused: 0, turnsQueued: 0 }
+    const tally = { turnsStarted: 0, turnsRefused: 0, turnsQueued: 0, heldAfterFailure }
     const failedLast = owedCards.filter((card) => this.awaitingEvidence.has(card.conversation_id))
     for (const card of owedCards.filter((card) => !failedLast.includes(card))) {
       if (run.stale()) break
@@ -1880,6 +2114,8 @@ export class ReceiveLoop {
     const held = this.tracker.holds(handle)
     let completion: Completion | null = null
     let failure: Failure | null = null
+    let due: Failure[] = []
+    let ended = false
     try {
       this.countRunEnd(end)
       this.emit({ type: 'run', end, kind: 'conversation', conversationId: attempt.conversationId })
@@ -1899,10 +2135,15 @@ export class ReceiveLoop {
           failure = { ...attempt, outcome: end.timedOut === true ? 'timed_out' : 'failed', failedAt: this.now(), holding: handle }
         }
       }
+      ended = true
     } finally {
       // A failure keeps the conversation held until the server has answered
       // (a later cycle must not start it meanwhile); the slot frees now.
       if (failure === null) this.tracker.end(handle)
+      // What this completion is the evidence for, before the slot frees: a
+      // run of theirs waiting for it waits for the server's answer. Only on
+      // a normal end: the report below then always goes out (and lets go).
+      if (ended && !this.stopped && completion !== null) due = this.takeDue(completion)
       this.releaseSlot(handle)
       if (failure === null) this.afterTurnEnded()
     }
@@ -1914,9 +2155,11 @@ export class ReceiveLoop {
         this.afterTurnEnded()
       }
     }
-    if (!this.stopped && completion !== null) await this.reportDue(completion)
+    await this.reportDue(due)
     // The last run of the queue has ended: the runtime check for a failure still waiting.
     await this.checkParked('run')
+    // A card a cycle left out while a report was out is read again.
+    this.afterTurnEnded()
   }
 
   /** The invite run: one run for the pending invites, holding each of them until it ends. */
@@ -1957,6 +2200,8 @@ export class ReceiveLoop {
     const end = await done
     const held = this.tracker.holds(slot)
     let completion: Completion | null = null
+    let due: Failure[] = []
+    let ended = false
     try {
       this.countRunEnd(end)
       this.emit({ type: 'run', end, kind: 'invite' })
@@ -1968,13 +2213,16 @@ export class ReceiveLoop {
       }
       // The single-run invite rule: pending after the second completed run → dismissed.
       if (this.options.dismissIgnoredInvites !== false) await this.afterRunInvites(invites, end)
+      ended = true
     } finally {
       endAll()
+      if (ended && !this.stopped && completion !== null) due = this.takeDue(completion)
       this.releaseSlot(slot)
       this.afterTurnEnded()
     }
-    if (!this.stopped && completion !== null) await this.reportDue(completion)
+    await this.reportDue(due)
     await this.checkParked('run')
+    this.afterTurnEnded()
   }
 
   /** The runtime's `startRun`, never rejecting: a throw is a run that did not start. */
@@ -2077,7 +2325,16 @@ export class ReceiveLoop {
    * hands its slot on the same way.
    */
   private async launch(handle: TurnHandle, admit: () => Promise<boolean>, drop?: () => void): Promise<Launch> {
-    if (this.waiting.length > 0 || this.activeTurns >= this.maxTurns) {
+    // A could-not-process answer may have come since its card was read (while
+    // a gate call or the readiness check ran): the start itself checks.
+    if (this.failureHeld(handle)) {
+      this.tracker.end(handle)
+      drop?.()
+      this.failureCounts.startsHeld += 1
+      return 'held'
+    }
+    // One whose conversation's report is out waits for the answer, even with a slot free.
+    if (this.waiting.length > 0 || this.activeTurns >= this.maxTurns || this.awaitsAnswer(handle)) {
       this.waiting.push({ handle, admit, ...(drop ? { drop } : {}) })
       this.counts.turnsQueued += 1
       // A free slot goes to the turn at the head of the queue, not to this one.
@@ -2108,17 +2365,34 @@ export class ReceiveLoop {
   }
 
   private async pump(): Promise<void> {
-    while (this.waiting.length > 0 && this.activeTurns < this.maxTurns && !this.stopped) {
-      const next = this.waiting.shift()!
+    while (this.activeTurns < this.maxTurns && !this.stopped) {
+      // In order, except that one whose conversation's could-not-process
+      // report is out waits for the answer (`reportDue` pumps again).
+      const index = this.waiting.findIndex((w) => !this.awaitsAnswer(w.handle))
+      if (index < 0) break
+      const next = this.waiting.splice(index, 1)[0]!
       if (!this.tracker.holds(next.handle)) continue // released while it waited
+      if (this.failureHeld(next.handle)) {
+        // Held at its anchor since it was queued: it does not start.
+        this.tracker.end(next.handle)
+        next.drop?.()
+        this.failureCounts.startsHeld += 1
+        continue
+      }
       await this.admitInSlot(next.handle, next.admit)
     }
+  }
+
+  private awaitsAnswer(handle: TurnHandle): boolean {
+    return handle.turn.kind === 'reply' && this.reporting.has(handle.turn.conversationId)
   }
 
   private async afterReplyTurn(handle: TurnHandle, attempt: Attempt, done: Promise<TurnEnd>): Promise<void> {
     const reply = attempt.reply!
     let completion: Completion | null = null
     let failure: Failure | null = null
+    let due: Failure[] = []
+    let ended = false
     try {
       const end = await this.tracker.confirmedEnd(handle, done)
       if (end === null || !this.tracker.holds(handle)) return // released: nothing recorded
@@ -2133,10 +2407,15 @@ export class ReceiveLoop {
       if (end.status === 'failed' && recorded?.freshRead === true && recorded.outcome.reason === 'turn_failed') {
         failure = { ...attempt, outcome: end.timedOut === true ? 'timed_out' : 'failed', failedAt: this.now(), holding: handle }
       }
+      ended = true
     } finally {
       // A failure keeps the conversation held until the server has answered
       // (a later cycle must not gate it meanwhile); the slot frees now.
       if (failure === null) this.tracker.end(handle)
+      // What this completion is the evidence for, before the slot frees: a
+      // turn of theirs waiting for it waits for the server's answer. Only on
+      // a normal end: the report below then always goes out (and lets go).
+      if (ended && !this.stopped && completion !== null) due = this.takeDue(completion)
       this.releaseSlot(handle)
       if (failure === null) this.afterTurnEnded()
     }
@@ -2148,9 +2427,11 @@ export class ReceiveLoop {
         this.afterTurnEnded()
       }
     }
-    if (!this.stopped && completion !== null) await this.track(this.reportDue(completion))
+    await this.track(this.reportDue(due))
     // The last turn of the queue has ended: the runtime check for a failure still waiting.
     await this.track(this.checkParked('turn'))
+    // A card a cycle left out while a report was out is read again.
+    this.afterTurnEnded()
   }
 
   private async recordReplyOutcome(
@@ -2294,11 +2575,15 @@ export class ReceiveLoop {
   }
 
   /**
-   * Report the failures this completion is the evidence for (each once). One
-   * that waited past `AWAITING_EVIDENCE_MS` is dropped instead: a completion
-   * that late says little about the runtime when it failed.
+   * The failures this completion is the evidence for (each once), taken off
+   * the waiting list. Their conversations are held from now until the
+   * server has answered (`reporting`): no gate, and a run or turn of theirs
+   * waiting for a slot waits for the answer, so it never starts on the input
+   * the answer is about. Take them before the completed work's slot frees.
+   * One that waited past `AWAITING_EVIDENCE_MS` is dropped instead: a
+   * completion that late says little about the runtime when it failed.
    */
-  private async reportDue(completion: Completion): Promise<void> {
+  private takeDue(completion: Completion): Failure[] {
     const now = this.now()
     const due: Failure[] = []
     for (const failure of [...this.awaitingEvidence.values()]) {
@@ -2308,10 +2593,42 @@ export class ReceiveLoop {
       }
       if (evidences(completion, failure)) {
         this.awaitingEvidence.delete(failure.conversationId)
+        this.holdForReport(failure)
         due.push(failure)
       }
     }
-    for (const failure of due) await this.reportFailure(failure, 'other_run_completed')
+    return due
+  }
+
+  /** Report what `takeDue` took, letting go of each conversation once its answer is in: what waits for it goes on (or was dropped). */
+  private async reportDue(due: readonly Failure[]): Promise<void> {
+    const held = [...due]
+    try {
+      while (held.length > 0) {
+        const failure = held[0]!
+        await this.reportFailure(failure, 'other_run_completed')
+        held.shift()
+        this.letGo([failure])
+      }
+    } finally {
+      this.letGo(held)
+    }
+  }
+
+  /** A report for this failure is due: its conversation is held until `letGo` (counted: two reports out hold it until both are answered). */
+  private holdForReport(failure: Failure): void {
+    this.reporting.set(failure.conversationId, (this.reporting.get(failure.conversationId) ?? 0) + 1)
+  }
+
+  /** The answers are in (or the report is off): those conversations are no longer held for it, and what waits for them goes on. */
+  private letGo(failures: readonly Failure[]): void {
+    if (failures.length === 0) return
+    for (const { conversationId } of failures) {
+      const left = (this.reporting.get(conversationId) ?? 0) - 1
+      if (left > 0) this.reporting.set(conversationId, left)
+      else this.reporting.delete(conversationId)
+    }
+    if (!this.stopped && this.waiting.length > 0) void this.pump()
   }
 
   /** An attempt of this kind failed for these conversations (whatever comes of it): see `failingSince`. */
@@ -2376,19 +2693,30 @@ export class ReceiveLoop {
         [...failing].every((id) => id === failure.conversationId),
     )
     if (due.length === 0) return
-    for (const failure of due) this.checkedFailures.add(failure)
-    const ok = await this.runtimeCheck()
+    // Held while the check runs and the report is out (as on `takeDue`): no
+    // cycle starts them on the input the answer is about.
     for (const failure of due) {
-      // Done with meanwhile (evidence came, a newer failure replaced it, the loop stopped)?
-      if (this.stopped || this.awaitingEvidence.get(failure.conversationId) !== failure) continue
-      if (!ok) {
+      this.checkedFailures.add(failure)
+      this.holdForReport(failure)
+    }
+    try {
+      const ok = await this.runtimeCheck()
+      for (const failure of due) {
+        // Done with meanwhile (evidence came, a newer failure replaced it, the loop stopped)?
+        if (this.stopped || this.awaitingEvidence.get(failure.conversationId) !== failure) continue
+        if (!ok) {
+          this.awaitingEvidence.delete(failure.conversationId)
+          continue
+        }
+        // Another conversation of that kind failed while the check ran: the runtime; it waits for (a).
+        if (![...failing].every((id) => id === failure.conversationId)) continue
         this.awaitingEvidence.delete(failure.conversationId)
-        continue
+        await this.reportFailure(failure, 'runtime_check')
       }
-      // Another conversation of that kind failed while the check ran: the runtime; it waits for (a).
-      if (![...failing].every((id) => id === failure.conversationId)) continue
-      this.awaitingEvidence.delete(failure.conversationId)
-      await this.reportFailure(failure, 'runtime_check')
+    } finally {
+      this.letGo(due)
+      // A card a cycle left out while the check ran is read again.
+      this.afterTurnEnded()
     }
   }
 
@@ -2467,10 +2795,30 @@ export class ReceiveLoop {
         next = this.rerun(failure, result.action === 'hidden')
       }
     }
-    if (result.action === 'paused') this.dropWaiting(failure.conversationId)
+    if (result.action === 'none' || result.action === 'paused') this.holdFailed(failure, result.action)
     // Stop for it in the running gate too (its single-card call, if queued).
     if (next === 'stop' || next === 'rerun_capped') this.activeSplit?.skip.add(failure.conversationId)
     this.emit({ type: 'processing_failure', ...base, result, next })
+  }
+
+  /**
+   * The server answered `none` or `paused`: the conversation is held at the
+   * anchor the report read through, so no later cycle (a message elsewhere,
+   * a wake frame, a reconnect, an `unanswered` re-wake, a turn's end) runs it
+   * again on the same input. A newer message moves its anchor and lifts the
+   * hold (`paceCards`); a card read meanwhile leaves the tray, and the hold
+   * with it (`forgetCleared`). What waits for it does not start: a run or
+   * reply turn queued at that anchor (after `paused`, the server's mute, any),
+   * and a reply turn to start again after the gate.
+   */
+  private holdFailed(failure: Failure, reason: FailureHoldReason): void {
+    const id = failure.conversationId
+    const anchor = failure.anchor!
+    this.pacer.holdFailed(`${CONVERSATION_KEY}${id}`, anchor, reason)
+    this.dropWaiting(id, reason === 'paused' ? null : anchor)
+    this.turnRerunsAfterGate = this.turnRerunsAfterGate.filter(
+      ({ reply }) => reply.conversationId !== id || (reason !== 'paused' && anchorFrom(reply.card) !== anchor),
+    )
   }
 
   /**
@@ -2533,14 +2881,20 @@ export class ReceiveLoop {
     }
   }
 
-  /** A `paused` conversation: a run or turn still waiting for a slot for it does not start. */
-  private dropWaiting(conversationId: string): void {
+  /**
+   * A held conversation: a run or turn still waiting for a slot for it does
+   * not start; with an `anchor`, only one for that anchor (one queued for a
+   * newer message is new input, and goes on).
+   */
+  private dropWaiting(conversationId: string, anchor: string | null): void {
     for (const entry of [...this.waiting]) {
       const turn = entry.handle.turn
       if (turn.kind !== 'reply' || turn.conversationId !== conversationId) continue
+      if (anchor !== null && turn.anchor !== anchor) continue
       this.waiting.splice(this.waiting.indexOf(entry), 1)
       this.tracker.end(entry.handle)
       entry.drop?.()
+      this.failureCounts.startsHeld += 1
     }
   }
 
@@ -2598,6 +2952,7 @@ export class ReceiveLoop {
       turnsQueued: 0,
       heldByTurns: 0,
       paced: 0,
+      heldAfterFailure: 0,
       chunksOk: 0,
       chunksFailed: 0,
       splitCallsOk: 0,
@@ -2744,7 +3099,8 @@ function timeoutOption(value: number | undefined, fallback: number, name: string
   return value
 }
 
-function launchKey(launch: Launch): 'turnsStarted' | 'turnsRefused' | 'turnsQueued' {
+function launchKey(launch: Launch): 'turnsStarted' | 'turnsRefused' | 'turnsQueued' | 'heldAfterFailure' {
+  if (launch === 'held') return 'heldAfterFailure'
   return launch === 'started' ? 'turnsStarted' : launch === 'queued' ? 'turnsQueued' : 'turnsRefused'
 }
 

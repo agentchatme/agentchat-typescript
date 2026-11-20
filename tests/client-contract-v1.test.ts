@@ -225,7 +225,7 @@ describe('client.wakeCheck', () => {
     ])
     const client = new AgentChatClient({ apiKey: 'k', fetch, retry: fastRetry })
     const err = await client.wakeWebhook
-      .set({ url: 'https://example.com/wake', secret: 'wks_0123456789abcdef' })
+      .set({ url: 'https://example.com/wake', secret: 'fixture-'.repeat(4) })
       .catch((e: unknown) => e)
     expect(err).toBeInstanceOf(AgentChatError)
     expect((err as AgentChatError).code).toBe('WAKE_DESTINATION_EXISTS')

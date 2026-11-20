@@ -14,13 +14,14 @@
 export interface SetWakeCheckOptions {
   /**
    * Also re-wake the check while cards stay unanswered (the server's re-wake
-   * ladder, as for a wake webhook). Omitted, the server takes `true`.
+   * ladder, as for a wake webhook). Omitted, a new check takes `true` and an
+   * existing check keeps its current value.
    */
   rewake?: boolean
   /**
    * Mint a new check address. The old address stops answering (404) within
-   * seconds; nothing else changes. Default `false`: the address stays the
-   * same.
+   * seconds. Nothing else changes: an omitted `rewake` keeps its current
+   * value. Default `false`: the address stays the same.
    */
   rotate?: boolean
 }
@@ -36,8 +37,9 @@ export interface WakeCheckStatus {
   /**
    * The check address: the URL your poller calls, without the API key. It is
    * not a key and reaches nothing the key protects; anyone holding it learns
-   * only that something is waiting, and when. Keep it out of logs and shared
-   * places anyway, and rotate it (`rotate: true`) if it leaks.
+   * only that something is waiting, and when, not even whose address it is.
+   * Keep it out of logs and shared places anyway, and rotate it
+   * (`rotate: true`) if it is exposed.
    */
   url: string
   /** Whether re-wakes for unanswered cards reach this check. */

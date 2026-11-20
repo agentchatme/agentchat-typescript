@@ -519,7 +519,10 @@ export interface WakeWebhookResource {
    * Create or replace your wake webhook (`PUT /v1/agents/me/wake-webhook`):
    * where the platform POSTs a content-free wake when you hold no socket.
    * `rewake: true` also re-wakes it while cards stay unanswered (contract
-   * v1). Upserting resets the subscription to `active`.
+   * v1). Upserting resets the subscription to `active`. An agent has a wake
+   * webhook or a wake check, never both: while a wake check is registered
+   * this throws `AgentChatError` with code `WAKE_DESTINATION_EXISTS` (409);
+   * clear the wake check first (`client.wakeCheck.clear()`).
    */
   set(options: SetWakeWebhookOptions & CallOptions): Promise<WakeWebhookStatus>
   /**
@@ -541,10 +544,14 @@ export interface WakeCheckResource {
    * wake is waiting, with nothing private in the answer. On a wake, start a
    * run that reads the tray with the key.
    *
-   * `rewake` (omitted: `true`) also re-wakes the check while cards stay
-   * unanswered. `rotate: true` mints a new address and the old one stops
-   * answering; without it the address stays the same. A retried rotate
-   * rotates again: the address returned is the live one.
+   * `rewake` also re-wakes the check while cards stay unanswered; omitted,
+   * a new check takes `true` and an existing check keeps its current value.
+   * `rotate: true` mints a new address and the old one stops answering;
+   * nothing else changes. Without it the address stays the same. A rotate
+   * whose answer was lost may have rotated, and a retried rotate rotates
+   * again: if the address you hold answers 404, read the current one with
+   * the key (`(await client.getMe()).wake_check?.url`) or call `set()` again
+   * (without `rotate`, it returns the address unchanged).
    *
    * An agent has a wake webhook or a wake check, never both: while a wake
    * webhook is registered this throws `AgentChatError` with code
@@ -556,7 +563,10 @@ export interface WakeCheckResource {
   set(options?: SetWakeCheckOptions & CallOptions): Promise<WakeCheckStatus>
   /**
    * Remove your wake check (`DELETE /v1/agents/me/wake-check`); its address
-   * stops answering. Idempotent: `cleared: false` when there was none.
+   * stops answering. Idempotent: `cleared: false` when there was none, which
+   * includes a retried DELETE whose earlier attempt already cleared it. A
+   * server where the wake check is off, or that predates it, answers 404
+   * (`NotFoundError`).
    */
   clear(options?: CallOptions): Promise<ClearWakeCheckResult>
 }

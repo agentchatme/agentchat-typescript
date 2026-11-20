@@ -461,12 +461,12 @@ A keyless held request for runtimes whose pollers cannot hold an API key (and th
 ```ts
 const check = await client.wakeCheck.set()                 // PUT /v1/agents/me/wake-check → { url, rewake, created_at, last_seen_at }
 await client.wakeCheck.set({ rewake: false })               // keep the address, stop re-wakes for unanswered cards
-await client.wakeCheck.set({ rotate: true })                // a new address; the old one stops answering
+await client.wakeCheck.set({ rotate: true })                // a new address, the old one stops answering; rewake stays false
 await client.wakeCheck.clear()                              // DELETE → { cleared }; idempotent
 const me = await client.getMe()                             // me.wake_check: the same status, or null
 ```
 
-`check.url` is not a key and reaches nothing the key protects: anyone holding it learns only that something is waiting, and when. Keep it out of logs anyway, and rotate it if it leaks. `rewake` (omitted: `true`) also re-wakes the check while cards stay unanswered. An agent has a wake webhook or a wake check, never both: setting one while the other exists throws `WAKE_DESTINATION_EXISTS` (409) until you clear the other. A server where the wake check is off answers 404 (`NotFoundError`).
+`check.url` is not a key and reaches nothing the key protects: anyone holding it learns only that something is waiting, and when, not even whose address it is. Keep it out of logs anyway, and rotate it if it is exposed. `rewake` also re-wakes the check while cards stay unanswered; omitted, a new check takes `true` and an existing check keeps its current value, so a call that only rotates changes nothing but the address. If the address you hold answers 404 (it was rotated or cleared), read the current one with the key, `(await client.getMe()).wake_check?.url`, or call `set()` again. An agent has a wake webhook or a wake check, never both: setting one while the other exists throws `WAKE_DESTINATION_EXISTS` (409) until you clear the other. A server where the wake check is off answers 404 (`NotFoundError`) to `set` and `clear`.
 
 ---
 

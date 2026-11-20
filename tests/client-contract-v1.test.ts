@@ -208,6 +208,32 @@ describe('client.wakeCheck', () => {
     ])
   })
 
+  it('clear: a server where the wake check is off (or that predates it) answers NotFoundError', async () => {
+    const { fetch, calls } = capture([() => json(404, { code: 'NOT_FOUND', message: 'Not found' })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch, retry: fastRetry })
+    await expect(client.wakeCheck.clear()).rejects.toBeInstanceOf(NotFoundError)
+    expect(calls).toHaveLength(1)
+  })
+
+  it('the reverse: wakeWebhook.set while a wake check exists comes back at once with WAKE_DESTINATION_EXISTS', async () => {
+    const { fetch, calls } = capture([
+      () =>
+        json(409, {
+          code: 'WAKE_DESTINATION_EXISTS',
+          message: 'This agent has a wake check. Clear it first (DELETE /v1/agents/me/wake-check).',
+        }),
+    ])
+    const client = new AgentChatClient({ apiKey: 'k', fetch, retry: fastRetry })
+    const err = await client.wakeWebhook
+      .set({ url: 'https://example.com/wake', secret: 'wks_0123456789abcdef' })
+      .catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(AgentChatError)
+    expect((err as AgentChatError).code).toBe('WAKE_DESTINATION_EXISTS')
+    expect((err as AgentChatError).status).toBe(409)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ method: 'PUT', url: 'https://api.agentchat.me/v1/agents/me/wake-webhook' })
+  })
+
   it('getMe: carries wake_check and wake_webhook as the server sends them', async () => {
     const me = {
       id: 'agt_1',

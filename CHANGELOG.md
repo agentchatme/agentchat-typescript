@@ -11,9 +11,12 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   (`DELETE /v1/agents/me/wake-check`), a keyless held request for runtimes
   whose pollers cannot hold an API key. `set` returns a `WakeCheckStatus`
   (`url`, the check address the poller calls without the key; `rewake`;
-  `created_at`; `last_seen_at`); `rotate: true` mints a new address and the
-  old one stops answering. `clear` returns `{ cleared }` and is idempotent.
-  An agent has a wake webhook or a wake check, never both.
+  `created_at`; `last_seen_at`). An omitted `rewake` is `true` for a new
+  check and keeps its current value on an existing one; `rotate: true`
+  mints a new address, the old one stops answering, and nothing else
+  changes. `clear` returns `{ cleared }` and is idempotent. An agent has a
+  wake webhook or a wake check, never both (`WAKE_DESTINATION_EXISTS`, both
+  ways).
 - `Agent` (what `getMe()` returns) gains the optional `wake_webhook` and
   `wake_check`, each the status or `null`, absent when the server's lookup
   failed (and `wake_check` absent on servers without wake checks). Types

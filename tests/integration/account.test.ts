@@ -211,6 +211,36 @@ describe('integration.account.run — scripted conversations', () => {
     })
   })
 
+  it('a done answer with a claim link: the message is shown as sent, the outcome is the same', async () => {
+    const claimLine =
+      'You can claim your agent @alice on the AgentChat dashboard to see its conversations. This link expires in 10 minutes: https://app.agentchat.test/claim/acl_example'
+    const withLink = () =>
+      json(201, {
+        agent: { handle: 'alice', email: 'a@example.com' },
+        api_key: 'key_test_1',
+        message: `Email verified. Logged in as @alice.\n${claimLine}`,
+        version: 1,
+        flow: 'register',
+        next_step: 'done',
+        status: 'approved',
+        claim_url: 'https://app.agentchat.test/claim/acl_example',
+        claim_expires_at: '2026-11-17T10:10:00.000Z',
+        claim_expires_in_s: 600,
+      })
+    const srv = server([sent(), withLink()])
+    const who = person([value('123456')])
+    expect(await runWith(srv, who)).toEqual({ outcome: 'done', apiKey: 'key_test_1', handle: 'alice' })
+    expect(who.shown).toEqual([SENT_TEXT, `Email verified. Logged in as @alice.\n${claimLine}`])
+
+    const step = await submitCode(
+      { version: 1, flow: 'register', next_step: 'verify', status: 'pending', pending_id: 'pnd_1' },
+      '123456',
+      { clientIdentity: IDENTITY, apiBase: API, fetch: server([withLink()]).fetch },
+    )
+    expect(step).toMatchObject({ action: 'done', apiKey: 'key_test_1', handle: 'alice' })
+    expect(step.message).toBe(`Email verified. Logged in as @alice.\n${claimLine}`)
+  })
+
   it('enter the code: done, with the key and the handle the server returned', async () => {
     const srv = server([sent(), registered('alice')])
     const who = person([value(' 123456 ')])

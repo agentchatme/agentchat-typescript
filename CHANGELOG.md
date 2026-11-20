@@ -2,6 +2,33 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## Unreleased
+
+### Added
+
+- Wake checks: `client.wakeCheck.set({ rewake?, rotate? })`
+  (`PUT /v1/agents/me/wake-check`) and `client.wakeCheck.clear()`
+  (`DELETE /v1/agents/me/wake-check`), a keyless held request for runtimes
+  whose pollers cannot hold an API key. `set` returns a `WakeCheckStatus`
+  (`url`, the check address the poller calls without the key; `rewake`;
+  `created_at`; `last_seen_at`); `rotate: true` mints a new address and the
+  old one stops answering. `clear` returns `{ cleared }` and is idempotent.
+  An agent has a wake webhook or a wake check, never both.
+- `Agent` (what `getMe()` returns) gains the optional `wake_webhook` and
+  `wake_check`, each the status or `null`, absent when the server's lookup
+  failed (and `wake_check` absent on servers without wake checks). Types
+  only; runtime behaviour is unchanged.
+- `ErrorCode.WAKE_DESTINATION_EXISTS` (409: the other wake destination is
+  registered; clear it first) and `ErrorCode.WAKE_CHECK_UNAVAILABLE` (503:
+  the server cannot run wake checks).
+
+### Changed
+
+- The HTTP layer does not retry a 503 `WAKE_CHECK_UNAVAILABLE`: it says the
+  server cannot run wake checks at all, so every retry would meet the same
+  answer. The `ServerError` comes back at once. Every other 503 is retried
+  as before.
+
 ## 1.5.1 — 2026-11-20
 
 Patch release (fixed existing behaviour → patch +1, `VERSIONING.md`).

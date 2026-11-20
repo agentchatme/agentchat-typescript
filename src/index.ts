@@ -22,6 +22,7 @@ export {
   type TextsResource,
   type GroupsResource,
   type WakeWebhookResource,
+  type WakeCheckResource,
   type SyncOptions,
   type SyncPage,
   type GetMessagesOptions,

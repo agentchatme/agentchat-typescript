@@ -9,6 +9,7 @@ import {
 } from './errors.js'
 import { parseRetryAfter } from './http-retry-after.js'
 import { defaultUserAgent } from './runtime.js'
+import { ErrorCode } from './types/errors.js'
 
 export type HttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
 
@@ -314,6 +315,11 @@ export class HttpTransport {
         error instanceof AwaitingReplyError ||
         error instanceof OtpAttemptsExhaustedError
 
+      // A 503 `WAKE_CHECK_UNAVAILABLE` says the server cannot run wake checks
+      // at all (it is not configured for them), not that it is busy: the
+      // same answer would come back on every retry.
+      const isTerminalCode = error.code === ErrorCode.WAKE_CHECK_UNAVAILABLE
+
       // A 429 that asks for a longer wait than one retry may sleep
       // (`maxDelayMs`) would only be turned away again: fail fast instead
       // of spending the retries on it.
@@ -325,6 +331,7 @@ export class HttpTransport {
         attempt < maxAttempts &&
         RETRIABLE_STATUSES.has(res.status) &&
         !isTerminal429 &&
+        !isTerminalCode &&
         !waitsTooLong
 
       await safeInvoke(this.hooks.onError, {

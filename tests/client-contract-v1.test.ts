@@ -1,9 +1,9 @@
 import { describe, expect, it, vi } from 'vitest'
 import { AgentChatClient } from '../src/client.js'
-import { NotFoundError } from '../src/errors.js'
-import type { TestWakeResult, WakeWebhookStatus } from '../src/types/index.js'
+import { AgentChatError, NotFoundError, ServerError } from '../src/errors.js'
+import type { Agent, TestWakeResult, WakeCheckStatus, WakeWebhookStatus } from '../src/types/index.js'
 
-// ─── client.groups / wakeWebhook / syncPage / per-call retry ───────────────
+// ─── client.groups / wakeWebhook / wakeCheck / syncPage / per-call retry ───
 
 interface Captured {
   url: string
@@ -115,6 +115,121 @@ describe('client.wakeWebhook', () => {
       ['POST', 'https://api.agentchat.me/v1/agents/me/wake-webhook/test'],
       ['DELETE', 'https://api.agentchat.me/v1/agents/me/wake-webhook'],
     ])
+  })
+})
+
+const checkStatus: WakeCheckStatus = {
+  url: 'https://api.agentchat.me/v1/wake-check/wc1.0a1b2c3d.aaaa.bbbb.cccc',
+  rewake: true,
+  created_at: '2026-11-20T09:00:00.000Z',
+  last_seen_at: null,
+}
+
+describe('client.wakeCheck', () => {
+  it('set: PUTs an empty body when no option is given and unwraps wake_check', async () => {
+    const { fetch, calls } = capture([() => json(200, { wake_check: checkStatus })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    await expect(client.wakeCheck.set()).resolves.toEqual(checkStatus)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({
+      method: 'PUT',
+      url: 'https://api.agentchat.me/v1/agents/me/wake-check',
+      body: {},
+    })
+    expect(calls[0]!.headers['content-type']).toBe('application/json')
+    expect(calls[0]!.headers['authorization']).toBe('Bearer k')
+  })
+
+  it('set: sends rewake and rotate when given, and only those; call options stay off the wire', async () => {
+    const { fetch, calls } = capture([
+      () => json(200, { wake_check: { ...checkStatus, rewake: false } }),
+      () => json(200, { wake_check: checkStatus }),
+    ])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    const result = await client.wakeCheck.set({ rewake: false, rotate: true, timeoutMs: 5_000 })
+    expect(result.rewake).toBe(false)
+    await client.wakeCheck.set({ rotate: false })
+    expect(calls.map((c) => c.body)).toEqual([{ rewake: false, rotate: true }, { rotate: false }])
+  })
+
+  it('set: a transient failure is retried (PUT is idempotent; a retried rotate rotates again)', async () => {
+    const { fetch, calls } = capture([
+      () => json(503, { code: 'INTERNAL_ERROR', message: 'busy' }),
+      () => json(200, { wake_check: checkStatus }),
+    ])
+    const client = new AgentChatClient({ apiKey: 'k', fetch, retry: fastRetry })
+    await expect(client.wakeCheck.set({ rotate: true })).resolves.toEqual(checkStatus)
+    expect(calls).toHaveLength(2)
+    expect(calls.map((c) => c.body)).toEqual([{ rotate: true }, { rotate: true }])
+  })
+
+  it('set: WAKE_DESTINATION_EXISTS (a wake webhook is registered) comes back at once with its code', async () => {
+    const { fetch, calls } = capture([
+      () =>
+        json(409, {
+          code: 'WAKE_DESTINATION_EXISTS',
+          message: 'This agent has a wake webhook. Clear it first (DELETE /v1/agents/me/wake-webhook).',
+        }),
+    ])
+    const client = new AgentChatClient({ apiKey: 'k', fetch, retry: fastRetry })
+    const err = await client.wakeCheck.set().catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(AgentChatError)
+    expect((err as AgentChatError).code).toBe('WAKE_DESTINATION_EXISTS')
+    expect((err as AgentChatError).status).toBe(409)
+    expect(calls).toHaveLength(1)
+  })
+
+  it('set: WAKE_CHECK_UNAVAILABLE is a ServerError that is not retried', async () => {
+    const { fetch, calls } = capture([
+      () => json(503, { code: 'WAKE_CHECK_UNAVAILABLE', message: 'Wake checks are not available on this server.' }),
+      () => json(200, { wake_check: checkStatus }),
+    ])
+    const client = new AgentChatClient({ apiKey: 'k', fetch, retry: fastRetry })
+    const err = await client.wakeCheck.set().catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ServerError)
+    expect((err as ServerError).code).toBe('WAKE_CHECK_UNAVAILABLE')
+    expect(calls).toHaveLength(1)
+  })
+
+  it('set: a server where the wake check is off (or that predates it) answers NotFoundError', async () => {
+    const { fetch } = capture([() => json(404, { code: 'NOT_FOUND', message: 'Not found' })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    await expect(client.wakeCheck.set()).rejects.toBeInstanceOf(NotFoundError)
+  })
+
+  it('clear: DELETEs and returns { cleared }', async () => {
+    const { fetch, calls } = capture([() => json(200, { cleared: true }), () => json(200, { cleared: false })])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    await expect(client.wakeCheck.clear()).resolves.toEqual({ cleared: true })
+    await expect(client.wakeCheck.clear()).resolves.toEqual({ cleared: false })
+    expect(calls.map((c) => [c.method, c.url])).toEqual([
+      ['DELETE', 'https://api.agentchat.me/v1/agents/me/wake-check'],
+      ['DELETE', 'https://api.agentchat.me/v1/agents/me/wake-check'],
+    ])
+  })
+
+  it('getMe: carries wake_check and wake_webhook as the server sends them', async () => {
+    const me = {
+      id: 'agt_1',
+      handle: 'nova',
+      email: 'n****@example.com',
+      display_name: null,
+      description: null,
+      avatar_url: null,
+      status: 'active',
+      paused_by_owner: 'none',
+      settings: { inbox_mode: 'open', group_invite_policy: 'open' },
+      created_at: '2026-11-01T00:00:00.000Z',
+      updated_at: '2026-11-01T00:00:00.000Z',
+      wake_webhook: null,
+      wake_check: checkStatus,
+    }
+    const { fetch, calls } = capture([() => json(200, me)])
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    const got: Agent = await client.getMe()
+    expect(got.wake_check).toEqual(checkStatus)
+    expect(got.wake_webhook).toBeNull()
+    expect(calls[0]).toMatchObject({ method: 'GET', url: 'https://api.agentchat.me/v1/agents/me' })
   })
 })
 

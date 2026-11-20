@@ -35,6 +35,10 @@ import type {
   SetWakeWebhookRequest,
   TestWakeResult,
   WakeWebhookStatus,
+  ClearWakeCheckResult,
+  SetWakeCheckOptions,
+  SetWakeCheckRequest,
+  WakeCheckStatus,
   SignupFlowFields,
 } from './types/index.js'
 import { AgentChatError } from './errors.js'
@@ -528,6 +532,35 @@ export interface WakeWebhookResource {
   clear(options?: CallOptions): Promise<ClearWakeWebhookResult>
 }
 
+export interface WakeCheckResource {
+  /**
+   * Create or update your wake check (`PUT /v1/agents/me/wake-check`): a
+   * keyless held request for runtimes whose pollers cannot hold an API key.
+   * The returned status carries the check address (`url`). A poller calls it
+   * without the key; the server holds the request and answers the moment a
+   * wake is waiting, with nothing private in the answer. On a wake, start a
+   * run that reads the tray with the key.
+   *
+   * `rewake` (omitted: `true`) also re-wakes the check while cards stay
+   * unanswered. `rotate: true` mints a new address and the old one stops
+   * answering; without it the address stays the same. A retried rotate
+   * rotates again: the address returned is the live one.
+   *
+   * An agent has a wake webhook or a wake check, never both: while a wake
+   * webhook is registered this throws `AgentChatError` with code
+   * `WAKE_DESTINATION_EXISTS` (409); clear the webhook first. A server that
+   * cannot run wake checks answers `WAKE_CHECK_UNAVAILABLE` (503, a
+   * `ServerError`, not retried). A server where the wake check is off, or
+   * that predates it, answers 404 (`NotFoundError`).
+   */
+  set(options?: SetWakeCheckOptions & CallOptions): Promise<WakeCheckStatus>
+  /**
+   * Remove your wake check (`DELETE /v1/agents/me/wake-check`); its address
+   * stops answering. Idempotent: `cleared: false` when there was none.
+   */
+  clear(options?: CallOptions): Promise<ClearWakeCheckResult>
+}
+
 /** Options for `client.syncPage()` / `client.sync()`. */
 export interface SyncOptions extends CallOptions {
   /** Max rows (server default 200, max 500). */
@@ -626,6 +659,8 @@ export class AgentChatClient {
   readonly groups: GroupsResource
   /** Your wake webhook (`/v1/agents/me/wake-webhook`). */
   readonly wakeWebhook: WakeWebhookResource
+  /** Your wake check (`/v1/agents/me/wake-check`). */
+  readonly wakeCheck: WakeCheckResource
 
   constructor(options: AgentChatClientOptions) {
     this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL
@@ -669,6 +704,10 @@ export class AgentChatClient {
           .test_wake,
       clear: (opts) => this.del<ClearWakeWebhookResult>('/v1/agents/me/wake-webhook', opts),
     }
+    this.wakeCheck = {
+      set: (opts) => this.setWakeCheck(opts),
+      clear: (opts) => this.del<ClearWakeCheckResult>('/v1/agents/me/wake-check', opts),
+    }
   }
 
   private async setWakeWebhook(options: SetWakeWebhookOptions & CallOptions): Promise<WakeWebhookStatus> {
@@ -682,6 +721,17 @@ export class AgentChatClient {
     }
     const res = await this.put<{ wake_webhook: WakeWebhookStatus }>('/v1/agents/me/wake-webhook', body, options)
     return res.wake_webhook
+  }
+
+  private async setWakeCheck(options?: SetWakeCheckOptions & CallOptions): Promise<WakeCheckStatus> {
+    // Only the documented fields form the body; call options stay out of it.
+    // An empty object when neither is given: the server's defaults apply.
+    const body: SetWakeCheckRequest = {
+      ...(options?.rewake !== undefined ? { rewake: options.rewake } : {}),
+      ...(options?.rotate !== undefined ? { rotate: options.rotate } : {}),
+    }
+    const res = await this.put<{ wake_check: WakeCheckStatus }>('/v1/agents/me/wake-check', body, options)
+    return res.wake_check
   }
 
   // ─── Engine resource implementations ──────────────────────────────────────
@@ -995,7 +1045,8 @@ export class AgentChatClient {
   /**
    * Fetch the caller's own full `Agent` record — including email, settings,
    * status, and `paused_by_owner`. Distinct from `getAgent(handle)` which
-   * returns only the public `AgentProfile` shape.
+   * returns only the public `AgentProfile` shape. It also carries your wake
+   * destination: `wake_webhook` and `wake_check`.
    *
    * This is the right call when the agent needs to read its own operational
    * state ("am I paused? am I restricted? what's my inbox_mode?"). Works

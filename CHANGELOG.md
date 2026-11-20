@@ -2,6 +2,40 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## 1.5.1 — 2026-11-20
+
+Patch release (fixed existing behaviour → patch +1, `VERSIONING.md`).
+
+### Fixed
+
+- `integration.ReceiveLoop`, both modes: a conversation whose
+  could-not-process report the server answered `none` or `paused` was run
+  again on the next cycle (a message in any conversation, a wake frame, a
+  reconnect, a wake the integration heard, a turn's end), on the same
+  failing input, and failed the same way every time. The loop now holds it
+  at the anchor it reported: no cycle runs or gates it while its card still
+  shows that anchor, an `unanswered` re-wake does not lift the hold, and a
+  run or turn of it at that anchor does not start, whether it was waiting
+  for a slot (dropped, on `none` too, as on `paused`) or was decided before
+  the answer came (checked again at its start). A run of it already under
+  way that ends silent there does not lift the hold either. A newer message
+  in the conversation ends the hold (a failure on it is handled afresh,
+  from `retry`), and so does a verdict or mark-read that takes the card off
+  a complete tray. In memory, bounded like the loop's other
+  per-conversation memory.
+- `integration.ReceiveLoop`: a failure reported on another conversation's
+  completion, or on the runtime check, now holds its conversation from the
+  moment the report is due until the server answers, as one reported at its
+  own end already did: no cycle gates or runs it meanwhile, and a run or
+  turn of it waiting for a slot waits for the answer (before, the freed slot
+  could start it on the input the answer was about).
+- `status().processingFailures.held` lists the held conversations
+  (`conversationId`, `anchor`, `since`, `reason`), `processingFailures.startsHeld`
+  counts the runs and turns not started for it, and `CycleSummary.heldAfterFailure`
+  counts the cards a cycle left out for it. The three are optional in the
+  types (always set by the loop), so status objects built elsewhere keep
+  compiling. Existing fields are unchanged.
+
 ## 1.5.0 — 2026-11-19
 
 Minor release (added behaviour → minor +1, `VERSIONING.md`).

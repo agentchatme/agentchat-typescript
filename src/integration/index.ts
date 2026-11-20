@@ -83,6 +83,8 @@ export {
   replyPrompt,
   conversationRunPrompt,
   type FailureSource,
+  type FailureHoldReason,
+  type HeldConversation,
   type ProcessingFailureReport,
   type RunKind,
   type RuntimeCheck,

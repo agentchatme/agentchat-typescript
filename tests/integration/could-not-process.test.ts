@@ -1,7 +1,8 @@
-import { describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { AgentChatClient } from '../../src/client.js'
 import { buildPrompt } from '../../src/gate.js'
 import {
+  Pacer,
   ReceiveLoop,
   conversationRunPrompt,
   type ReceiveLoopEvent,
@@ -20,6 +21,7 @@ import type {
   ReportProcessingFailureOptions,
   Texts,
 } from '../../src/types/index.js'
+import { MockWebSocket, MockWebSocketCtor } from '../helpers/mock-websocket.js'
 import { json } from './fixtures.js'
 
 // Could not process (contract v1, additive): conversation runs in single-run
@@ -585,9 +587,10 @@ describe('could not process: the report (conversation runs)', () => {
     r.ends[1]!({ status: 'completed' })
     await until(() => report.mock.calls.length === 1)
     expect(report.mock.calls[0]![1]).toMatchObject({ evidence: 'other_run_completed', throughMessageId: 'msg_poison03' })
-    await until(() => r.started.length === 3)
-    expect(r.started[2]!.conversationId).toBe(P.conversation_id)
-    r.ends[2]!({ status: 'completed' })
+    // none: P's run queued behind A waited for the answer and does not start; P is held at its anchor.
+    await loop.idle()
+    expect(r.started).toHaveLength(2)
+    expect(loop.status().processingFailures.held).toMatchObject([{ conversationId: P.conversation_id, anchor: 'msg_poison03', reason: 'none' }])
     await loop.stop()
 
     // A runtime whose own check fails: not the conversation's fault; nothing kept, nothing reported.
@@ -655,6 +658,8 @@ describe('could not process: the report (conversation runs)', () => {
     expect(loop.status().processingFailures).toMatchObject({ reported: 0, reportErrors: 1 })
     expect(reportsIn(events)[0]).toMatchObject({ result: null, error: 'network down', next: 'stop' })
     expect(events.some((e) => e.type === 'error' && e.error.message === 'network down')).toBe(true)
+    // The server did not answer: nothing is held.
+    expect(loop.status().processingFailures.held).toEqual([])
     // The loop goes on: the next wake runs.
     loop.wake()
     await until(() => r.started.length === 3)
@@ -1105,4 +1110,578 @@ describe('could not process: reply turns (gate-call mode)', () => {
     await second.loop.stop()
   })
 
+})
+
+// ─── the hold: a none or paused answer, until a newer message ───────────────
+
+describe('could not process: a none or paused answer holds the conversation until a newer message', () => {
+  beforeEach(() => MockWebSocket.reset())
+
+  const frame = (id: string, conversationId: string, seq: number) => ({
+    type: 'message.new',
+    payload: { id, conversation_id: conversationId, sender: '@example-scout', seq },
+  })
+  const unanswered = (ids: string[]) => ({
+    type: 'wake',
+    payload: { reason: 'unanswered', conversation_ids: ids, step: 1, at: '2026-11-20T09:01:00.000Z' },
+  })
+  const settled = async (loop: ReceiveLoop, cycles: number, what: string) => {
+    await until(() => loop.status().coalescer.cycles >= cycles && loop.status().coalescer.state === 'idle', what)
+    await loop.idle()
+    await briefly()
+  }
+
+  /** Single-run mode over a socket; a lone failure is reported on the runtime check. */
+  async function socketRuns(answers: Array<ProcessingFailureAction | Error>) {
+    const fake = fakeClient(answers)
+    const r = runs()
+    const events: ReceiveLoopEvent[] = []
+    const loop = new ReceiveLoop({
+      mode: 'singleRun',
+      client: fake.client,
+      texts: textsSource(),
+      startRun: r.startRun,
+      checkRuntime: async () => ({ ok: true }),
+      socket: { apiKey: 'ac_key', webSocket: MockWebSocketCtor, reconnectInterval: 5, maxReconnectInterval: 5 },
+      handle: '@example-relay',
+      quietMs: 0,
+      maxMs: 0,
+      onEvent: (e) => events.push(e),
+    })
+    return { ...fake, r, loop, events }
+  }
+  const connect = (): MockWebSocket => {
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateMessage(json('hello-ok.v1.json'))
+    return ws
+  }
+
+  it('none: a message elsewhere, a wake frame, an unanswered re-wake and a reconnect start no run of it while the others run; a newer message lifts it and its failure gets retry again', async () => {
+    const { state, report, r, loop, events } = await socketRuns([answer('none', { attempts: 3 }), answer('retry')])
+    state.tray = trayOf([P])
+    await loop.start()
+    let ws = connect()
+    await until(() => r.started.length === 1, 'P’s run on the connect wake')
+    r.ends[0]!({ status: 'failed', detail: 'API error: the request was refused' })
+    await until(() => report.mock.calls.length === 1, 'the report')
+    await settled(loop, 1, 'the first cycle')
+    expect(reportsIn(events)[0]).toMatchObject({ throughMessageId: 'msg_poison03', result: { action: 'none' }, next: 'stop' })
+    expect(loop.status().processingFailures.held).toEqual([
+      { conversationId: P.conversation_id, anchor: 'msg_poison03', since: expect.any(String), reason: 'none' },
+    ])
+
+    // A message in another conversation: A runs, P does not.
+    state.tray = trayOf([P, A])
+    ws.simulateMessage(frame('msg_alpha001', A.conversation_id, 1))
+    await until(() => r.started.length === 2, 'A’s run')
+    expect(r.started[1]!.conversationId).toBe(A.conversation_id)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'runs_started', heldAfterFailure: 1, turnsStarted: 1 })
+    r.ends[1]!({ status: 'completed' }) // its card stays: paced
+    await settled(loop, 2, 'A’s cycle')
+
+    // A wake frame (a reminder): nothing owed.
+    let cycles = loop.status().coalescer.cycles
+    ws.simulateMessage(json('wake-frame.json'))
+    await settled(loop, cycles + 1, 'the wake-frame cycle')
+    expect(r.started).toHaveLength(2)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'nothing_owed', paced: 1, heldAfterFailure: 1 })
+
+    // An unanswered re-wake naming both: A's pace yields, P's hold does not.
+    ws.simulateMessage(unanswered([P.conversation_id, A.conversation_id]))
+    await until(() => r.started.length === 3, 'A again after the re-wake')
+    expect(r.started[2]!.conversationId).toBe(A.conversation_id)
+    r.ends[2]!({ status: 'completed' })
+    await loop.idle()
+    await briefly()
+
+    // A reconnect (a new HELLO): nothing for P.
+    cycles = loop.status().coalescer.cycles
+    const sockets = MockWebSocket.instances.length
+    ws.simulateClose()
+    await until(() => MockWebSocket.instances.length > sockets, 'the reconnect')
+    ws = connect()
+    await settled(loop, cycles + 1, 'the reconnect cycle')
+    expect(r.ids()).toEqual([P.conversation_id, A.conversation_id, A.conversation_id])
+    expect(loop.status().processingFailures.held).toHaveLength(1)
+
+    // A newer message in P: the hold ends, P runs on it; its failure is reported through the new anchor and retried.
+    state.tray = trayOf([card(P.conversation_id, 'msg_poison04'), A])
+    ws.simulateMessage(frame('msg_poison04', P.conversation_id, 4))
+    await until(() => r.started.length === 4, 'P on the newer message')
+    expect(r.started[3]!.conversationId).toBe(P.conversation_id)
+    expect(loop.status().processingFailures.held).toEqual([])
+    r.ends[3]!({ status: 'failed' })
+    await until(() => r.started.length === 5, 'P again on retry')
+    expect(report.mock.calls.map(([id, opts]) => [id, opts.throughMessageId])).toEqual([
+      [P.conversation_id, 'msg_poison03'],
+      [P.conversation_id, 'msg_poison04'],
+    ])
+    expect(reportsIn(events).map((e) => [e.result?.action, e.next])).toEqual([
+      ['none', 'stop'],
+      ['retry', 'rerun'],
+    ])
+    r.ends[4]!({ status: 'completed' })
+    await loop.stop()
+  })
+
+  it('a run of it waiting for a slot waits for the answer: none drops it; retry starts it once, after the answer', async () => {
+    for (const action of ['none', 'retry'] as const) {
+      let answerNow: (a: ProcessingFailureAction) => void = () => undefined
+      const { client, state, report } = fakeClient()
+      report.mockImplementationOnce(() => new Promise<ProcessingFailureAction>((resolve) => (answerNow = resolve)))
+      state.tray = trayOf([P])
+      const r = runs()
+      const { loop, events } = runLoop({ client, startRun: r.startRun })
+      loop.wake()
+      await until(() => r.started.length === 1)
+      r.ends[0]!({ status: 'failed' }) // no evidence yet: it waits
+      await until(() => loop.status().processingFailures.awaitingEvidence === 1)
+      // The next wake: A runs, P waits behind it (its last run failed).
+      state.tray = trayOf([P, A])
+      loop.wake()
+      await until(() => r.started.length === 2 && loop.status().counters.turnsWaiting === 1)
+      expect(r.started[1]!.conversationId).toBe(A.conversation_id)
+      // A completes (the evidence): the slot is free, but P's run waits for the server's answer.
+      r.ends[1]!({ status: 'completed' })
+      await until(() => report.mock.calls.length === 1, 'the report under way')
+      await briefly()
+      expect(r.started).toHaveLength(2)
+      expect(loop.status().counters.turnsWaiting).toBe(1)
+      // A wake meanwhile does not start it either.
+      loop.wake()
+      await briefly()
+      expect(r.started).toHaveLength(2)
+      answerNow(answer(action))
+      if (action === 'none') {
+        await until(() => loop.status().counters.turnsWaiting === 0, 'the waiting run dropped')
+        await loop.idle()
+        expect(r.started).toHaveLength(2)
+        expect(loop.status().turns).toEqual([])
+        expect(reportsIn(events)[0]).toMatchObject({ next: 'stop' })
+        expect(loop.status().processingFailures.held).toMatchObject([{ conversationId: P.conversation_id, reason: 'none' }])
+      } else {
+        await until(() => r.started.length === 3, 'P after the answer')
+        expect(r.started[2]!.conversationId).toBe(P.conversation_id)
+        expect(reportsIn(events)[0]).toMatchObject({ next: 'running' }) // its next run was already queued
+        r.ends[2]!({ status: 'completed' })
+        await loop.idle()
+        expect(r.ids()).toEqual([P.conversation_id, A.conversation_id, P.conversation_id])
+        expect(loop.status().processingFailures.held).toEqual([])
+      }
+      await loop.stop()
+    }
+  })
+
+  it('a waiting failure reported on the runtime check is held while the check runs: a cycle meanwhile starts no run of it', async () => {
+    let pass: (answer: { ok: boolean }) => void = () => undefined
+    const checkRuntime = vi.fn(() => new Promise<{ ok: boolean }>((resolve) => (pass = resolve)))
+    const { client, state, report } = fakeClient([answer('none', { attempts: 3 })])
+    state.tray = trayOf([P], { invites: [INVITE] })
+    const r = runs()
+    const { loop } = runLoop({ client, startRun: r.startRun, checkRuntime })
+    loop.wake()
+    await until(() => r.started.length === 1)
+    r.ends[0]!({ status: 'failed' }) // P: the invite run is queued, so no check yet
+    await until(() => r.started.length === 2)
+    expect(r.started[1]!.kind).toBe('invite')
+    expect(checkRuntime).not.toHaveBeenCalled()
+    state.tray = trayOf([P])
+    r.ends[1]!({ status: 'completed' }) // no evidence for a run; nothing else queued: the check for P
+    await until(() => checkRuntime.mock.calls.length === 1, 'the runtime check')
+    const cycles = loop.status().coalescer.cycles
+    loop.wake() // a cycle while the check runs
+    await until(() => loop.status().coalescer.cycles > cycles && loop.status().coalescer.state === 'idle', 'the cycle')
+    expect(r.started).toHaveLength(2)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'nothing_owed', heldByTurns: 1 })
+    pass({ ok: true })
+    await until(() => report.mock.calls.length === 1, 'the report')
+    await loop.idle()
+    expect(report.mock.calls[0]![1]).toMatchObject({ evidence: 'runtime_check', throughMessageId: 'msg_poison03' })
+    loop.wake()
+    await loop.idle()
+    await briefly()
+    expect(r.started).toHaveLength(2)
+    expect(loop.status().processingFailures.held).toMatchObject([{ conversationId: P.conversation_id, reason: 'none' }])
+    await loop.stop()
+  })
+
+  it('paused holds the same way, also while the card is not shown muted', async () => {
+    const { client, state, report } = fakeClient([answer('paused', { attempts: 3, paused_until: '2026-11-21T12:00:00.000Z' })])
+    state.tray = trayOf([P, A])
+    const r = runs()
+    const { loop } = runLoop({ client, startRun: r.startRun, checkRuntime: async () => ({ ok: true }) })
+    loop.wake()
+    await until(() => r.started.length === 1)
+    r.ends[0]!({ status: 'failed' }) // P: A is queued behind it, the evidence
+    await until(() => r.started.length === 2)
+    r.ends[1]!({ status: 'completed' })
+    await until(() => report.mock.calls.length === 1)
+    await loop.idle()
+    expect(loop.status().processingFailures.held).toMatchObject([{ conversationId: P.conversation_id, anchor: 'msg_poison03', reason: 'paused' }])
+    // Wakes: A goes on (a newer message), P stays held at its anchor.
+    state.tray = trayOf([P, card(A.conversation_id, 'msg_alpha002')])
+    loop.wake()
+    await until(() => r.started.length === 3)
+    expect(r.started[2]!.conversationId).toBe(A.conversation_id)
+    r.ends[2]!({ status: 'completed' })
+    await loop.idle()
+    loop.wake()
+    await loop.idle()
+    await briefly()
+    expect(r.ids()).toEqual([P.conversation_id, A.conversation_id, A.conversation_id])
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'nothing_owed', heldAfterFailure: 1 })
+    // A newer message in P lifts it.
+    state.tray = trayOf([card(P.conversation_id, 'msg_poison04')])
+    loop.wake()
+    await until(() => r.started.length === 4)
+    expect(r.started[3]!.conversationId).toBe(P.conversation_id)
+    r.ends[3]!({ status: 'completed' })
+    await loop.stop()
+  })
+
+  it('a card read meanwhile (a verdict, a mark-read) ends the hold; a truncated tray without it proves nothing', async () => {
+    const { client, state, report } = fakeClient([answer('none', { attempts: 3 })])
+    state.tray = trayOf([P])
+    const r = runs()
+    const { loop } = runLoop({ client, startRun: r.startRun, checkRuntime: async () => ({ ok: true }) })
+    loop.wake()
+    await until(() => r.started.length === 1)
+    r.ends[0]!({ status: 'failed' })
+    await until(() => report.mock.calls.length === 1)
+    await loop.idle()
+    expect(loop.status().processingFailures.held).toHaveLength(1)
+    // A truncated tray that does not show P: still held.
+    state.tray = trayOf([A], { truncated: true })
+    loop.wake()
+    await until(() => r.started.length === 2)
+    r.ends[1]!({ status: 'completed' })
+    await loop.idle()
+    expect(loop.status().processingFailures.held).toHaveLength(1)
+    // A complete tray without P: the card was read; nothing left to hold.
+    state.tray = trayOf([])
+    loop.wake()
+    await until(() => loop.status().lastCycle?.outcome === 'empty')
+    expect(loop.status().processingFailures.held).toEqual([])
+    // Back at the same anchor later (a deferred card's reminder): it runs again.
+    state.tray = trayOf([P])
+    loop.wake()
+    await until(() => r.started.length === 3)
+    expect(r.started[2]!.conversationId).toBe(P.conversation_id)
+    r.ends[2]!({ status: 'completed' })
+    await loop.stop()
+  })
+
+  it('gate-call mode: a reply turn answered none is not gated again while its anchor stands; an unanswered re-wake does not lift it; the other cards are gated', async () => {
+    const { client, state, report } = fakeClient([answer('none', { attempts: 3 })])
+    state.tray = trayOf([P])
+    const t = turns()
+    const callModel = vi.fn(async (prompt: string) => allAs('reply', prompt))
+    const events: ReceiveLoopEvent[] = []
+    const loop = new ReceiveLoop({
+      mode: 'gateCall',
+      client,
+      texts: textsSource(served),
+      callModel,
+      startTurn: t.startTurn,
+      checkRuntime: async () => ({ ok: true }),
+      socket: { apiKey: 'ac_key', webSocket: MockWebSocketCtor },
+      handle: '@example-relay',
+      quietMs: 0,
+      maxMs: 0,
+      onEvent: (e) => events.push(e),
+    })
+    await loop.start()
+    const ws = connect()
+    await until(() => t.started.length === 1, 'P’s turn')
+    t.ends[0]!({ status: 'failed', detail: 'API error: refused' })
+    await until(() => report.mock.calls.length === 1)
+    await briefly()
+    expect(reportsIn(events)[0]).toMatchObject({ source: 'turn', result: { action: 'none' }, next: 'stop' })
+    expect(loop.status().processingFailures.held).toMatchObject([{ conversationId: P.conversation_id, anchor: 'msg_poison03' }])
+
+    // A message elsewhere: B is gated, P is not.
+    state.tray = trayOf([P, B])
+    ws.simulateMessage(frame('msg_bravo001', B.conversation_id, 1))
+    await until(() => t.started.length === 2, 'B’s turn')
+    expect(idsIn(callModel.mock.calls.at(-1)![0])).toEqual([B.conversation_id])
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'decided', heldAfterFailure: 1 })
+    state.tray = trayOf([P])
+    t.ends[1]!({ status: 'completed', agentchatCalls: { made: 2, failed: 0 } })
+    await briefly()
+    // An unanswered re-wake naming P: still no gate call for it.
+    const calls = callModel.mock.calls.length
+    const cycles = loop.status().coalescer.cycles
+    ws.simulateMessage(unanswered([P.conversation_id]))
+    await settled(loop, cycles + 1, 'the re-wake cycle')
+    expect(callModel.mock.calls.length).toBe(calls)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'nothing_owed', heldAfterFailure: 1 })
+    expect(t.started).toHaveLength(2)
+
+    // A newer message in P: gated again.
+    state.tray = trayOf([card(P.conversation_id, 'msg_poison04')])
+    ws.simulateMessage(frame('msg_poison04', P.conversation_id, 4))
+    await until(() => t.started.length === 3, 'P on the newer message')
+    expect(t.started[2]).toMatchObject({ kind: 'reply', conversationId: P.conversation_id, anchor: 'msg_poison04' })
+    t.ends[2]!({ status: 'completed', agentchatCalls: { made: 2, failed: 0 } })
+    await loop.stop()
+  })
+
+  it('gate-call mode: a single-card gate call answered none is not gated again; a newer message gates it alone', async () => {
+    const POISON = card('conv_poison0001', 'msg_poison03', {
+      preview: { ...sample.conversations[0]!.preview!, message_id: 'msg_poison03', text: 'POISON: content the model refuses' },
+    })
+    const { client, state, report } = fakeClient([answer('none', { attempts: 3 })])
+    state.tray = trayOf([POISON])
+    const callModel = vi.fn(async (prompt: string) => {
+      if (prompt.includes('POISON')) throw new Error('the provider refused the request')
+      return allAs('dismiss', prompt)
+    })
+    const { loop } = gateLoop({ client, callModel, checkRuntime: async () => ({ ok: true }) })
+    loop.wake()
+    await until(() => report.mock.calls.length === 1)
+    await loop.idle()
+    expect(report.mock.calls[0]![1]).toMatchObject({ evidence: 'runtime_check', throughMessageId: 'msg_poison03' })
+    state.tray = trayOf([POISON, B])
+    for (let i = 0; i < 2; i++) {
+      loop.wake()
+      await loop.idle()
+      await briefly()
+    }
+    expect(callModel.mock.calls.filter(([prompt]) => prompt.includes('POISON'))).toHaveLength(1)
+    expect(callModel.mock.calls.slice(1).map(([prompt]) => idsIn(prompt))).toEqual([[B.conversation_id], [B.conversation_id]])
+    state.tray = trayOf([{ ...POISON, preview: { ...POISON.preview!, message_id: 'msg_poison04', text: 'hello again' } }])
+    loop.wake()
+    await until(() => callModel.mock.calls.length === 4)
+    expect(idsIn(callModel.mock.calls[3]![0])).toEqual([POISON.conversation_id])
+    expect(loop.status().processingFailures.held).toEqual([])
+    await loop.stop()
+  })
+})
+
+// ─── the hold at the start itself: an answer that came after the card was read ──
+
+describe('could not process: the hold is checked when a run or turn starts', () => {
+  /** Gate-call mode with two slots: P's turn fails while B's runs, so P waits for evidence; the next gate (P, A) answers when the test says. */
+  async function gateWithParkedP(answers: Parameters<typeof fakeClient>[0], reportFirst?: Promise<ProcessingFailureAction>) {
+    const fake = fakeClient(answers)
+    if (reportFirst) fake.report.mockImplementationOnce(() => reportFirst)
+    fake.state.tray = trayOf([P, B])
+    const t = turns()
+    let release: () => void = () => undefined
+    const callModel = vi.fn((prompt: string) => {
+      if (callModel.mock.calls.length === 2) return new Promise<string>((r) => (release = () => r(allAs('reply', prompt))))
+      return Promise.resolve(allAs('reply', prompt))
+    })
+    const { loop } = gateLoop({ client: fake.client, callModel, startTurn: t.startTurn, maxConcurrentTurns: 2 })
+    loop.wake()
+    await until(() => t.started.length === 2, 'P and B')
+    t.ends[0]!({ status: 'failed' }) // P; B still runs: no evidence yet
+    await until(() => loop.status().processingFailures.awaitingEvidence === 1)
+    fake.state.tray = trayOf([P, A])
+    loop.wake()
+    await until(() => callModel.mock.calls.length === 2, 'the gate call for P and A')
+    t.ends[1]!({ status: 'completed', agentchatCalls: { made: 1, failed: 0 } }) // B: the evidence for P
+    await until(() => fake.report.mock.calls.length === 1, 'the report')
+    return { ...fake, t, loop, release: () => release() }
+  }
+  const startedIds = (t: ReturnType<typeof turns>) => t.started.map((r) => (r as { conversationId: string }).conversationId)
+
+  it('gate-call mode: none lands while the gate call carrying the card is out; the gate says reply; no turn starts at the held anchor', async () => {
+    const { t, loop, release } = await gateWithParkedP([answer('none', { attempts: 3 })])
+    await briefly()
+    expect(loop.status().processingFailures.held).toMatchObject([{ conversationId: P.conversation_id, anchor: 'msg_poison03' }])
+    release()
+    await until(() => t.started.length === 3, 'A’s turn')
+    await loop.idle()
+    await briefly()
+    expect(startedIds(t)).toEqual([P.conversation_id, B.conversation_id, A.conversation_id])
+    expect(loop.status().processingFailures.startsHeld).toBe(1)
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'decided', heldAfterFailure: 1 })
+    await loop.stop()
+  })
+
+  it('gate-call mode: the gate answers while the report is still out; the turn waits for the answer (with a slot free) and none drops it', async () => {
+    let answerNow: (a: ProcessingFailureAction) => void = () => undefined
+    const pending = new Promise<ProcessingFailureAction>((resolve) => (answerNow = resolve))
+    const { t, loop, release } = await gateWithParkedP([], pending)
+    release()
+    await until(() => t.started.length === 3, 'A’s turn')
+    await briefly()
+    expect(startedIds(t)).toEqual([P.conversation_id, B.conversation_id, A.conversation_id])
+    expect(loop.status().counters.turnsWaiting).toBe(1) // P's, waiting for the answer
+    answerNow(answer('none'))
+    await until(() => loop.status().counters.turnsWaiting === 0, 'P’s turn dropped')
+    await briefly()
+    expect(t.started).toHaveLength(3)
+    expect(loop.status().processingFailures.startsHeld).toBe(1)
+    await loop.stop()
+  })
+
+  it('conversation runs: none lands while the cycle waits on its readiness check; the run of the card it read does not start', async () => {
+    let answerNow: (a: ProcessingFailureAction) => void = () => undefined
+    const { client, state, report } = fakeClient()
+    report.mockImplementationOnce(() => new Promise<ProcessingFailureAction>((resolve) => (answerNow = resolve)))
+    state.tray = trayOf([P, A])
+    const r = runs()
+    let ready: (() => void) | null = null
+    let slow = false
+    const readiness = async (): Promise<{ ready: true }> => {
+      if (slow) await new Promise<void>((resolve) => (ready = resolve))
+      return { ready: true }
+    }
+    const { loop } = runLoop({ client, startRun: r.startRun, maxConcurrentTurns: 2, readiness })
+    loop.wake()
+    await until(() => r.started.length === 2, 'P and A')
+    r.ends[0]!({ status: 'failed' }) // P; A still runs
+    await until(() => loop.status().processingFailures.awaitingEvidence === 1)
+    slow = true
+    loop.wake() // reads [P, A]: A is running, P is owed; the cycle waits on readiness
+    await until(() => ready !== null, 'the cycle in its readiness check')
+    r.ends[1]!({ status: 'completed' }) // A: the evidence for P
+    await until(() => report.mock.calls.length === 1)
+    answerNow(answer('none'))
+    await until(() => (loop.status().processingFailures.held ?? []).length === 1, 'the hold')
+    ready!()
+    await loop.idle()
+    await briefly()
+    expect(r.ids()).toEqual([P.conversation_id, A.conversation_id])
+    expect(loop.status().processingFailures.startsHeld).toBe(1)
+    await loop.stop()
+  })
+
+  it('none keeps a run waiting at a newer anchor (new input); paused drops it', async () => {
+    for (const action of ['none', 'paused'] as const) {
+      const { client, state, report } = fakeClient([answer(action, { attempts: 3 })])
+      state.tray = trayOf([P])
+      const r = runs()
+      const { loop } = runLoop({ client, startRun: r.startRun })
+      loop.wake()
+      await until(() => r.started.length === 1)
+      r.ends[0]!({ status: 'failed' }) // P at msg_poison03: no evidence yet
+      await until(() => loop.status().processingFailures.awaitingEvidence === 1)
+      // A newer message in P: its run waits behind A's (its last run failed).
+      state.tray = trayOf([card(P.conversation_id, 'msg_poison04'), A])
+      loop.wake()
+      await until(() => r.started.length === 2 && loop.status().counters.turnsWaiting === 1)
+      r.ends[1]!({ status: 'completed' }) // A: the evidence; the report is through msg_poison03
+      await until(() => report.mock.calls.length === 1)
+      expect(report.mock.calls[0]![1]).toMatchObject({ throughMessageId: 'msg_poison03' })
+      if (action === 'none') {
+        await until(() => r.started.length === 3, 'P on its newer message')
+        expect(r.started[2]!.conversationId).toBe(P.conversation_id)
+        r.ends[2]!({ status: 'completed' })
+        await loop.idle()
+        // The next tray shows the newer anchor: the old hold is gone from status.
+        loop.wake()
+        await loop.idle()
+        await briefly()
+        expect(loop.status().processingFailures.held).toEqual([])
+      } else {
+        await until(() => loop.status().counters.turnsWaiting === 0)
+        await loop.idle()
+        await briefly()
+        expect(r.started).toHaveLength(2)
+        expect(loop.status().processingFailures.startsHeld).toBe(1)
+      }
+      await loop.stop()
+    }
+  })
+
+  it('a run of it already under way when none lands, ending silent at that anchor, does not lift the hold', async () => {
+    const { client, state, report } = fakeClient([answer('none', { attempts: 3 })])
+    state.tray = trayOf([P])
+    const r = runs()
+    const { loop } = runLoop({ client, startRun: r.startRun, maxConcurrentTurns: 2 })
+    loop.wake()
+    await until(() => r.started.length === 1)
+    r.ends[0]!({ status: 'failed' }) // no evidence yet
+    await until(() => loop.status().processingFailures.awaitingEvidence === 1)
+    state.tray = trayOf([P, A])
+    loop.wake()
+    await until(() => r.started.length === 3, 'A and P again, two slots')
+    const a = r.ids().indexOf(A.conversation_id, 1)
+    const p = a === 1 ? 2 : 1
+    r.ends[a]!({ status: 'completed' }) // A: the evidence; none holds P at msg_poison03
+    await until(() => report.mock.calls.length === 1)
+    await until(() => (loop.status().processingFailures.held ?? []).length === 1)
+    r.ends[p]!({ status: 'completed' }) // P's run under way ends silent at the same anchor
+    await loop.idle()
+    loop.wake()
+    await loop.idle()
+    await briefly()
+    expect(r.started).toHaveLength(3)
+    expect(loop.status().processingFailures.held).toMatchObject([{ conversationId: P.conversation_id, anchor: 'msg_poison03' }])
+    expect(loop.status().lastCycle).toMatchObject({ outcome: 'nothing_owed', heldAfterFailure: 1 })
+    await loop.stop()
+  })
+})
+
+describe('could not process: no wake loop', () => {
+  it('a card whose gate call keeps failing, a runtime check that fails and a turn that runs on: one wake is one cycle, not a spin', async () => {
+    const X = card('conv_xray000001', 'msg_xray0001', {
+      preview: { ...sample.conversations[0]!.preview!, message_id: 'msg_xray0001', text: 'POISON x' },
+    })
+    const { client, state, report } = fakeClient()
+    state.tray = trayOf([B, X])
+    const t = turns()
+    const callModel = vi.fn(async (prompt: string) => {
+      if (prompt.includes('POISON')) throw new Error('refused')
+      return allAs('reply', prompt)
+    })
+    const checkRuntime = vi.fn(async () => ({ ok: false }))
+    const { loop } = gateLoop({ client, callModel, startTurn: t.startTurn, checkRuntime })
+    loop.wake()
+    await until(() => t.started.length === 1, 'B’s turn') // it runs on and does not end
+    await loop.idle()
+    await briefly()
+    const calls = callModel.mock.calls.length
+    const checks = checkRuntime.mock.calls.length
+    const cycles = loop.status().coalescer.cycles
+    loop.wake()
+    await new Promise((r) => setTimeout(r, 200))
+    await loop.idle()
+    expect(loop.status().coalescer.cycles - cycles).toBeLessThanOrEqual(2)
+    expect(callModel.mock.calls.length - calls).toBeLessThanOrEqual(2)
+    expect(checkRuntime.mock.calls.length - checks).toBeLessThanOrEqual(2)
+    expect(report).not.toHaveBeenCalled()
+    await loop.stop()
+  })
+})
+
+describe('Pacer: could-not-process holds beside D5 paces', () => {
+  it('bounds paces and holds apart; a tray read lifts only holds made before it; a moved anchor lifts one, an absent card only on a complete tray', () => {
+    let clock = 1_000
+    const pacer = new Pacer(60_000, () => clock)
+    pacer.holdFailed('conversation:p', 'm1', 'none')
+    for (let i = 0; i < 1_500; i++) pacer.hold(`conversation:c${i}`, 'm')
+    expect(pacer.failed().map((h) => h.key)).toEqual(['conversation:p']) // paces never push a hold out
+    for (let i = 0; i < 1_000; i++) {
+      clock += 1
+      pacer.holdFailed(`conversation:h${i}`, 'm', 'paused')
+    }
+    const held = pacer.failed()
+    expect(held).toHaveLength(1_000)
+    expect(held[0]!.key).toBe('conversation:h0') // the oldest hold went first
+    expect(pacer.check('conversation:c1499', 'm')).toBe('paced')
+
+    const fresh = new Pacer(60_000, () => clock)
+    const before = fresh.mark()
+    fresh.holdFailed('conversation:p', 'm1', 'none')
+    fresh.keepFailedOn(new Map(), before, true) // a read that began before the hold
+    expect(fresh.heldFailedAt('conversation:p', 'm1')).toBe(true)
+    fresh.keepFailedOn(new Map(), fresh.mark(), false) // truncated, card not shown: proves nothing
+    expect(fresh.heldFailedAt('conversation:p', 'm1')).toBe(true)
+    fresh.hold('conversation:p', 'm1') // a pace at the same anchor does not replace it
+    expect(fresh.check('conversation:p', 'm1')).toBe('failed')
+    fresh.releasePace('conversation:p') // an unanswered wake
+    expect(fresh.heldFailedAt('conversation:p', 'm1')).toBe(true)
+    expect(fresh.heldFailedAt('conversation:p', 'm0')).toBe(false) // an older anchor neither matches nor lifts it
+    expect(fresh.heldFailedAt('conversation:p', 'm1')).toBe(true)
+    fresh.keepFailedOn(new Map([['conversation:p', 'm2']]), fresh.mark(), false) // a newer anchor shown
+    expect(fresh.failed()).toEqual([])
+    fresh.holdFailed('conversation:q', 'm1', 'none')
+    fresh.keepFailedOn(new Map(), fresh.mark(), true) // a complete tray without it: read
+    expect(fresh.failed()).toEqual([])
+  })
 })

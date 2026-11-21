@@ -2,6 +2,18 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## Unreleased
+
+### Tests
+
+- `ManualSync` retry tests (`tests/integration/texts-and-manual.test.ts`):
+  the wait helper gave up after 5,000 event-loop turns, not after a span of
+  time, and a sync's real file I/O on the libuv threadpool can take longer
+  than that on a slow runner, so two tests failed in a CI run. The helper
+  now waits up to 10 s of real elapsed time (`performance.now()`, which the
+  fake timers leave alone), checking the same conditions, and the suite's
+  tests get 30 s each. Tests only; no change to the package.
+
 ## 1.8.0 — 2026-11-21
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): `integration.anchor` gains `owner`, `decide` and `follow` (new surface).

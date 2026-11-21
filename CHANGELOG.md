@@ -2,6 +2,29 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## Unreleased
+
+### Fixed
+
+- `integration.ManualSync`: a manual that failed to download was not tried
+  again until the texts changed or the process restarted. A sync ran at
+  `start()` and on each texts change only, and `TextsCache` reports a
+  change only when the content differs. A gateway that started offline,
+  with cached texts already announcing a newer manual, kept the old file
+  (as it should), and the next successful texts fetch returned the same
+  texts, so nothing ran again: the manual stayed stale for as long as the
+  process lived. While following (between `start()` and `stop()`), a sync
+  that leaves the file not the announced manual (`upToDate` not `true`) is
+  now tried again on its own after 5 min, doubling to 1 h (the texts
+  cache's retry cadence), each wait ±20 %. A current result ends the
+  retries and resets the backoff; a texts change still syncs at once and
+  starts the backoff over; nothing announced means no retry. `stop()`
+  cancels a pending retry, the timer never keeps the process alive, and
+  retries run one at a time with every other sync. `onResult` still hears a
+  repeated failure once. No new options or exports.
+- `docs/integration-kit.md`: the manual section says when the manual
+  syncs, the retry included.
+
 ## 1.6.0 — 2026-11-21
 
 Minor release (added behaviour → minor +1, `VERSIONING.md`).

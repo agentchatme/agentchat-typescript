@@ -378,6 +378,15 @@ describe('follow — a concurrent edit is never written over', () => {
     expect(fs.readdirSync(dir)).toEqual([])
   })
 
+  it('options an untyped caller got wrong are a failure, never a rejection', async () => {
+    fs.writeFileSync(file, around(block(served())))
+    const before = snapshot()
+    const missing = { identityLine: NEW_LINE } as unknown as anchor.FollowOptions
+    await expect(anchor.follow(file, missing)).resolves.toMatchObject({ outcome: 'failed' })
+    await expect(anchor.follow(file, undefined as unknown as anchor.FollowOptions)).resolves.toMatchObject({ outcome: 'failed' })
+    expect(snapshot()).toEqual(before)
+  })
+
   it('a hook that throws aborts the write: a failure, the file as it was, no temp file', async () => {
     fs.writeFileSync(file, around(block(served())))
     const before = snapshot()

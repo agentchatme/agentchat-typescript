@@ -160,7 +160,13 @@ export async function readForReplace(file: string): Promise<ReadForReplace | nul
     if ((err as { code?: string }).code === 'ENOENT') return null
     throw err
   }
-  const stat = await fs.stat(target)
+  let stat: Awaited<ReturnType<FsPromises['stat']>>
+  try {
+    stat = await fs.stat(target)
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ENOENT') return null
+    throw err
+  }
   if (!stat.isFile()) throw new Error(`${file} is not a regular file`)
   let bytes: Uint8Array
   try {

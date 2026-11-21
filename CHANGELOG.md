@@ -36,11 +36,15 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 - `anchor.replace` and `anchor.remove` keep a CRLF text CRLF. Before, the
   new block and the blank lines around it were LF, and a CR was left at the
   end of the text before the block, so a CRLF file came back with mixed
-  line endings. The style is the one most of the lines outside the blocks
-  use.
+  line endings. The style is the one most of the user's own lines use (the
+  blank lines next to a block, which a replacement rewrites, decide only
+  when the text has no other line break), so replacing again gives the same
+  text.
 - `anchor.replace` and `anchor.remove` no longer add a final line break to
   a text that had none when they replace or remove a block in place. A
   block appended to a text with no block still ends with one.
+- `anchor.replace` and `anchor.remove` keep a leading byte-order mark.
+  Before, it was dropped when the text began with a block.
 
 ### Changed
 

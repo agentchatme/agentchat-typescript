@@ -147,27 +147,32 @@ export function find(text: string, options: FindOptions = {}): FoundBlock | null
 /**
  * `text` with `block` in place of the first block (current or legacy) and
  * every other block removed; appended after one blank line when there is
- * none. Idempotent. The text's line breaks are kept: CRLF when most of the
- * user's own lines end so (the block's lines then too), LF otherwise. A
- * block replaced in place keeps whether the text ends with a line break; an
- * appended one always ends with one.
+ * none. Idempotent. The text's line breaks are kept (`lineBreakOf`): a CRLF
+ * text stays CRLF, the block's lines included. A block replaced in place
+ * keeps whether the text ends with a line break; an appended one always ends
+ * with one. A leading byte-order mark is kept.
  */
 export function replace(text: string, block: string): string {
-  const spans = blocksOf(text)
+  const bom = text.startsWith('\uFEFF') ? '\uFEFF' : ''
+  const body = text.slice(bom.length)
+  const spans = blocksOf(body)
   if (spans.length === 0) {
-    const eol = lineBreakOf(text)
-    const trimmed = text.replace(TRAILING_BREAKS, '')
+    const cut = trailingBreaksAt(body)
+    const own = body.slice(0, cut)
+    const eol = lineBreakOf([own], [body.slice(cut)], body)
     const fenced = block.replace(/\r?\n/g, eol)
-    return trimmed.length === 0 ? `${fenced}${eol}` : `${trimmed}${eol}${eol}${fenced}${eol}`
+    return bom + (own.length === 0 ? `${fenced}${eol}` : `${own}${eol}${eol}${fenced}${eol}`)
   }
-  return rebuild(text, spans, block)
+  return bom + rebuild(body, spans, block)
 }
 
-/** `text` without any block (current or legacy); unchanged when there is none. Line breaks as `replace` keeps them. */
+/** `text` without any block (current or legacy); unchanged when there is none. Line breaks and a leading byte-order mark as `replace` keeps them. */
 export function remove(text: string): string {
-  const spans = blocksOf(text)
+  const bom = text.startsWith('\uFEFF') ? '\uFEFF' : ''
+  const body = text.slice(bom.length)
+  const spans = blocksOf(body)
   if (spans.length === 0) return text
-  return rebuild(text, spans, null)
+  return bom + rebuild(body, spans, null)
 }
 
 // ─── Whose block it is, and bringing this agent's to the served line ────────
@@ -353,8 +358,8 @@ export const FOLLOW_ATTEMPTS = 3
 export async function follow(path: string, options: FollowOptions): Promise<FollowResult> {
   const result = (outcome: FollowOutcome, claimed: string | null, detail: string, named: string | null = null): FollowResult => ({ outcome, path, claimed, named, detail })
   const reason = (err: unknown): string => (err instanceof Error ? err.message : String(err))
-  const handle = normalizeHandle(options.handle)
   try {
+    const handle = normalizeHandle(typeof options?.handle === 'string' ? options.handle : '')
     for (let attempt = 0; attempt < FOLLOW_ATTEMPTS; attempt++) {
       let file: ReadForReplace | null
       try {
@@ -454,48 +459,80 @@ function blocksOf(text: string): Span[] {
   return spans
 }
 
-const LEADING_BREAKS = /^(?:\r?\n)+/
-const TRAILING_BREAKS = /(?:\r?\n)+$/
+/** Where the run of line breaks (LF or CRLF, any mix) that ends `text` starts. Linear, unlike a `(?:\r?\n)+$` regex. */
+function trailingBreaksAt(text: string): number {
+  let at = text.length
+  while (at > 0 && text[at - 1] === '\n') {
+    at -= 1
+    if (at > 0 && text[at - 1] === '\r') at -= 1
+  }
+  return at
+}
+
+/** Where the text after the run of line breaks that starts `text` begins. */
+function leadingBreaksEnd(text: string): number {
+  let at = 0
+  for (;;) {
+    if (text[at] === '\n') at += 1
+    else if (text[at] === '\r' && text[at + 1] === '\n') at += 2
+    else return at
+  }
+}
+
+/** CRLF when more of the line breaks in `parts` are CRLF than bare LF, LF on a tie; null when they hold none. */
+function majority(parts: readonly string[]): '\n' | '\r\n' | null {
+  let crlf = 0
+  let all = 0
+  for (const part of parts) {
+    crlf += part.split('\r\n').length - 1
+    all += part.split('\n').length - 1
+  }
+  if (all === 0) return null
+  return crlf > all - crlf ? '\r\n' : '\n'
+}
 
 /**
- * The text's line break: CRLF when more of its lines end with CRLF than with
- * a bare LF, else LF (a text with no line break, a tie). Only the text
- * outside `spans` is counted when it has a line break: the blocks are
- * replaced, and one an earlier release wrote with LF into a CRLF file must
- * not decide the file's style.
+ * The text's line break, by majority (a tie is LF), counted first over the
+ * user's own text (`own`: everything outside the blocks but the line breaks
+ * next to them); when that holds none, over those line breaks (`runs`, which
+ * `replace` normalises to one blank line); when there are none either, over
+ * the whole text. The blocks are replaced, so a block an earlier release
+ * wrote with LF into a CRLF file does not decide the style; and the runs,
+ * which a replacement rewrites, decide only when nothing else can, so
+ * replacing again gives the same text.
  */
-function lineBreakOf(text: string, spans: readonly Span[] = []): '\n' | '\r\n' {
-  const count = (part: string): { crlf: number; lf: number } => {
-    const crlf = part.split('\r\n').length - 1
-    return { crlf, lf: part.split('\n').length - 1 - crlf }
-  }
-  let outside = { crlf: 0, lf: 0 }
-  let at = 0
-  for (const span of [...spans, { start: text.length, end: text.length }]) {
-    const part = count(text.slice(at, span.start))
-    outside = { crlf: outside.crlf + part.crlf, lf: outside.lf + part.lf }
-    // A span ends before its end marker's `\n`, after a CR: that break is the line's CRLF.
-    at = span.end > 0 && text[span.end - 1] === '\r' ? span.end - 1 : span.end
-  }
-  const { crlf, lf } = outside.crlf + outside.lf > 0 ? outside : count(text)
-  return crlf > lf ? '\r\n' : '\n'
+function lineBreakOf(own: readonly string[], runs: readonly string[], whole: string): '\n' | '\r\n' {
+  return majority(own) ?? majority(runs) ?? majority([whole]) ?? '\n'
 }
 
 function rebuild(text: string, spans: readonly Span[], replacement: string | null): string {
-  const parts: string[] = []
   const first = spans[0]
   const last = spans[spans.length - 1]
   if (!first || !last) return text
-  const eol = lineBreakOf(text, spans)
-  parts.push(text.slice(0, first.start).replace(TRAILING_BREAKS, ''))
-  if (replacement !== null) parts.push(replacement.replace(/\r?\n/g, eol))
-  for (let i = 1; i < spans.length; i++) {
-    const previous = spans[i - 1]
-    const current = spans[i]
-    if (!previous || !current) continue
-    parts.push(text.slice(previous.end, current.start).replace(LEADING_BREAKS, '').replace(TRAILING_BREAKS, ''))
+  // The user's text between the blocks, without the line breaks next to them (`runs`).
+  const own: string[] = []
+  const runs: string[] = []
+  const before = text.slice(0, first.start)
+  const cut = trailingBreaksAt(before)
+  own.push(before.slice(0, cut))
+  runs.push(before.slice(cut))
+  for (let i = 1; i <= spans.length; i++) {
+    const end = spans[i - 1]!.end
+    const part = text.slice(end, i < spans.length ? spans[i]!.start : text.length)
+    const lead = leadingBreaksEnd(part)
+    // A span ends before its end marker's `\n`, after a CR: that break is the line's CRLF.
+    runs.push((lead > 0 && text[end - 1] === '\r' ? '\r' : '') + part.slice(0, lead))
+    const rest = part.slice(lead)
+    if (i === spans.length) {
+      own.push(rest) // the text after the last block keeps its own last line breaks
+    } else {
+      const trail = trailingBreaksAt(rest)
+      own.push(rest.slice(0, trail))
+      runs.push(rest.slice(trail))
+    }
   }
-  parts.push(text.slice(last.end).replace(LEADING_BREAKS, ''))
+  const eol = lineBreakOf(own, runs, text)
+  const parts = [own[0] ?? '', ...(replacement !== null ? [replacement.replace(/\r?\n/g, eol)] : []), ...own.slice(1)]
   const kept = parts.filter((part) => part.length > 0)
   if (kept.length === 0) return ''
   const out = kept.join(eol + eol)
@@ -522,7 +559,7 @@ function filledHandle(body: string, template: string): string | null {
   const shape = normalized(template)
   if (!shape.includes(HANDLE_PLACEHOLDER)) return null
   const [head = '', ...rest] = shape.split(HANDLE_PLACEHOLDER)
-  const pattern = new RegExp(`^${escapeRegExp(head)}${SERVED_HANDLE}${rest.map((part, i) => (i === 0 ? '' : '\\1') + escapeRegExp(part)).join('')}$`)
+  const pattern = new RegExp(`^${escapeRegExp(head)}${SERVED_HANDLE}${rest.map((part, i) => (i === 0 ? '' : '(?:\\1)') + escapeRegExp(part)).join('')}$`)
   const match = pattern.exec(body)
   return match?.[1] ?? null
 }

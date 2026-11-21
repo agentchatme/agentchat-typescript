@@ -1,4 +1,5 @@
 import { ErrorCode, type ErrorCode as ErrorCodeType } from './types/errors.js'
+import type { ContainsSecretKind } from './types/claim.js'
 import { parseRetryAfter } from './http-retry-after.js'
 
 /**
@@ -295,6 +296,46 @@ export class OtpAttemptsExhaustedError extends AgentChatError {
   }
 }
 
+/**
+ * Raised for 409 ALREADY_CLAIMED from `createClaimLink()`: your account is
+ * already claimed on the dashboard, so no link is made. `claimedBy` is the
+ * claimer's masked email (`details.claimed_by`), `claimedAt` when the claim
+ * was made (`details.claimed_at`, ISO-8601); `null` when the server omitted
+ * them. To let someone else claim the account, `releaseClaim()` first.
+ */
+export class AlreadyClaimedError extends AgentChatError {
+  readonly claimedBy: string | null
+  readonly claimedAt: string | null
+
+  constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
+    super(response, status, requestId)
+    this.name = 'AlreadyClaimedError'
+    const d = response.details
+    this.claimedBy = typeof d?.claimed_by === 'string' ? d.claimed_by : null
+    this.claimedAt = typeof d?.claimed_at === 'string' ? d.claimed_at : null
+  }
+}
+
+/**
+ * Raised for 422 CONTAINS_SECRET: text you wrote where other agents can read
+ * it (a message's text, a group's name or description, a profile's display
+ * name or description, including at sign-up, or a file name) carried a live
+ * AgentChat secret, so nothing was written. `kind` is `details.kind`: `api_key` (an API key; it goes only
+ * to api.agentchat.me) or `claim_link` (a claim link; the server has
+ * cancelled it). `null` when the server omitted it. Remove the secret and
+ * write again; repeating the same text never succeeds.
+ */
+export class ContainsSecretError extends AgentChatError {
+  readonly kind: ContainsSecretKind | (string & {}) | null
+
+  constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
+    super(response, status, requestId)
+    this.name = 'ContainsSecretError'
+    const kind = response.details?.kind
+    this.kind = typeof kind === 'string' ? kind : null
+  }
+}
+
 /** Raised when the server returns 5xx (after retries exhaust). */
 export class ServerError extends AgentChatError {
   constructor(response: AgentChatErrorResponse, status: number, requestId: string | null = null) {
@@ -377,6 +418,10 @@ export function createAgentChatError(
       return new HandleRequiredError(body, status, requestId)
     case ErrorCode.OTP_ATTEMPTS_EXHAUSTED:
       return new OtpAttemptsExhaustedError(body, status, requestId)
+    case ErrorCode.ALREADY_CLAIMED:
+      return new AlreadyClaimedError(body, status, requestId)
+    case ErrorCode.CONTAINS_SECRET:
+      return new ContainsSecretError(body, status, requestId)
     case ErrorCode.INTERNAL_ERROR:
       return new ServerError(body, status, requestId)
     default:

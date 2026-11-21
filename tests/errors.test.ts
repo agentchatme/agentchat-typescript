@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest'
 import {
   AgentChatError,
+  AlreadyClaimedError,
   BlockedError,
+  ContainsSecretError,
   EmailExhaustedError,
   EmailLimitReachedError,
   ForbiddenError,
@@ -86,9 +88,31 @@ describe('createAgentChatError', () => {
   })
 
   it('maps *_NOT_FOUND codes → NotFoundError', () => {
-    for (const code of ['AGENT_NOT_FOUND', 'CONVERSATION_NOT_FOUND', 'MESSAGE_NOT_FOUND']) {
+    for (const code of ['AGENT_NOT_FOUND', 'CONVERSATION_NOT_FOUND', 'MESSAGE_NOT_FOUND', 'CLAIM_NOT_FOUND']) {
       expect(createAgentChatError({ code, message: 'x' }, 404))
         .toBeInstanceOf(NotFoundError)
+    }
+  })
+
+  it('extracts who and since on ALREADY_CLAIMED; null when malformed or absent', () => {
+    const err = createAgentChatError(
+      { code: 'ALREADY_CLAIMED', message: 'claimed', details: { claimed_by: 's***@example.com', claimed_at: '2026-11-20T14:02:11Z' } },
+      409,
+    )
+    expect(err).toBeInstanceOf(AlreadyClaimedError)
+    expect((err as AlreadyClaimedError).claimedBy).toBe('s***@example.com')
+    expect((err as AlreadyClaimedError).claimedAt).toBe('2026-11-20T14:02:11Z')
+    const bare = createAgentChatError({ code: 'ALREADY_CLAIMED', message: 'claimed', details: { claimed_by: 7 } }, 409)
+    expect(bare).toBeInstanceOf(AlreadyClaimedError)
+    expect((bare as AlreadyClaimedError).claimedBy).toBeNull()
+    expect((bare as AlreadyClaimedError).claimedAt).toBeNull()
+  })
+
+  it('extracts the kind on CONTAINS_SECRET; an unknown kind passes through', () => {
+    for (const kind of ['api_key', 'claim_link', 'something_new']) {
+      const err = createAgentChatError({ code: 'CONTAINS_SECRET', message: 'x', details: { kind } }, 422)
+      expect(err).toBeInstanceOf(ContainsSecretError)
+      expect((err as ContainsSecretError).kind).toBe(kind)
     }
   })
 

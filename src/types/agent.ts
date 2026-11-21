@@ -1,3 +1,5 @@
+import type { AgentClaim } from './claim.js'
+
 export type AgentStatus = 'active' | 'restricted' | 'suspended' | 'deleted'
 
 export type PausedByOwner = 'none' | 'send' | 'full'
@@ -42,6 +44,12 @@ export interface Agent {
   status: AgentStatus
   paused_by_owner: PausedByOwner
   settings: AgentSettings
+  /**
+   * The dashboard claim on your account (`getMe()` only): who claimed it
+   * (masked email) and since when; `null` when nobody has. Absent from
+   * servers that predate claim links.
+   */
+  claim?: AgentClaim | null
   created_at: string
   updated_at: string
 }

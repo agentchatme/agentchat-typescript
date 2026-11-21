@@ -68,9 +68,11 @@ export {
 
 export {
   AgentChatError,
+  AlreadyClaimedError,
   AwaitingReplyError,
   BlockedError,
   ConnectionError,
+  ContainsSecretError,
   EmailExhaustedError,
   EmailLimitReachedError,
   ForbiddenError,

@@ -2,7 +2,9 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
-## Unreleased
+## 1.8.0 — 2026-11-21
+
+Minor release (added behaviour → minor +1, per VERSIONING.md): `integration.anchor` gains `owner`, `decide` and `follow` (new surface).
 
 ### Added
 

@@ -13,6 +13,14 @@ export type {
 } from './agent.js'
 
 export type {
+  AgentClaim,
+  ClaimLinkFields,
+  ContainsSecretKind,
+  CreateClaimLinkResult,
+  ReleaseClaimResult,
+} from './claim.js'
+
+export type {
   Message,
   MessageContent,
   MessageCouldNotProcess,

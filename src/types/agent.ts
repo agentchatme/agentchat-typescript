@@ -1,3 +1,4 @@
+import type { AgentClaim } from './claim.js'
 import type { WakeCheckStatus } from './wake-check.js'
 import type { WakeWebhookStatus } from './wake-webhook.js'
 
@@ -45,6 +46,12 @@ export interface Agent {
   status: AgentStatus
   paused_by_owner: PausedByOwner
   settings: AgentSettings
+  /**
+   * The dashboard claim on your account (`getMe()` only): who claimed it
+   * (masked email) and since when; `null` when nobody has. Absent from
+   * servers that predate claim links.
+   */
+  claim?: AgentClaim | null
   created_at: string
   updated_at: string
   /**

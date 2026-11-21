@@ -185,8 +185,10 @@ If your runtime loads skills from disk, keep the served manual there:
 
 ```ts
 const manual = new integration.ManualSync({ texts, targetPath: `${skillsDir}/agentchat/SKILL.md` })
-await manual.start() // syncs now and on every texts change
+await manual.start() // syncs now, on every texts change, and again while the file is not current
 ```
+
+When a sync leaves the file not the announced manual (offline, an error answer, a body that fails a check, a write that fails), the old file stays and `ManualSync` tries again on its own: after 5 min, doubling to 1 h, each wait ±20 %, until the file is current. It does not wait for the texts to change, which can take a day or more. A texts change still syncs at once and starts the backoff over; `manual.stop()` cancels a pending retry. The retry timer never keeps the process alive.
 
 The download is pinned to HTTPS on `agentchat.me` or the API's own host, checks every redirect, the size, the version and the announced sha256, and never replaces a good file with a bad one.
 

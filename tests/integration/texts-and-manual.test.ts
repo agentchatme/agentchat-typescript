@@ -375,8 +375,12 @@ describe('ManualSync', () => {
 
 // ─── ManualSync: retries while the file is not current ─────────────────────
 
-describe('ManualSync retries', () => {
+// The retry tests wait on real file I/O (see `until`): a slow runner gets a
+// longer budget than vitest's default 5 s per test.
+describe('ManualSync retries', { timeout: 30_000 }, () => {
   const MIN = 60_000
+  /** Real time `until` gives a condition, well inside the suite's 30 s per test. */
+  const UNTIL_BUDGET_MS = 10_000
   const MANUAL_URL = 'https://agentchat.me/skill.md'
 
   // Only the timers are fake: setImmediate stays real, so the real file I/O
@@ -391,12 +395,20 @@ describe('ManualSync retries', () => {
     vi.useRealTimers()
   })
 
+  /**
+   * Wait for `condition`, for up to `UNTIL_BUDGET_MS` of real time. A sync
+   * reads and writes real files on the libuv threadpool, which on a slow or
+   * busy runner can take longer than any fixed number of event-loop turns,
+   * so the bound is elapsed time (`performance.now()`, which the fake timers
+   * leave alone), never a count. Each turn is a real `setImmediate`, so the
+   * file I/O completes while the fake clock stands still.
+   */
   async function until(what: string, condition: () => boolean): Promise<void> {
-    for (let i = 0; i < 5_000; i++) {
-      if (condition()) return
+    const deadline = performance.now() + UNTIL_BUDGET_MS
+    while (!condition()) {
+      if (performance.now() > deadline) throw new Error(`never happened within ${UNTIL_BUDGET_MS} ms: ${what}`)
       await new Promise((resolve) => setImmediate(resolve))
     }
-    throw new Error(`never happened: ${what}`)
   }
 
   /** A texts source announcing `manual`, whose change the test fires. */

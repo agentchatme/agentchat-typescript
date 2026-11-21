@@ -1067,11 +1067,18 @@ export class AgentChatClient {
    * Throws `AlreadyClaimedError` (409 `ALREADY_CLAIMED`; `claimedBy`,
    * `claimedAt`) while your account is claimed: `releaseClaim()` first to
    * let someone else claim it. Rate-limited server-side: `RateLimitedError`
-   * (429, `retryAfterMs`). Never retried: no Idempotency-Key is sent, and a
-   * second attempt would make a second link and cancel the first.
+   * (429, `retryAfterMs`).
+   *
+   * Exactly one attempt, whatever `opts` says: the route has no idempotency,
+   * so a second attempt would make a second link, cancel the first and spend
+   * the hourly budget. A caller's `idempotencyKey` is not sent and its
+   * `retry` is ignored; only `signal` and `timeoutMs` apply.
    */
   createClaimLink(opts?: CallOptions) {
-    return this.post<CreateClaimLinkResult>('/v1/agents/me/claim-links', undefined, opts)
+    const once: CallOptions = { retry: 'never' }
+    if (opts?.signal) once.signal = opts.signal
+    if (opts?.timeoutMs !== undefined) once.timeoutMs = opts.timeoutMs
+    return this.post<CreateClaimLinkResult>('/v1/agents/me/claim-links', undefined, once)
   }
 
   /**

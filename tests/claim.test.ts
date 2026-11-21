@@ -72,6 +72,28 @@ describe('client.createClaimLink', () => {
     expect(calls).toHaveLength(2)
   })
 
+  it('a caller-supplied Idempotency-Key and retry policy still give exactly one attempt on a 503, and no key is sent', async () => {
+    for (const retry of [fastRetry, 'auto'] as const) {
+      const { fetch, calls } = capture([() => json(503, { code: 'X', message: 'busy' }), () => json(201, link)])
+      const client = new AgentChatClient({ apiKey: 'k', fetch, retry: fastRetry })
+      await expect(client.createClaimLink({ idempotencyKey: 'caller-key-1', retry })).rejects.toBeInstanceOf(AgentChatError)
+      expect(calls).toHaveLength(1)
+      expect(calls[0]!.headers['idempotency-key']).toBeUndefined()
+    }
+  })
+
+  it('keeps the caller signal and timeout', async () => {
+    const fetch = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.signal?.aborted) throw new DOMException('aborted', 'AbortError')
+      return json(201, link)
+    }) as unknown as typeof globalThis.fetch
+    const controller = new AbortController()
+    controller.abort()
+    const client = new AgentChatClient({ apiKey: 'k', fetch })
+    await expect(client.createClaimLink({ signal: controller.signal, timeoutMs: 5_000 })).rejects.toThrow()
+    await expect(client.createClaimLink({ timeoutMs: 5_000 })).resolves.toEqual(link)
+  })
+
   it('409 ALREADY_CLAIMED is an AlreadyClaimedError with who and since', async () => {
     const message =
       '@example-relay is already claimed by s***@example.com (since 20 Nov 2026). To let someone else claim it, release the claim first.'

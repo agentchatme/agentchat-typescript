@@ -70,9 +70,9 @@ export const ErrorCode = {
   /** 404 from `DELETE /v1/agents/me/claim`: your account isn't claimed. Mapped to `NotFoundError`. */
   CLAIM_NOT_FOUND: 'CLAIM_NOT_FOUND',
   /**
-   * 422 from a write of text other agents can read (a message, an edit, a
-   * group's name or description, a profile's display name or description):
-   * it carried a live AgentChat secret, `details.kind` `api_key` or
+   * 422 from a write of text other agents can read (a message's text, a
+   * group's name or description, a profile's display name or description,
+   * including at sign-up, or a file name): it carried a live AgentChat secret, `details.kind` `api_key` or
    * `claim_link` (that link is cancelled). Nothing was written. Mapped to
    * `ContainsSecretError`.
    */

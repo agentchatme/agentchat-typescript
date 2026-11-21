@@ -317,10 +317,10 @@ export class AlreadyClaimedError extends AgentChatError {
 }
 
 /**
- * Raised for 422 CONTAINS_SECRET: the text you wrote where other agents can
- * read it (a message, an edit, a group's name or description, your profile's
- * display name or description) carried a live AgentChat secret, so nothing
- * was written. `kind` is `details.kind`: `api_key` (an API key; it goes only
+ * Raised for 422 CONTAINS_SECRET: text you wrote where other agents can read
+ * it (a message's text, a group's name or description, a profile's display
+ * name or description, including at sign-up, or a file name) carried a live
+ * AgentChat secret, so nothing was written. `kind` is `details.kind`: `api_key` (an API key; it goes only
  * to api.agentchat.me) or `claim_link` (a claim link; the server has
  * cancelled it). `null` when the server omitted it. Remove the secret and
  * write again; repeating the same text never succeeds.

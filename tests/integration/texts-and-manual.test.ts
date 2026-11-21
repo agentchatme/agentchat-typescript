@@ -422,6 +422,12 @@ describe('ManualSync retries', () => {
     }
   }
 
+  /** For a real `TextsCache` whose own timer the test stands in for. */
+  const noCacheTimer = {
+    setTimeout: () => 0 as unknown as ReturnType<typeof setTimeout>,
+    clearTimeout: () => undefined,
+  }
+
   /** The manual address: offline while `offline()` says so, else the manual at the version asked. */
   function download(offline: () => boolean, version: () => string) {
     const calls: string[] = []
@@ -442,9 +448,10 @@ describe('ManualSync retries', () => {
     const announced = served('2.2.2', manual('2.2.2'))
     writeFileSync(textsFile, JSON.stringify({ version: 1, runtime: 'generic', fetched_at: '2026-11-01T00:00:00.000Z', texts: { ...texts, manual: announced } }))
     writeFileSync(skill, manual('2.2.1'))
-    // The API is offline at start, then answers the same texts it announced before.
+    // The API is offline at start, then answers the same texts it announced before. The
+    // cache's own timer is left out: the test refreshes where it would.
     const { client, get } = textsClient([new Error('offline'), { ...texts, manual: announced }])
-    const cache = new TextsCache({ client, runtime: 'generic', filePath: textsFile })
+    const cache = new TextsCache({ client, runtime: 'generic', filePath: textsFile, ...noCacheTimer })
     const changes: string[] = []
     cache.onChange((_t, source) => changes.push(source))
     let offline = true
@@ -458,12 +465,17 @@ describe('ManualSync retries', () => {
     expect(first).toMatchObject({ state: 'kept', version: '2.2.1', served: '2.2.2', upToDate: false })
     expect(readFileSync(skill, 'utf8')).toBe(manual('2.2.1')) // never worse than before
 
-    // 5 min: the texts come back unchanged (no change event); the manual retry fails again.
+    // The texts come back unchanged: no change event, so only the retry can help.
+    await expect(cache.refresh()).resolves.toBe(true)
+    expect(cache.source).toBe('server')
+    expect(changes).toEqual(['cache'])
+
+    // 5 min: the retry refreshes the texts (the same again) and syncs against them; still offline.
     await vi.advanceTimersByTimeAsync(5 * MIN - 1)
     expect(calls).toHaveLength(1)
     await vi.advanceTimersByTimeAsync(1)
-    await until('the texts refresh', () => get.mock.calls.length === 2 && cache.source === 'server')
     await until('the first retry', () => calls.length === 2 && sync.result !== first)
+    expect(get).toHaveBeenCalledTimes(3)
     expect(changes).toEqual(['cache'])
     expect(sync.result).toMatchObject({ state: 'kept', upToDate: false })
 
@@ -473,6 +485,7 @@ describe('ManualSync retries', () => {
     expect(calls).toHaveLength(2)
     await vi.advanceTimersByTimeAsync(1)
     await until('the second retry', () => sync.result?.state === 'updated')
+    expect(get).toHaveBeenCalledTimes(4)
     expect(readFileSync(skill, 'utf8')).toBe(manual('2.2.2'))
     expect(sync.result).toMatchObject({ state: 'updated', version: '2.2.2', upToDate: true })
     expect(changes).toEqual(['cache'])
@@ -650,6 +663,251 @@ describe('ManualSync retries', () => {
     expect(vi.getTimerCount()).toBe(0)
     await vi.advanceTimersByTimeAsync(2 * 60 * MIN)
     expect(calls).toHaveLength(1)
+  })
+
+  // ─── each retry refreshes the texts first ────────────────────────────────
+
+  describe('refreshing the texts', () => {
+    /**
+     * `GET /v1/texts` for a real `TextsCache` (its own timer left out): it
+     * announces `manual`, fails while `down`, and while `hold` is set waits
+     * for `release()` before it answers.
+     */
+    function textsServer(manualServed: Texts['manual']) {
+      const state = { manual: manualServed, down: false, hold: false }
+      let releases: Array<() => void> = []
+      const get = vi.fn(async (_opts: unknown) => {
+        if (state.hold) await new Promise<void>((resolve) => releases.push(resolve))
+        if (state.down) throw new Error('503')
+        return { ...texts, manual: state.manual }
+      })
+      const cache = new TextsCache({ client: { texts: { get }, baseUrl: 'https://api.agentchat.me' }, runtime: 'generic', ...noCacheTimer })
+      const release = (): void => {
+        const waiting = releases
+        releases = []
+        state.hold = false
+        for (const resolve of waiting) resolve()
+      }
+      return { state, get, cache, release }
+    }
+
+    /** Real time for real file I/O to finish (only setTimeout is fake): to see that nothing more happens. */
+    async function settle(ms = 50): Promise<void> {
+      const end = performance.now() + ms
+      while (performance.now() < end) await new Promise((resolve) => setImmediate(resolve))
+    }
+
+    /** The manual address, serving `version()` unless offline. */
+    function address(version: () => string, offline: () => boolean = () => false) {
+      return download(offline, version)
+    }
+
+    it('the lab case: a new manual announced during the backoff is placed by the next retry, not refused until the daily refetch', async () => {
+      fakeTimers()
+      vi.spyOn(Math, 'random').mockReturnValue(0.5)
+      const skill = join(dir(), 'SKILL.md')
+      writeFileSync(skill, manual('2.4.1'))
+      const server = textsServer(served('2.4.2', manual('2.4.2')))
+      let published = '2.4.2'
+      let offline = true
+      const { fetch, calls } = address(() => published, () => offline)
+      const results: string[] = []
+      const sync = new ManualSync({ texts: server.cache, targetPath: skill, fetch, onResult: (r) => results.push(`${r.state}:${r.served}`) })
+      await server.cache.start()
+      await expect(sync.start()).resolves.toMatchObject({ state: 'kept', served: '2.4.2', upToDate: false })
+      expect(vi.getTimerCount()).toBe(1) // the retry, pending
+
+      // The server ships 2.4.3: the address and the announcement both move on.
+      published = '2.4.3'
+      server.state.manual = served('2.4.3', manual('2.4.3'))
+      offline = false
+
+      await vi.advanceTimersByTimeAsync(5 * MIN)
+      await until('the retry placed 2.4.3', () => sync.result?.state === 'updated')
+      expect(readFileSync(skill, 'utf8')).toBe(manual('2.4.3'))
+      expect(sync.result).toMatchObject({ state: 'updated', served: '2.4.3', version: '2.4.3', upToDate: true })
+      await settle()
+      expect(server.get).toHaveBeenCalledTimes(2) // start, and the retry's refresh
+      expect(calls).toHaveLength(2) // no download synced against the old announcement
+      expect(results).toEqual(['kept:2.4.2', 'updated:2.4.3']) // the change's sync only, no second one
+      expect(vi.getTimerCount()).toBe(0)
+      sync.stop()
+      server.cache.stop()
+    })
+
+    it('a download that is another manual refreshes the texts at once; the new announcement is placed with no time passing', async () => {
+      fakeTimers()
+      const skill = join(dir(), 'SKILL.md')
+      writeFileSync(skill, manual('2.4.1'))
+      const server = textsServer(served('2.4.2', manual('2.4.2')))
+      await server.cache.start()
+      // The texts in hand are behind: the server already ships 2.4.3.
+      server.state.manual = served('2.4.3', manual('2.4.3'))
+      const { fetch, calls } = address(() => '2.4.3')
+      const sync = new ManualSync({ texts: server.cache, targetPath: skill, fetch })
+      const first = await sync.start()
+      expect(first).toMatchObject({ state: 'kept', version: '2.4.1', served: '2.4.2' })
+      expect(first?.error).toMatch(/the body is version 2\.4\.3, the server announced 2\.4\.2/)
+      await until('the refreshed announcement placed', () => sync.result?.state === 'updated')
+      expect(readFileSync(skill, 'utf8')).toBe(manual('2.4.3'))
+      expect(server.get).toHaveBeenCalledTimes(2)
+      expect(calls).toHaveLength(2)
+      expect(vi.getTimerCount()).toBe(0)
+      sync.stop()
+    })
+
+    it('an address ahead of the announcement: one refresh at once, then the backoff; the body is never accepted', async () => {
+      fakeTimers()
+      vi.spyOn(Math, 'random').mockReturnValue(0.5)
+      const armed = timeouts()
+      const skill = join(dir(), 'SKILL.md')
+      writeFileSync(skill, manual('2.4.1'))
+      const server = textsServer(served('2.4.2', manual('2.4.2'))) // keeps announcing 2.4.2
+      await server.cache.start()
+      const { fetch, calls } = address(() => '2.4.3')
+      const sync = new ManualSync({ texts: server.cache, targetPath: skill, fetch })
+      await sync.start()
+      await until('the refresh at once', () => server.get.mock.calls.length === 2)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(armed.mock.calls.map((call) => call[1])).toEqual([5 * MIN])
+      expect(calls).toHaveLength(1)
+
+      // The retry refreshes (the same texts) and syncs; that sync's refusal asks for no second refresh.
+      await vi.advanceTimersByTimeAsync(5 * MIN)
+      await until('the retry', () => armed.mock.calls.length === 2)
+      expect(server.get).toHaveBeenCalledTimes(3)
+      expect(calls).toHaveLength(2)
+      expect(armed.mock.calls[1]![1]).toBe(10 * MIN)
+      expect(sync.result).toMatchObject({ state: 'kept', served: '2.4.2' })
+      expect(readFileSync(skill, 'utf8')).toBe(manual('2.4.1'))
+      sync.stop()
+    })
+
+    it('a retry whose refresh finds the texts unchanged still syncs against them', async () => {
+      fakeTimers()
+      const skill = join(dir(), 'SKILL.md')
+      writeFileSync(skill, manual('2.4.1'))
+      const server = textsServer(served('2.4.2', manual('2.4.2')))
+      const changes: string[] = []
+      server.cache.onChange((_t, source) => changes.push(source))
+      await server.cache.start()
+      let offline = true
+      const { fetch, calls } = address(() => '2.4.2', () => offline)
+      const sync = new ManualSync({ texts: server.cache, targetPath: skill, fetch })
+      await sync.start()
+      offline = false
+      await vi.advanceTimersByTimeAsync(6 * MIN)
+      await until('the retry placed it', () => sync.result?.state === 'updated')
+      expect(readFileSync(skill, 'utf8')).toBe(manual('2.4.2'))
+      expect(server.get).toHaveBeenCalledTimes(2)
+      expect(changes).toEqual(['server']) // the start only: the retry's refresh changed nothing
+      expect(calls).toHaveLength(2)
+      sync.stop()
+    })
+
+    it('a refresh that fails lets the retry go on with the texts in hand; a failing cache is left to its own backoff', async () => {
+      fakeTimers()
+      vi.spyOn(Math, 'random').mockReturnValue(0.5)
+      const skill = join(dir(), 'SKILL.md')
+      writeFileSync(skill, manual('2.4.1'))
+      const server = textsServer(served('2.4.2', manual('2.4.2')))
+      await server.cache.start()
+      let offline = true
+      const { fetch, calls } = address(() => '2.4.2', () => offline)
+      const sync = new ManualSync({ texts: server.cache, targetPath: skill, fetch })
+      await sync.start()
+
+      server.state.down = true
+      await vi.advanceTimersByTimeAsync(5 * MIN)
+      await until('the first retry', () => calls.length === 2)
+      expect(server.get).toHaveBeenCalledTimes(2) // the refresh, failed
+      expect(server.cache.lastError).toBe('503')
+      await until('the next retry armed', () => vi.getTimerCount() === 1)
+
+      // The cache is failing: the next retry asks it nothing and syncs against what it holds.
+      offline = false
+      await vi.advanceTimersByTimeAsync(10 * MIN)
+      await until('the second retry placed it', () => sync.result?.state === 'updated')
+      expect(server.get).toHaveBeenCalledTimes(2)
+      expect(readFileSync(skill, 'utf8')).toBe(manual('2.4.2'))
+      sync.stop()
+    })
+
+    it("a retry's refresh joins the cache's fetch in flight: never two fetches at once", async () => {
+      fakeTimers()
+      const skill = join(dir(), 'SKILL.md')
+      writeFileSync(skill, manual('2.4.1'))
+      const server = textsServer(served('2.4.2', manual('2.4.2')))
+      await server.cache.start()
+      let offline = true
+      const { fetch, calls } = address(() => '2.4.2', () => offline)
+      const sync = new ManualSync({ texts: server.cache, targetPath: skill, fetch })
+      await sync.start()
+
+      server.state.hold = true
+      const inFlight = server.cache.refresh() // the cache's own fetch, not answered yet
+      expect(server.get).toHaveBeenCalledTimes(2)
+      offline = false
+      await vi.advanceTimersByTimeAsync(6 * MIN)
+      await settle()
+      expect(server.get).toHaveBeenCalledTimes(2) // joined, not a second fetch
+      expect(calls).toHaveLength(1) // and it waits for that answer before it syncs
+      server.release()
+      await expect(inFlight).resolves.toBe(true)
+      await until('the retry placed it', () => sync.result?.state === 'updated')
+      expect(server.get).toHaveBeenCalledTimes(2)
+      sync.stop()
+    })
+
+    it("stop() during the retry's refresh: nothing syncs after it, not even a change it brings", async () => {
+      fakeTimers()
+      const skill = join(dir(), 'SKILL.md')
+      writeFileSync(skill, manual('2.4.1'))
+      const server = textsServer(served('2.4.2', manual('2.4.2')))
+      await server.cache.start()
+      const { fetch, calls } = address(() => '2.4.3', () => true)
+      const sync = new ManualSync({ texts: server.cache, targetPath: skill, fetch })
+      await sync.start()
+
+      server.state.hold = true
+      server.state.manual = served('2.4.3', manual('2.4.3'))
+      await vi.advanceTimersByTimeAsync(6 * MIN)
+      expect(server.get).toHaveBeenCalledTimes(2) // the retry's refresh, waiting
+      sync.stop()
+      server.release()
+      await until('the refresh answered', () => server.cache.current()?.manual.version === '2.4.3')
+      await vi.advanceTimersByTimeAsync(2 * 60 * MIN)
+      await settle()
+      expect(calls).toHaveLength(1)
+      expect(vi.getTimerCount()).toBe(0)
+      expect(sync.result).toMatchObject({ served: '2.4.2', state: 'kept' })
+      expect(readFileSync(skill, 'utf8')).toBe(manual('2.4.1'))
+
+      // And a stop with the retry still pending: the texts are not even asked.
+      const other = textsServer(served('2.4.2', manual('2.4.2')))
+      await other.cache.start()
+      const pending = new ManualSync({ texts: other.cache, targetPath: skill, fetch })
+      await pending.start()
+      expect(vi.getTimerCount()).toBe(1)
+      pending.stop()
+      await vi.advanceTimersByTimeAsync(2 * 60 * MIN)
+      expect(other.get).toHaveBeenCalledTimes(1)
+    })
+
+    it('a texts source without refresh() is synced against as before', async () => {
+      fakeTimers()
+      const skill = join(dir(), 'SKILL.md')
+      writeFileSync(skill, manual('2.4.1'))
+      let offline = true
+      const { fetch, calls } = address(() => '2.4.2', () => offline)
+      const sync = new ManualSync({ texts: announcing(served('2.4.2')).source, targetPath: skill, fetch })
+      await sync.start()
+      offline = false
+      await vi.advanceTimersByTimeAsync(6 * MIN)
+      await until('the retry placed it', () => sync.result?.state === 'updated')
+      expect(calls).toHaveLength(2)
+      sync.stop()
+    })
   })
 })
 

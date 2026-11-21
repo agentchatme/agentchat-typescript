@@ -1,6 +1,6 @@
 /**
- * The few file operations the kit needs (the texts cache, the manual), for
- * Node, Bun and Deno. `node:` modules are imported lazily, on first use, so
+ * The few file operations the kit needs (the texts cache, the manual, the
+ * identity block's follow), for Node, Bun and Deno. `node:` modules are imported lazily, on first use, so
  * the SDK still loads in a browser or an edge runtime that never asks for a
  * file.
  *
@@ -125,5 +125,121 @@ export async function exists(file: string): Promise<boolean> {
     return true
   } catch {
     return false
+  }
+}
+
+// ─── Replacing a file someone else owns ─────────────────────────────────────
+//
+// For a file the kit did not create and must not damage: the user's
+// instruction file (`anchor.follow`). Never creates one, keeps what an
+// in-place write would have kept, and replaces it only if it still holds the
+// bytes the caller decided on, looked at again at the last moment.
+
+/** A file as it was read for a replacement: where it really is, its bytes, and what a replacement keeps. */
+export interface ReadForReplace {
+  /** The file at the end of any symlinks: the one replaced (a symlink stays a symlink). */
+  readonly target: string
+  readonly bytes: Uint8Array
+  /** Permission bits (`mode & 0o7777`). */
+  readonly mode: number
+  readonly uid: number
+  readonly gid: number
+}
+
+/**
+ * The file at `file` (through any symlinks), or null when there is none (a
+ * dangling symlink included). Throws when it is not a regular file or cannot
+ * be read.
+ */
+export async function readForReplace(file: string): Promise<ReadForReplace | null> {
+  const { fs } = await nodeModules()
+  let target: string
+  try {
+    target = await fs.realpath(file)
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ENOENT') return null
+    throw err
+  }
+  let stat: Awaited<ReturnType<FsPromises['stat']>>
+  try {
+    stat = await fs.stat(target)
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ENOENT') return null
+    throw err
+  }
+  if (!stat.isFile()) throw new Error(`${file} is not a regular file`)
+  let bytes: Uint8Array
+  try {
+    bytes = new Uint8Array(await fs.readFile(target))
+  } catch (err) {
+    if ((err as { code?: string }).code === 'ENOENT') return null
+    throw err
+  }
+  return { target, bytes, mode: stat.mode & 0o7777, uid: stat.uid, gid: stat.gid }
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false
+  return true
+}
+
+function isRoot(): boolean {
+  const getuid = (globalThis as { process?: { getuid?: () => number } }).process?.getuid
+  return typeof getuid === 'function' && getuid() === 0
+}
+
+export interface ReplaceIfUnchangedOptions extends RenameOptions {
+  /** Called once the new text is written and flushed beside the file, right before it is read again for the rename. */
+  readonly beforeRename?: () => void | Promise<void>
+}
+
+/**
+ * Replace `original.target` with `data`, but only if it still holds
+ * `original.bytes`: a temp file beside it (unguessable name, created
+ * exclusively, the original's permission bits, under root its owner), the
+ * data written and flushed, then the file read again and renamed over only
+ * if it is byte for byte what was decided on. `changed`: it is not (an edit
+ * saved meanwhile); `gone`: it was removed meanwhile, and is not made again.
+ * Throws (the file as it was, the temp file removed) when the file is not
+ * writable (a file the user made read-only is refused, not replaced) or the
+ * temp file or the rename fails. Never an in-place write: one that fails
+ * halfway would leave the user's file cut short.
+ */
+export async function replaceIfUnchanged(original: ReadForReplace, data: string, options: ReplaceIfUnchangedOptions = {}): Promise<'replaced' | 'changed' | 'gone'> {
+  const { fs, path } = await nodeModules()
+  const { target } = original
+  await fs.access(target, fs.constants.W_OK)
+  const tmp = path.join(path.dirname(target), `.${path.basename(target)}.${randomSuffix()}.tmp`)
+  // Only a temp file this call created is ever removed: `wx` refuses a name that exists.
+  let created = false
+  let renamed = false
+  try {
+    const handle = await fs.open(tmp, 'wx', original.mode)
+    created = true
+    try {
+      await handle.chmod(original.mode)
+      if (isRoot() && (original.uid !== 0 || original.gid !== 0)) {
+        await handle.chown(original.uid, original.gid).catch(() => undefined)
+      }
+      await handle.writeFile(data, 'utf-8')
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    await options.beforeRename?.()
+    let now: Uint8Array
+    try {
+      now = new Uint8Array(await fs.readFile(target))
+    } catch (err) {
+      if ((err as { code?: string }).code === 'ENOENT') return 'gone'
+      throw err
+    }
+    if (!sameBytes(now, original.bytes)) return 'changed'
+    await renameWithRetry(tmp, target, options)
+    renamed = true
+    return 'replaced'
+  } finally {
+    if (created && !renamed) await fs.rm(tmp, { force: true }).catch(() => undefined)
   }
 }

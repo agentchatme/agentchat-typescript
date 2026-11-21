@@ -373,6 +373,286 @@ describe('ManualSync', () => {
   })
 })
 
+// ─── ManualSync: retries while the file is not current ─────────────────────
+
+describe('ManualSync retries', () => {
+  const MIN = 60_000
+  const MANUAL_URL = 'https://agentchat.me/skill.md'
+
+  // Only the timers are fake: setImmediate stays real, so the real file I/O
+  // a sync does can finish while the clock stands still.
+  const fakeTimers = () => vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+  const timeouts = () => vi.spyOn(globalThis, 'setTimeout')
+
+  // The spies first, then the clock: restoring a spy on the fake setTimeout
+  // after the real one is back would put the fake back.
+  afterEach(() => {
+    vi.restoreAllMocks()
+    vi.useRealTimers()
+  })
+
+  async function until(what: string, condition: () => boolean): Promise<void> {
+    for (let i = 0; i < 5_000; i++) {
+      if (condition()) return
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+    throw new Error(`never happened: ${what}`)
+  }
+
+  /** A texts source announcing `manual`, whose change the test fires. */
+  function announcing(manualServed: Texts['manual'] | null) {
+    const listeners = new Set<(t: Texts) => void>()
+    let current: Texts | null = manualServed === null ? null : { ...texts, manual: manualServed }
+    return {
+      source: {
+        current: () => current,
+        onChange: (fn: (t: Texts) => void) => {
+          listeners.add(fn)
+          return () => {
+            listeners.delete(fn)
+          }
+        },
+        apiBase: 'https://api.agentchat.me',
+      },
+      change(next: Texts['manual']): void {
+        const changed = { ...texts, manual: next }
+        current = changed
+        for (const fn of listeners) fn(changed)
+      },
+    }
+  }
+
+  /** The manual address: offline while `offline()` says so, else the manual at the version asked. */
+  function download(offline: () => boolean, version: () => string) {
+    const calls: string[] = []
+    const fetch: ManualFetch = async (url) => {
+      calls.push(url)
+      if (offline()) throw new TypeError('fetch failed')
+      return new Response(manual(version()), { status: 200 })
+    }
+    return { fetch, calls }
+  }
+
+  it('offline start with cached texts announcing a newer manual: the retry places it, with no texts change', async () => {
+    fakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0.5) // no jitter: the steps exactly
+    const d = dir()
+    const textsFile = join(d, 'texts.json')
+    const skill = join(d, 'SKILL.md')
+    const announced = served('2.2.2', manual('2.2.2'))
+    writeFileSync(textsFile, JSON.stringify({ version: 1, runtime: 'generic', fetched_at: '2026-11-01T00:00:00.000Z', texts: { ...texts, manual: announced } }))
+    writeFileSync(skill, manual('2.2.1'))
+    // The API is offline at start, then answers the same texts it announced before.
+    const { client, get } = textsClient([new Error('offline'), { ...texts, manual: announced }])
+    const cache = new TextsCache({ client, runtime: 'generic', filePath: textsFile })
+    const changes: string[] = []
+    cache.onChange((_t, source) => changes.push(source))
+    let offline = true
+    const { fetch, calls } = download(() => offline, () => '2.2.2')
+    const results: string[] = []
+    const sync = new ManualSync({ texts: cache, targetPath: skill, fetch, onResult: (r) => results.push(`${r.state}:${r.error ?? ''}`) })
+
+    await cache.start()
+    expect(cache.source).toBe('cache')
+    const first = await sync.start()
+    expect(first).toMatchObject({ state: 'kept', version: '2.2.1', served: '2.2.2', upToDate: false })
+    expect(readFileSync(skill, 'utf8')).toBe(manual('2.2.1')) // never worse than before
+
+    // 5 min: the texts come back unchanged (no change event); the manual retry fails again.
+    await vi.advanceTimersByTimeAsync(5 * MIN - 1)
+    expect(calls).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    await until('the texts refresh', () => get.mock.calls.length === 2 && cache.source === 'server')
+    await until('the first retry', () => calls.length === 2 && sync.result !== first)
+    expect(changes).toEqual(['cache'])
+    expect(sync.result).toMatchObject({ state: 'kept', upToDate: false })
+
+    // 10 min later the network is back: the retry places the announced manual.
+    offline = false
+    await vi.advanceTimersByTimeAsync(10 * MIN - 1)
+    expect(calls).toHaveLength(2)
+    await vi.advanceTimersByTimeAsync(1)
+    await until('the second retry', () => sync.result?.state === 'updated')
+    expect(readFileSync(skill, 'utf8')).toBe(manual('2.2.2'))
+    expect(sync.result).toMatchObject({ state: 'updated', version: '2.2.2', upToDate: true })
+    expect(changes).toEqual(['cache'])
+    expect(results).toEqual(['kept:fetch failed', 'updated:']) // the repeated failure said once
+
+    // Current: nothing more is fetched.
+    await vi.advanceTimersByTimeAsync(3 * 60 * MIN)
+    expect(calls).toEqual([MANUAL_URL, MANUAL_URL, MANUAL_URL])
+    sync.stop()
+    cache.stop()
+  })
+
+  it('repeated failures back off 5 → 10 → 20 → 40 → 60 → 60 min, each within ±20 %, one at a time', async () => {
+    fakeTimers()
+    const armed = timeouts()
+    const skill = join(dir(), 'SKILL.md')
+    writeFileSync(skill, manual('2.2.1'))
+    const { source } = announcing(served('2.2.2'))
+    const { fetch, calls } = download(() => true, () => '2.2.2')
+    const results: string[] = []
+    const sync = new ManualSync({ texts: source, targetPath: skill, fetch, onResult: (r) => results.push(r.state) })
+    await sync.start()
+    const delays = () => armed.mock.calls.map((call) => call[1] as number)
+    for (const [i, minutes] of [5, 10, 20, 40, 60, 60].entries()) {
+      await until(`retry ${i + 1} armed`, () => delays().length === i + 1)
+      expect(vi.getTimerCount()).toBe(1)
+      const ms = delays()[i]!
+      expect(ms).toBeGreaterThanOrEqual(Math.floor(minutes * MIN * 0.8))
+      expect(ms).toBeLessThanOrEqual(Math.ceil(minutes * MIN * 1.2))
+      await vi.advanceTimersByTimeAsync(ms - 1)
+      expect(calls).toHaveLength(i + 1)
+      await vi.advanceTimersByTimeAsync(1)
+      await until(`retry ${i + 1} ran`, () => calls.length === i + 2)
+    }
+    expect(results).toEqual(['kept']) // one report for one condition, as before
+    sync.stop()
+  })
+
+  it('the jitter spans 0.8× to 1.2× of the step', async () => {
+    fakeTimers()
+    const armed = timeouts()
+    const skill = join(dir(), 'SKILL.md')
+    for (const [random, expected] of [
+      [0, 4 * MIN],
+      [0.999_999, Math.floor(5 * MIN * (0.8 + 0.999_999 * 0.4))],
+    ] as const) {
+      armed.mockClear()
+      vi.spyOn(Math, 'random').mockReturnValue(random)
+      const { fetch } = download(() => true, () => '2.2.2')
+      const sync = new ManualSync({ texts: announcing(served('2.2.2')).source, targetPath: skill, fetch })
+      await sync.start()
+      expect(armed.mock.calls.map((call) => call[1])).toEqual([expected])
+      sync.stop()
+    }
+  })
+
+  it('a success stops the retries', async () => {
+    fakeTimers()
+    const skill = join(dir(), 'SKILL.md')
+    writeFileSync(skill, manual('2.2.1'))
+    let offline = true
+    const { fetch, calls } = download(() => offline, () => '2.2.2')
+    const sync = new ManualSync({ texts: announcing(served('2.2.2')).source, targetPath: skill, fetch })
+    await sync.start()
+    expect(vi.getTimerCount()).toBe(1)
+    offline = false
+    await vi.advanceTimersByTimeAsync(6 * MIN)
+    await until('the retry placed it', () => sync.result?.state === 'updated')
+    expect(readFileSync(skill, 'utf8')).toBe(manual('2.2.2'))
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(24 * 60 * MIN)
+    expect(calls).toHaveLength(2)
+    sync.stop()
+  })
+
+  it('a texts change during the backoff syncs at once and starts the backoff over', async () => {
+    fakeTimers()
+    const armed = timeouts()
+    const skill = join(dir(), 'SKILL.md')
+    writeFileSync(skill, manual('2.2.1'))
+    const announcer = announcing(served('2.2.2'))
+    let offline = true
+    let version = '2.2.2'
+    const { fetch, calls } = download(() => offline, () => version)
+    const sync = new ManualSync({ texts: announcer.source, targetPath: skill, fetch })
+    await sync.start()
+    const delays = () => armed.mock.calls.map((call) => call[1] as number)
+    // Two retries fail: the third waits about 20 min.
+    for (let i = 0; i < 2; i++) {
+      await until(`retry ${i + 1} armed`, () => delays().length === i + 1)
+      await vi.advanceTimersByTimeAsync(delays()[i]!)
+      await until(`retry ${i + 1} ran`, () => calls.length === i + 2)
+    }
+    await until('retry 3 armed', () => delays().length === 3)
+    expect(delays()[2]).toBeGreaterThanOrEqual(16 * MIN)
+
+    // A new announcement, still offline: synced now, with no time passing; the backoff is back at 5 min.
+    version = '2.2.3'
+    announcer.change(served('2.2.3'))
+    await until('the change synced', () => calls.length === 4)
+    await until('the next retry armed', () => delays().length === 4)
+    expect(vi.getTimerCount()).toBe(1) // the 20 min retry was cancelled, not added to
+    expect(delays()[3]).toBeGreaterThanOrEqual(4 * MIN)
+    expect(delays()[3]).toBeLessThanOrEqual(6 * MIN)
+    expect(sync.result).toMatchObject({ state: 'kept', served: '2.2.3', upToDate: false })
+
+    // Online again: the retry places the new announcement.
+    offline = false
+    await vi.advanceTimersByTimeAsync(delays()[3]!)
+    await until('the retry placed it', () => sync.result?.state === 'updated')
+    expect(readFileSync(skill, 'utf8')).toBe(manual('2.2.3'))
+    expect(vi.getTimerCount()).toBe(0)
+    sync.stop()
+  })
+
+  it('stop() cancels the pending retry, and a sync in flight at stop arms none', async () => {
+    fakeTimers()
+    const skill = join(dir(), 'SKILL.md')
+    writeFileSync(skill, manual('2.2.1'))
+    const { fetch, calls } = download(() => true, () => '2.2.2')
+    const sync = new ManualSync({ texts: announcing(served('2.2.2')).source, targetPath: skill, fetch })
+    await sync.start()
+    expect(vi.getTimerCount()).toBe(1)
+    sync.stop()
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(2 * 60 * MIN)
+    expect(calls).toHaveLength(1)
+    await expect(sync.sync()).resolves.toBeNull()
+
+    // A download still in flight when stop() is called arms nothing after it.
+    let release = (): void => undefined
+    const blocked: string[] = []
+    const slow: ManualFetch = async (url) => {
+      blocked.push(url)
+      await new Promise<void>((resolve) => {
+        release = resolve
+      })
+      throw new TypeError('fetch failed')
+    }
+    const other = new ManualSync({ texts: announcing(served('2.2.2')).source, targetPath: skill, fetch: slow })
+    const first = other.start()
+    await until('the download started', () => blocked.length === 1)
+    other.stop()
+    release()
+    await first
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(2 * 60 * MIN)
+    expect(blocked).toHaveLength(1)
+  })
+
+  it('the pending retry does not keep the process alive (a real timer, unref)', async () => {
+    const armed = timeouts()
+    const { fetch } = download(() => true, () => '2.2.2')
+    const sync = new ManualSync({ texts: announcing(served('2.2.2')).source, targetPath: join(dir(), 'SKILL.md'), fetch })
+    await sync.start()
+    expect(armed).toHaveBeenCalledTimes(1)
+    const handle = armed.mock.results[0]!.value as ReturnType<typeof setTimeout>
+    expect(handle.hasRef()).toBe(false)
+    sync.stop()
+  })
+
+  it('nothing announced, or not following (sync() without start()): no retry', async () => {
+    fakeTimers()
+    const skill = join(dir(), 'SKILL.md')
+    const { fetch, calls } = download(() => true, () => '2.2.2')
+    const none = new ManualSync({ texts: announcing(null).source, targetPath: skill, fetch })
+    await expect(none.start()).resolves.toBeNull()
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(2 * 60 * MIN)
+    expect(calls).toEqual([])
+    none.stop()
+
+    const once = new ManualSync({ texts: announcing(served('2.2.2')).source, targetPath: skill, fetch })
+    await expect(once.sync()).resolves.toMatchObject({ state: 'failed', upToDate: false })
+    expect(vi.getTimerCount()).toBe(0)
+    await vi.advanceTimersByTimeAsync(2 * 60 * MIN)
+    expect(calls).toHaveLength(1)
+  })
+})
+
 describe('files', () => {
   it('renameWithRetry retries a transient EPERM/EBUSY/EACCES when asked (Windows), and only then', async () => {
     let n = 0

@@ -38,7 +38,7 @@
 
 import type { Texts } from '../types/index.js'
 import { readBytes, writeAtomic, type RenameOptions } from './files.js'
-import type { TextsCache } from './texts-cache.js'
+import { TEXTS_RETRY_MAX_MS, TEXTS_RETRY_MS, type TextsCache } from './texts-cache.js'
 
 /** What the served texts announce: `Texts['manual']`. */
 export type ServedManual = Texts['manual']
@@ -51,6 +51,13 @@ export const MANUAL_FETCH_TIMEOUT_MS = 10_000
 export const MANUAL_MAX_REDIRECTS = 3
 /** The skill the manual is: `<skills dir>/agentchat/SKILL.md`. */
 export const MANUAL_SKILL_NAME = 'agentchat'
+/**
+ * After a sync that left the file not the announced manual, `ManualSync`
+ * tries again on the texts cache's own retry cadence (5 min, doubling to
+ * 1 h), each wait spread ±20 % so a fleet that failed together does not
+ * retry together.
+ */
+const MANUAL_RETRY_JITTER = 0.2
 
 /** `fetch`'s shape, injectable for tests. Called with `redirect: 'manual'`. */
 export type ManualFetch = (url: string, init: RequestInit) => Promise<Response>
@@ -218,7 +225,12 @@ export interface ManualSyncOptions {
 /**
  * Keeps the skill file at the manual the texts announce. `start()` syncs once
  * and then on every texts change (the texts' own cadence: daily, sooner while
- * the server does not answer). Calls are serialised; `stop()` aborts a
+ * the server does not answer). While a sync has left the file not the
+ * announced manual (offline, an error answer, a body that failed a check, a
+ * write that failed), it is tried again on its own after 5 min, doubling to
+ * 1 h (±20 %), until one is current: the texts may not change again for a
+ * day or more. A texts change syncs at once and starts the backoff over.
+ * Calls are serialised; `stop()` cancels a pending retry and aborts a
  * download in flight.
  */
 export class ManualSync {
@@ -228,6 +240,9 @@ export class ManualSync {
   private unsubscribe: (() => void) | null = null
   private lastError: string | null = null
   private last: ManualSyncResult | null = null
+  /** Syncs in a row, since the last current one or texts change, that left the file not the announced manual. */
+  private misses = 0
+  private retryTimer: ReturnType<typeof setTimeout> | null = null
 
   constructor(options: ManualSyncOptions) {
     this.options = options
@@ -238,11 +253,13 @@ export class ManualSync {
     return this.last
   }
 
-  /** Sync now, then follow every texts change. Resolves with the first result. */
+  /** Sync now, then follow every texts change, and retry while the file is not current. Resolves with the first result. */
   start(): Promise<ManualSyncResult | null> {
     if (this.unsubscribe === null) {
       this.unsubscribe = this.options.texts.onChange((texts) => {
-        void this.sync(texts.manual)
+        // A new announcement: synced at once, the backoff from its start.
+        this.cancelRetry()
+        void this.run(texts.manual, true)
       })
     }
     return this.sync()
@@ -251,11 +268,17 @@ export class ManualSync {
   stop(): void {
     this.unsubscribe?.()
     this.unsubscribe = null
+    this.cancelRetry()
     this.controller.abort()
   }
 
   /** One serialised sync against `served` (default: the texts in hand). Null when nothing is in hand or stopped. */
   sync(served: ServedManual | null = this.options.texts.current()?.manual ?? null): Promise<ManualSyncResult | null> {
+    return this.run(served, false)
+  }
+
+  /** `sync`, on the chain. `announced`: the texts changed, so the backoff starts over. */
+  private run(served: ServedManual | null, announced: boolean): Promise<ManualSyncResult | null> {
     const next = this.chain.then(async () => {
       if (served === null || this.controller.signal.aborted) return null
       const result = await syncManual({
@@ -278,10 +301,43 @@ export class ManualSync {
         }
       }
       this.lastError = result.upToDate === true ? null : result.error
+      if (announced) this.misses = 0
+      this.scheduleRetry(result)
       return result
     })
     this.chain = next.catch(() => undefined)
     return next
+  }
+
+  /**
+   * After each result: a current one (or nothing announced) ends the retries
+   * and resets the backoff; any other arms the next attempt, while following
+   * (between `start()` and `stop()`). At most one is pending; it runs on the
+   * chain like any sync, against the texts in hand when it fires. The timer
+   * never keeps the process alive.
+   */
+  private scheduleRetry(result: ManualSyncResult): void {
+    this.cancelRetry()
+    if (result.served === null || result.upToDate === true) {
+      this.misses = 0
+      return
+    }
+    if (this.unsubscribe === null || this.controller.signal.aborted) return
+    this.misses += 1
+    const step = Math.min(TEXTS_RETRY_MAX_MS, TEXTS_RETRY_MS * 2 ** Math.min(this.misses - 1, 20))
+    const delay = Math.floor(step * (1 - MANUAL_RETRY_JITTER + Math.random() * 2 * MANUAL_RETRY_JITTER))
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null
+      // No caller awaits a retry: a rejection here must not become an unhandled one.
+      this.sync().catch(() => undefined)
+    }, delay)
+    ;(this.retryTimer as { unref?: () => void }).unref?.()
+  }
+
+  private cancelRetry(): void {
+    if (this.retryTimer === null) return
+    clearTimeout(this.retryTimer)
+    this.retryTimer = null
   }
 }
 

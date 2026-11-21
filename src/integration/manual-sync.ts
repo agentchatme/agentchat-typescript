@@ -138,6 +138,21 @@ export function manualVersion(text: string): string | null {
 
 /** Bring the skill file at `path` to the announced manual. Never throws. */
 export async function syncManual(options: SyncManualOptions): Promise<ManualSyncResult> {
+  return (await placeManual(options)).result
+}
+
+/** `syncManual`'s result, and whether the address served a manual other than the announced one. */
+interface Placed {
+  readonly result: ManualSyncResult
+  /**
+   * The download was the agentchat manual, but not the announced one (another
+   * version, or the announced version with other bytes): the address has
+   * moved on, or the announcement has, and the texts in hand may be behind.
+   */
+  readonly otherManual: boolean
+}
+
+async function placeManual(options: SyncManualOptions): Promise<Placed> {
   const file = options.path
   const served = options.served
   const local = await readLocal(file)
@@ -145,6 +160,8 @@ export async function syncManual(options: SyncManualOptions): Promise<ManualSync
   const base = { path: file, previous: local.version, served: served?.version ?? null, url: served?.url ?? null }
   let tampered = false
   let error: string | null = null
+  let otherManual = false
+  const done = (result: ManualSyncResult): Placed => ({ result, otherManual })
 
   if (served !== null) {
     const hash = announcedHash(served)
@@ -153,7 +170,7 @@ export async function syncManual(options: SyncManualOptions): Promise<ManualSync
     } else {
       if (local.exists && local.version === served.version) {
         if (hash === null || (await sha256(local.bytes)) === hash) {
-          return { ...base, tampered, state: 'current', version: local.version, source: null, written: false, upToDate: true, error: null }
+          return done({ ...base, tampered, state: 'current', version: local.version, source: null, written: false, upToDate: true, error: null })
         }
         tampered = true
       }
@@ -171,12 +188,13 @@ export async function syncManual(options: SyncManualOptions): Promise<ManualSync
             source = 'download'
           } catch (err) {
             error = describe(err)
+            otherManual = err instanceof OtherManual
           }
         }
         if (bytes !== null) {
           try {
             await writeAtomic(file, bytes, { mode: 0o644, ...(options.rename ? { rename: options.rename } : {}) })
-            return { ...base, tampered, state: 'updated', version: served.version, source, written: true, upToDate: true, error: null }
+            return done({ ...base, tampered, state: 'updated', version: served.version, source, written: true, upToDate: true, error: null })
           } catch (err) {
             error = `could not write ${file}: ${describe(err)}`
           }
@@ -186,18 +204,18 @@ export async function syncManual(options: SyncManualOptions): Promise<ManualSync
   }
 
   if (local.exists) {
-    return { ...base, tampered, state: 'kept', version: local.version, source: null, written: false, upToDate: served === null ? null : false, error }
+    return done({ ...base, tampered, state: 'kept', version: local.version, source: null, written: false, upToDate: served === null ? null : false, error })
   }
   if (fallback === null) {
-    return { ...base, tampered, state: 'failed', version: null, source: null, written: false, upToDate: served === null ? null : false, error: error ?? 'no manual could be had and no fallback was given' }
+    return done({ ...base, tampered, state: 'failed', version: null, source: null, written: false, upToDate: served === null ? null : false, error: error ?? 'no manual could be had and no fallback was given' })
   }
   try {
     await writeAtomic(file, fallback, { mode: 0o644, ...(options.rename ? { rename: options.rename } : {}) })
   } catch (err) {
-    return { ...base, tampered, state: 'failed', version: null, source: null, written: false, upToDate: served === null ? null : false, error: describe(err) }
+    return done({ ...base, tampered, state: 'failed', version: null, source: null, written: false, upToDate: served === null ? null : false, error: describe(err) })
   }
   const fallbackIsServed = served !== null && (await isAnnounced(fallback, served, announcedHashOrNull(served)))
-  return {
+  return done({
     ...base,
     tampered,
     state: 'fallback',
@@ -206,7 +224,7 @@ export async function syncManual(options: SyncManualOptions): Promise<ManualSync
     written: true,
     upToDate: served === null ? null : fallbackIsServed,
     error,
-  }
+  })
 }
 
 export interface ManualSyncOptions {
@@ -230,6 +248,17 @@ export interface ManualSyncOptions {
  * write that failed), it is tried again on its own after 5 min, doubling to
  * 1 h (±20 %), until one is current: the texts may not change again for a
  * day or more. A texts change syncs at once and starts the backoff over.
+ *
+ * Each retry first asks the texts source to refresh (a `TextsCache`'s own
+ * `refresh()`, coalesced with a fetch in flight), so a retry does not keep
+ * syncing against an announcement the server has since replaced: when the
+ * texts changed, the change syncs; when not, the retry syncs against the
+ * texts in hand. A download that was the manual but not the announced one
+ * (another version, other bytes) asks for that refresh at once, without
+ * waiting for the next step; the body is still refused. While the texts
+ * cache is failing (`lastError` set) no refresh is asked for: its own timer
+ * retries on its own backoff. A source without `refresh()` is not refreshed.
+ *
  * Calls are serialised; `stop()` cancels a pending retry and aborts a
  * download in flight.
  */
@@ -243,6 +272,8 @@ export class ManualSync {
   /** Syncs in a row, since the last current one or texts change, that left the file not the announced manual. */
   private misses = 0
   private retryTimer: ReturnType<typeof setTimeout> | null = null
+  /** Texts changes heard: a refresh that moved it has already queued the change's sync. */
+  private changes = 0
 
   constructor(options: ManualSyncOptions) {
     this.options = options
@@ -256,10 +287,11 @@ export class ManualSync {
   /** Sync now, then follow every texts change, and retry while the file is not current. Resolves with the first result. */
   start(): Promise<ManualSyncResult | null> {
     if (this.unsubscribe === null) {
-      this.unsubscribe = this.options.texts.onChange((texts) => {
+      this.unsubscribe = this.options.texts.onChange((texts, source) => {
         // A new announcement: synced at once, the backoff from its start.
+        this.changes += 1
         this.cancelRetry()
-        void this.run(texts.manual, true)
+        void this.run(texts.manual, true, source === 'server')
       })
     }
     return this.sync()
@@ -274,14 +306,18 @@ export class ManualSync {
 
   /** One serialised sync against `served` (default: the texts in hand). Null when nothing is in hand or stopped. */
   sync(served: ServedManual | null = this.options.texts.current()?.manual ?? null): Promise<ManualSyncResult | null> {
-    return this.run(served, false)
+    return this.run(served, false, false)
   }
 
-  /** `sync`, on the chain. `announced`: the texts changed, so the backoff starts over. */
-  private run(served: ServedManual | null, announced: boolean): Promise<ManualSyncResult | null> {
+  /**
+   * `sync`, on the chain. `announced`: the texts changed, so the backoff
+   * starts over. `fresh`: the texts were just had from the server, so a
+   * download that is another manual asks for no refresh.
+   */
+  private run(served: ServedManual | null, announced: boolean, fresh: boolean): Promise<ManualSyncResult | null> {
     const next = this.chain.then(async () => {
       if (served === null || this.controller.signal.aborted) return null
-      const result = await syncManual({
+      const { result, otherManual } = await placeManual({
         path: this.options.targetPath,
         served,
         apiBase: this.options.texts.apiBase,
@@ -303,18 +339,56 @@ export class ManualSync {
       this.lastError = result.upToDate === true ? null : result.error
       if (announced) this.misses = 0
       this.scheduleRetry(result)
+      // The address serves another manual than the one in hand: the texts may
+      // be behind. Ask now; a change syncs and resets the backoff, no change
+      // leaves the retry armed above.
+      if (otherManual && !fresh && this.following()) void this.refreshTexts()
       return result
     })
     this.chain = next.catch(() => undefined)
     return next
   }
 
+  /** One retry: refresh the texts, then sync unless the refresh changed them (the change has queued its own sync). */
+  private async retry(): Promise<void> {
+    const refreshed = await this.refreshTexts()
+    if (refreshed === 'changed' || !this.following()) return
+    await this.run(this.options.texts.current()?.manual ?? null, false, refreshed === 'fresh')
+  }
+
+  /**
+   * The texts source's own `refresh()` (a `TextsCache`: one fetch, coalesced
+   * with one in flight, its timer re-armed by it). `changed`: a change was
+   * heard, and its sync is queued. `fresh`: the server answered with the same
+   * texts. `stale`: no answer, or not asked — no `refresh()`, stopped, or the
+   * cache is failing (`lastError` set) and its own timer retries on its own
+   * backoff.
+   */
+  private async refreshTexts(): Promise<'changed' | 'fresh' | 'stale'> {
+    const source = this.options.texts as { refresh?: () => Promise<unknown>; lastError?: unknown }
+    if (typeof source.refresh !== 'function' || typeof source.lastError === 'string' || !this.following()) return 'stale'
+    const before = this.changes
+    let answered = false
+    try {
+      answered = (await source.refresh()) === true
+    } catch {
+      // a refresh that throws is the source's to report; the retry goes on with the texts in hand
+    }
+    if (this.changes !== before) return 'changed'
+    return answered ? 'fresh' : 'stale'
+  }
+
+  /** Between `start()` and `stop()`. */
+  private following(): boolean {
+    return this.unsubscribe !== null && !this.controller.signal.aborted
+  }
+
   /**
    * After each result: a current one (or nothing announced) ends the retries
    * and resets the backoff; any other arms the next attempt, while following
-   * (between `start()` and `stop()`). At most one is pending; it runs on the
-   * chain like any sync, against the texts in hand when it fires. The timer
-   * never keeps the process alive.
+   * (between `start()` and `stop()`). At most one is pending; when it fires
+   * it refreshes the texts, then syncs on the chain like any sync, against
+   * the texts in hand. The timer never keeps the process alive.
    */
   private scheduleRetry(result: ManualSyncResult): void {
     this.cancelRetry()
@@ -322,14 +396,14 @@ export class ManualSync {
       this.misses = 0
       return
     }
-    if (this.unsubscribe === null || this.controller.signal.aborted) return
+    if (!this.following()) return
     this.misses += 1
     const step = Math.min(TEXTS_RETRY_MAX_MS, TEXTS_RETRY_MS * 2 ** Math.min(this.misses - 1, 20))
     const delay = Math.floor(step * (1 - MANUAL_RETRY_JITTER + Math.random() * 2 * MANUAL_RETRY_JITTER))
     this.retryTimer = setTimeout(() => {
       this.retryTimer = null
       // No caller awaits a retry: a rejection here must not become an unhandled one.
-      this.sync().catch(() => undefined)
+      this.retry().catch(() => undefined)
     }, delay)
     ;(this.retryTimer as { unref?: () => void }).unref?.()
   }
@@ -375,6 +449,9 @@ function refusal(url: URL, origin: Extract<Origin, { ok: true }>): string | null
 // ─── download and checks ────────────────────────────────────────────────────
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
+
+/** The body is the agentchat manual, but not the announced one. Never accepted; a sign the texts in hand may be behind. */
+class OtherManual extends Error {}
 const SHA256_HEX = /^[0-9a-f]{64}$/
 
 async function sha256(bytes: Uint8Array): Promise<string> {
@@ -492,7 +569,7 @@ async function downloadManual(
   checkManualText(text, served.version)
   if (hash !== null) {
     const got = await sha256(bytes)
-    if (got !== hash) throw new Error(`the body's sha256 is ${got}, the server announced ${hash}`)
+    if (got !== hash) throw new OtherManual(`the body's sha256 is ${got}, the server announced ${hash}`)
   }
   return bytes
 }
@@ -527,7 +604,10 @@ function checkManualText(text: string, announced: string): void {
   if (fields === null) throw new Error('the body has no front matter — not the manual')
   if (fields.get('name') !== MANUAL_SKILL_NAME) throw new Error(`the front matter names "${fields.get('name') ?? ''}", not the ${MANUAL_SKILL_NAME} skill`)
   const version = manualVersion(text)
-  if (version !== announced) throw new Error(`the body is version ${version ?? '(none)'}, the server announced ${announced}`)
+  if (version !== announced) {
+    const message = `the body is version ${version ?? '(none)'}, the server announced ${announced}`
+    throw version === null ? new Error(message) : new OtherManual(message)
+  }
 }
 
 /** `AbortSignal.any` where it exists (Node 20.3+), a manual join elsewhere. */

@@ -20,6 +20,17 @@ describe('public SDK surface', () => {
     expect(typeof sdk.integration.anchor.render).toBe('function')
   })
 
+  it('exposes the identity block\'s strict reading and its follow', () => {
+    expect(typeof sdk.integration.anchor.owner).toBe('function')
+    expect(typeof sdk.integration.anchor.decide).toBe('function')
+    expect(typeof sdk.integration.anchor.follow).toBe('function')
+    expect(sdk.integration.anchor.FOLLOW_ATTEMPTS).toBe(3)
+    expect(sdk.integration.anchor.EARLIER_IDENTITY_LINES).toHaveLength(3)
+    // The file mechanics stay internal: the kit's public file helpers are unchanged.
+    expect(sdk.integration).not.toHaveProperty('replaceIfUnchanged')
+    expect(sdk.integration).not.toHaveProperty('readForReplace')
+  })
+
   it('exposes the wake check beside the wake webhook, and its error codes', () => {
     const client = new AgentChatClient({ apiKey: 'k', fetch: (() => Promise.reject(new Error('unused'))) as typeof fetch })
     expect(typeof client.wakeCheck.set).toBe('function')

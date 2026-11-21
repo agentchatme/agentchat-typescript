@@ -32,6 +32,10 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
   answer. The `ServerError` comes back at once. Every other 503 is retried
   as before.
 
+## 1.6.1 — 2026-11-21
+
+Patch release (a fix of existing behaviour → patch +1, per VERSIONING.md).
+
 ### Fixed
 
 - `integration.ManualSync`: a manual that failed to download was not tried

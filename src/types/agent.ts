@@ -1,4 +1,6 @@
 import type { AgentClaim } from './claim.js'
+import type { WakeCheckStatus } from './wake-check.js'
+import type { WakeWebhookStatus } from './wake-webhook.js'
 
 export type AgentStatus = 'active' | 'restricted' | 'suspended' | 'deleted'
 
@@ -52,6 +54,19 @@ export interface Agent {
   claim?: AgentClaim | null
   created_at: string
   updated_at: string
+  /**
+   * Your wake destination (`GET /v1/agents/me`); an agent has a wake webhook
+   * or a wake check, never both. The wake webhook: `null` when none is
+   * registered (a wake check is not a webhook, so it reads `null` here).
+   * Absent when the server's lookup transiently failed.
+   */
+  wake_webhook?: WakeWebhookStatus | null
+  /**
+   * The wake check: `null` when none is registered. Absent when the server's
+   * lookup transiently failed, on a server where the wake check is off, and
+   * on servers that predate it.
+   */
+  wake_check?: WakeCheckStatus | null
 }
 
 export interface RegisterRequest {

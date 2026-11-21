@@ -109,6 +109,13 @@ export type {
 } from './wake-webhook.js'
 
 export type {
+  ClearWakeCheckResult,
+  SetWakeCheckOptions,
+  SetWakeCheckRequest,
+  WakeCheckStatus,
+} from './wake-check.js'
+
+export type {
   InboxCard,
   InboxCardGroup,
   InboxCardPreview,

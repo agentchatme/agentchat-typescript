@@ -1,0 +1,9 @@
+# Fingerprint-level exceptions for findings in historical commits that are
+# not credentials. Each entry covers one commit, file, rule and line only; it
+# does not suppress other findings in the same file or from the same rule.
+#
+# 268fb43 (feat/wake-check): a made-up wake-webhook test secret written as a
+# literal ('wks_0123456789abcdef') in a client test. Not a credential; built
+# at run time ('fixture-'.repeat(4)) in the current tree. The original commit
+# still carries the line.
+268fb437429287a5686117e63ca31516e1672b73:tests/client-contract-v1.test.ts:generic-api-key:228

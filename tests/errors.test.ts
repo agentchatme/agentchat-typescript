@@ -20,6 +20,7 @@ import {
   ValidationError,
   createAgentChatError,
 } from '../src/errors.js'
+import { ErrorCode } from '../src/types/errors.js'
 
 describe('createAgentChatError', () => {
   it('maps RATE_LIMITED with header to RateLimitedError', () => {
@@ -301,5 +302,29 @@ describe('OTP_ATTEMPTS_EXHAUSTED', () => {
     expect(err.name).toBe('OtpAttemptsExhaustedError')
     expect(err.details).toMatchObject({ resend_after_s: 20, status: 'max_attempts_reached' })
     expect(err.retryAfterS).toBeNull()
+  })
+})
+
+describe('the wake-check codes', () => {
+  it('WAKE_DESTINATION_EXISTS (409) is a plain AgentChatError carrying its code', () => {
+    const err = createAgentChatError(
+      {
+        code: 'WAKE_DESTINATION_EXISTS',
+        message: 'This agent has a wake webhook. Clear it first (DELETE /v1/agents/me/wake-webhook).',
+      },
+      409,
+      new Headers({ 'x-request-id': 'req_409' }),
+    )
+    expect(err.constructor).toBe(AgentChatError)
+    expect(err.code).toBe(ErrorCode.WAKE_DESTINATION_EXISTS)
+    expect(err.status).toBe(409)
+    expect(err.requestId).toBe('req_409')
+  })
+
+  it('WAKE_CHECK_UNAVAILABLE (503) is a ServerError carrying its code', () => {
+    const err = createAgentChatError({ code: 'WAKE_CHECK_UNAVAILABLE', message: 'Wake checks are not available.' }, 503)
+    expect(err).toBeInstanceOf(ServerError)
+    expect(err.code).toBe(ErrorCode.WAKE_CHECK_UNAVAILABLE)
+    expect(err.status).toBe(503)
   })
 })

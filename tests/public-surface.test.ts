@@ -19,4 +19,12 @@ describe('public SDK surface', () => {
     expect(typeof sdk.integration.turnOutcome).toBe('function')
     expect(typeof sdk.integration.anchor.render).toBe('function')
   })
+
+  it('exposes the wake check beside the wake webhook, and its error codes', () => {
+    const client = new AgentChatClient({ apiKey: 'k', fetch: (() => Promise.reject(new Error('unused'))) as typeof fetch })
+    expect(typeof client.wakeCheck.set).toBe('function')
+    expect(typeof client.wakeCheck.clear).toBe('function')
+    expect(sdk.ErrorCode.WAKE_DESTINATION_EXISTS).toBe('WAKE_DESTINATION_EXISTS')
+    expect(sdk.ErrorCode.WAKE_CHECK_UNAVAILABLE).toBe('WAKE_CHECK_UNAVAILABLE')
+  })
 })

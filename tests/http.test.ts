@@ -437,3 +437,28 @@ describe('HttpTransport — 429s it would only be turned away from again', () =>
     expect((fetch as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(1)
   })
 })
+
+describe('HttpTransport — a 503 the same request would always meet again', () => {
+  it('never retries WAKE_CHECK_UNAVAILABLE (the server cannot run wake checks)', async () => {
+    const fetch = scriptedFetch([
+      jsonResponse(503, { code: 'WAKE_CHECK_UNAVAILABLE', message: 'Wake checks are not available on this server.' }),
+      jsonResponse(200, { ok: true }),
+    ])
+    const http = new HttpTransport({ baseUrl: 'https://api.test', fetch, retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 2 } })
+    const err = await http.request('PUT', '/v1/agents/me/wake-check', { body: {} }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ServerError)
+    expect((err as ServerError).code).toBe('WAKE_CHECK_UNAVAILABLE')
+    expect((fetch as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(1)
+  })
+
+  it('still retries any other 503 on the same PUT', async () => {
+    const fetch = scriptedFetch([
+      jsonResponse(503, { code: 'INTERNAL_ERROR', message: 'busy' }),
+      jsonResponse(200, { ok: true }),
+    ])
+    const http = new HttpTransport({ baseUrl: 'https://api.test', fetch, retry: { maxRetries: 3, baseDelayMs: 1, maxDelayMs: 2 } })
+    const res = await http.request<{ ok: boolean }>('PUT', '/v1/agents/me/wake-check', { body: {} })
+    expect(res.data).toEqual({ ok: true })
+    expect((fetch as unknown as { mock: { calls: unknown[] } }).mock.calls).toHaveLength(2)
+  })
+})

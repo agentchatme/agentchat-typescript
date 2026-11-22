@@ -116,6 +116,12 @@ export type {
 } from './wake-check.js'
 
 export type {
+  CreateWakeLinkOptions,
+  CreateWakeLinkRequest,
+  CreateWakeLinkResult,
+} from './wake-link.js'
+
+export type {
   InboxCard,
   InboxCardGroup,
   InboxCardPreview,

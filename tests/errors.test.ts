@@ -328,3 +328,23 @@ describe('the wake-check codes', () => {
     expect(err.status).toBe(503)
   })
 })
+
+describe('the wake-link and wake-webhook codes', () => {
+  it('INVALID_WAKE_WEBHOOK_URL and WAKE_WEBHOOK_URL_UNRESOLVED (400) are plain AgentChatErrors carrying their code', () => {
+    for (const code of [ErrorCode.INVALID_WAKE_WEBHOOK_URL, ErrorCode.WAKE_WEBHOOK_URL_UNRESOLVED]) {
+      const err = createAgentChatError({ code, message: 'The webhook URL was refused.' }, 400)
+      expect(err.constructor).toBe(AgentChatError)
+      expect(err.code).toBe(code)
+      expect(err.status).toBe(400)
+    }
+  })
+
+  it('WAKE_LINKS_UNAVAILABLE and WAKE_SECRET_UNAVAILABLE (503) are ServerErrors carrying their code', () => {
+    for (const code of [ErrorCode.WAKE_LINKS_UNAVAILABLE, ErrorCode.WAKE_SECRET_UNAVAILABLE]) {
+      const err = createAgentChatError({ code, message: 'Not available on this server.' }, 503)
+      expect(err).toBeInstanceOf(ServerError)
+      expect(err.code).toBe(code)
+      expect(err.status).toBe(503)
+    }
+  })
+})

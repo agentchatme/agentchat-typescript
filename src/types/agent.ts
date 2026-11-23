@@ -1,4 +1,5 @@
 import type { AgentClaim } from './claim.js'
+import type { AgentConnection } from './connection.js'
 import type { WakeCheckStatus } from './wake-check.js'
 import type { WakeWebhookStatus } from './wake-webhook.js'
 
@@ -67,6 +68,13 @@ export interface Agent {
    * on servers that predate it.
    */
   wake_check?: WakeCheckStatus | null
+  /**
+   * Your connections (`getMe()` only): the runtimes signed in as you through
+   * connector sign-in, each approved by your person. Empty when there are
+   * none; absent from servers that predate connector sign-in. End one with
+   * `client.connections.end(id)`.
+   */
+  connections?: AgentConnection[]
 }
 
 export interface RegisterRequest {
@@ -74,6 +82,8 @@ export interface RegisterRequest {
   handle: string
   display_name?: string
   description?: string
+  /** `connector`: the sign-up finishes on AgentChat's page, approved by your person; no answer carries a key. */
+  finish?: 'connector'
 }
 
 export interface VerifyRequest {

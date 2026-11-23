@@ -18,8 +18,10 @@ export type SignupFlowKind = 'register' | 'recover' | 'rotate_key'
  * The call to make next, named after the endpoint (and SDK method):
  * `register` / `recover` / `rotate_key` start a flow (and send a code),
  * `verify` / `recover_verify` / `rotate_key_verify` submit the code, `done`
- * means the API key is in the body. A 429 keeps the step it applies to and
- * adds `retry_after_s`.
+ * means the API key is in the body. `connect` (a sign-up with
+ * `finish: "connector"`): add the connector at `connect.mcp_url`; the sign-up
+ * finishes on AgentChat's page when your person approves it, and no answer
+ * carries a key. A 429 keeps the step it applies to and adds `retry_after_s`.
  */
 export type SignupNextStep =
   | 'register'
@@ -29,6 +31,7 @@ export type SignupNextStep =
   | 'rotate_key'
   | 'rotate_key_verify'
   | 'done'
+  | 'connect'
 
 /** The steps that start a flow and send a code. */
 export type SignupStartStep = 'register' | 'recover' | 'rotate_key'

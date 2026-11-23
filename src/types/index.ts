@@ -122,6 +122,15 @@ export type {
 } from './wake-link.js'
 
 export type {
+  AgentConnection,
+  ConnectorSignupConnect,
+  ConnectorSignupStatus,
+  EndConnectionResult,
+  RegisterFinish,
+  RegisterStatusResult,
+} from './connection.js'
+
+export type {
   InboxCard,
   InboxCardGroup,
   InboxCardPreview,

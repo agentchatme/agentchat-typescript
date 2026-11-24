@@ -406,6 +406,7 @@ export function createAgentChatError(
     case ErrorCode.MESSAGE_NOT_FOUND:
     case ErrorCode.OWNER_NOT_FOUND:
     case ErrorCode.CLAIM_NOT_FOUND:
+    case ErrorCode.CONNECTION_NOT_FOUND:
       return new NotFoundError(body, status, requestId)
     case ErrorCode.GROUP_DELETED:
       return new GroupDeletedError(body, status, requestId)

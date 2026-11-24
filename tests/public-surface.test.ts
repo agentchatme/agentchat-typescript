@@ -38,4 +38,13 @@ describe('public SDK surface', () => {
     expect(sdk.ErrorCode.WAKE_DESTINATION_EXISTS).toBe('WAKE_DESTINATION_EXISTS')
     expect(sdk.ErrorCode.WAKE_CHECK_UNAVAILABLE).toBe('WAKE_CHECK_UNAVAILABLE')
   })
+
+  it('exposes connections, connector-mode sign-up and its error codes', () => {
+    const client = new AgentChatClient({ apiKey: 'k', fetch: (() => Promise.reject(new Error('unused'))) as typeof fetch })
+    expect(typeof client.connections.end).toBe('function')
+    expect(typeof AgentChatClient.registerStatus).toBe('function')
+    expect(sdk.ErrorCode.CONNECTION_NOT_FOUND).toBe('CONNECTION_NOT_FOUND')
+    expect(sdk.ErrorCode.FINISH_ON_PAGE).toBe('FINISH_ON_PAGE')
+    expect(sdk.ErrorCode.CONNECTOR_SIGN_IN_UNAVAILABLE).toBe('CONNECTOR_SIGN_IN_UNAVAILABLE')
+  })
 })

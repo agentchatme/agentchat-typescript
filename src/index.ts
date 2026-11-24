@@ -23,6 +23,8 @@ export {
   type GroupsResource,
   type WakeWebhookResource,
   type WakeCheckResource,
+  type ConnectionsResource,
+  type ConnectorRegisterResult,
   type SyncOptions,
   type SyncPage,
   type GetMessagesOptions,

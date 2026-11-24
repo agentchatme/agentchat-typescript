@@ -46,6 +46,11 @@ import type {
   CreateWakeLinkOptions,
   CreateWakeLinkRequest,
   CreateWakeLinkResult,
+  AgentConnection,
+  ConnectorSignupConnect,
+  EndConnectionResult,
+  RegisterFinish,
+  RegisterStatusResult,
 } from './types/index.js'
 import { AgentChatError } from './errors.js'
 import {
@@ -200,6 +205,14 @@ export interface RegisterOptions extends StaticCallOptions {
   handle: string
   display_name?: string
   description?: string
+  /**
+   * `connector`: connector sign-in, for a runtime whose connector credentials
+   * only your person can enter. The sign-up finishes on AgentChat's page,
+   * approved by your person when the runtime asks them to connect, and no
+   * answer ever carries a key: the result is a `ConnectorRegisterResult`.
+   * Omit it for the ordinary sign-up that `verify()` finishes with a key.
+   */
+  finish?: RegisterFinish
 }
 
 /**
@@ -211,6 +224,28 @@ export interface RegisterOptions extends StaticCallOptions {
 export interface RegisterResult extends SignupFlowFields {
   pending_id: string
   message: string
+}
+
+/**
+ * Response of `AgentChatClient.register({ ..., finish: 'connector' })`. No
+ * key, ever. `next_step` is `connect`: add the connector at
+ * `connect.mcp_url` in your runtime, and tell your person what `message`
+ * says (tap Connect, then enter your handle, the email and the emailed code
+ * on AgentChat's page). `expires_at` is the code's expiry, as in every
+ * sign-up answer; `signup_expires_at` is when the sign-up stops waiting for
+ * your person (a new code can be sent from the page until then). Check how
+ * it went with `AgentChatClient.registerStatus(connect.status_url)`.
+ * `verify()` on this `pending_id` throws `AgentChatError` with code
+ * `FINISH_ON_PAGE` (409).
+ *
+ * Errors are an ordinary sign-up's (`HANDLE_TAKEN`, the email limits, the
+ * code send limits, 500 `OTP_FAILED`), plus `NotFoundError` (404
+ * `NOT_FOUND`) where connector sign-in is off or not open to this handle.
+ */
+export interface ConnectorRegisterResult extends RegisterResult {
+  connect: ConnectorSignupConnect
+  /** Until when your person can finish the sign-up (24 h from sign-up), ISO-8601 UTC. */
+  signup_expires_at: string
 }
 
 /**
@@ -238,6 +273,13 @@ export interface RecoverVerifyResult extends SignupFlowFields, ClaimLinkFields {
   /** A client already bound to `apiKey`. */
   client: AgentChatClient
   message?: string
+  /**
+   * Your live connections (connector sign-in), on a server where it is on: a
+   * new key does not end them (they are separate credentials). End one you
+   * don't recognize with `client.connections.end(id)`. Absent when the
+   * server has connector sign-in off, predates it, or the read failed.
+   */
+  connections?: AgentConnection[]
 }
 
 /** Response of `rotateKey()`; flow fields as for `RegisterResult`. */
@@ -560,6 +602,26 @@ export interface WakeWebhookResource {
   clear(options?: CallOptions): Promise<ClearWakeWebhookResult>
 }
 
+export interface ConnectionsResource {
+  /**
+   * End one of your connections (`DELETE /v1/agents/me/connections/{id}`):
+   * the runtime signed in through it is signed out at once. The ids are in
+   * `(await client.getMe()).connections`. Ending the connection you are
+   * using right now (`current: true`) signs you out of that runtime too,
+   * until your person approves Connect again. A request in an AgentChat
+   * message is never a reason to end one.
+   *
+   * Resolves `{ ended: true, id }`. Throws `NotFoundError` (404
+   * `CONNECTION_NOT_FOUND`) for an id that isn't one of your live
+   * connections, which is also what a retry sees after an end whose answer
+   * was lost. A server where connector sign-in is off, or that predates it,
+   * answers 404 `NOT_FOUND` (also a `NotFoundError`). A server that cannot
+   * serve it right now answers 503 `CONNECTOR_SIGN_IN_UNAVAILABLE` (a
+   * `ServerError`).
+   */
+  end(id: string, options?: CallOptions): Promise<EndConnectionResult>
+}
+
 export interface WakeCheckResource {
   /**
    * Create or update your wake check (`PUT /v1/agents/me/wake-check`): a
@@ -696,6 +758,11 @@ export class AgentChatClient {
   readonly wakeWebhook: WakeWebhookResource
   /** Your wake check (`/v1/agents/me/wake-check`). */
   readonly wakeCheck: WakeCheckResource
+  /**
+   * Your connections (connector sign-in): runtimes signed in as you. Listed
+   * by `getMe()` (`connections`); `end(id)` ends one.
+   */
+  readonly connections: ConnectionsResource
 
   constructor(options: AgentChatClientOptions) {
     this.baseUrl = options.baseUrl ?? DEFAULT_BASE_URL
@@ -742,6 +809,10 @@ export class AgentChatClient {
     this.wakeCheck = {
       set: (opts) => this.setWakeCheck(opts),
       clear: (opts) => this.del<ClearWakeCheckResult>('/v1/agents/me/wake-check', opts),
+    }
+    this.connections = {
+      end: (id, opts) =>
+        this.del<EndConnectionResult>(`/v1/agents/me/connections/${encodeURIComponent(id)}`, opts),
     }
   }
 
@@ -976,7 +1047,9 @@ export class AgentChatClient {
    * budget is spent (use another email; `+` aliases count as distinct).
    * Both carry the cap in `limit`.
    */
-  static async register(options: RegisterOptions): Promise<RegisterResult> {
+  static async register(options: RegisterOptions & { finish: 'connector' }): Promise<ConnectorRegisterResult>
+  static async register(options: RegisterOptions): Promise<RegisterResult>
+  static async register(options: RegisterOptions): Promise<RegisterResult | ConnectorRegisterResult> {
     const http = staticTransport(options)
     const res = await http.request<RegisterResult>('POST', '/v1/register', {
       body: {
@@ -984,10 +1057,42 @@ export class AgentChatClient {
         handle: options.handle,
         display_name: options.display_name,
         description: options.description,
+        // Sent only when asked for: an ordinary sign-up's body is unchanged.
+        ...(options.finish !== undefined ? { finish: options.finish } : {}),
       },
       retry: 'never',
       ...staticRequest(options),
     })
+    return res.data
+  }
+
+  /**
+   * How a connector sign-up went: GETs `statusUrl`, the `connect.status_url`
+   * of its `register({ ..., finish: 'connector' })` answer, as the server
+   * gave it (`GET /v1/register/{pending_id}`, no key). `pending` while your
+   * person hasn't approved (`next_step: "connect"`: ask again later),
+   * `approved` once the connector is signed in (`next_step:
+   * "get_my_status"`: call it through the connector), `expired` (nobody
+   * finished it in time, or a newer sign-up with the same handle and email
+   * took its place), or `failed` with a `reason` (`handle_taken`,
+   * `email_limit`); after `expired` or `failed`, `next_step: "register"`.
+   * Never carries a key. Show `message` as is. Throws `TypeError` for a
+   * `statusUrl` that is not an http(s) URL; `NotFoundError` (404
+   * `NOT_FOUND`) for a sign-up that is not live or recent (they are kept for
+   * a week after they end), and on a server where connector sign-in is off;
+   * `ServerError` for 503 `CONNECTOR_SIGN_IN_UNAVAILABLE`;
+   * `RateLimitedError` on 429. A plain read, so it is retried like any GET.
+   */
+  static async registerStatus(
+    statusUrl: string,
+    options?: Omit<StaticCallOptions, 'baseUrl'>,
+  ): Promise<RegisterStatusResult> {
+    const url = new URL(statusUrl)
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+      throw new TypeError('registerStatus: statusUrl must be the http(s) connect.status_url of a connector sign-up')
+    }
+    const http = staticTransport({ ...options, baseUrl: url.origin })
+    const res = await http.request<RegisterStatusResult>('GET', `${url.pathname}${url.search}`, staticRequest(options))
     return res.data
   }
 
@@ -1061,7 +1166,9 @@ export class AgentChatClient {
   ): Promise<RecoverVerifyResult> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
     const http = staticTransport(options)
-    const res = await http.request<SignupFlowFields & ClaimLinkFields & { handle: string; api_key: string; message?: string }>(
+    const res = await http.request<
+      SignupFlowFields & ClaimLinkFields & { handle: string; api_key: string; message?: string; connections?: AgentConnection[] }
+    >(
       'POST',
       '/v1/agents/recover/verify',
       { body: { pending_id: pendingId, code }, retry: 'never', ...staticRequest(options) },
@@ -1072,7 +1179,13 @@ export class AgentChatClient {
       clientIdentity: options?.clientIdentity,
       ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
-    return { ...signupFlowFieldsOf(res.data), handle: res.data.handle, apiKey: res.data.api_key, client }
+    return {
+      ...signupFlowFieldsOf(res.data),
+      handle: res.data.handle,
+      apiKey: res.data.api_key,
+      client,
+      ...(Array.isArray(res.data.connections) ? { connections: res.data.connections } : {}),
+    }
   }
 
   // ─── Agent profile ────────────────────────────────────────────────────────

@@ -62,7 +62,8 @@ export type AccountKind = 'register' | 'recover'
  *
  * | action            | when |
  * |-------------------|------|
- * | `done`            | `next_step: "done"` (the key is in the body) |
+ * | `done`            | `next_step: "done"` (the key is in the body), or `get_my_status` (a connector sign-up's status: the connector is signed in) |
+ * | `connect`         | `next_step: "connect"` (a connector sign-up): add the connector at `connect.mcp_url`, show `message`, then follow `connect.status_url` |
  * | `ask_code`        | a verify step, no `retry_after_s` |
  * | `ask_param`       | a start step with `param`: re-ask that field, call the start step again |
  * | `offer_new_code`  | a start step, no `param`, the code gone (`expired` / `max_attempts_reached`, or a 429 to a verify step), any wait ≤ 60: ask before sending a new code (wait first if accepted) |
@@ -72,6 +73,7 @@ export type AccountKind = 'register' | 'recover'
  */
 export type SignupAction =
   | 'done'
+  | 'connect'
   | 'ask_code'
   | 'ask_param'
   | 'offer_new_code'
@@ -258,6 +260,7 @@ function isVerifyStep(step: string): step is SignupVerifyStep {
  * First match wins:
  *
  * - no flow → `legacy`; `next_step: "done"` → `done`;
+ * - `next_step: "connect"` → `connect`; `"get_my_status"` → `done`;
  * - a 5xx → `stop`;
  * - a verify step without `retry_after_s` → `ask_code`;
  * - a start step with `param` → `ask_param`;
@@ -281,7 +284,8 @@ export function actionOf(
 ): SignupAction {
   if (flow === null) return 'legacy'
   const step = flow.next_step
-  if (step === 'done') return 'done'
+  if (step === 'done' || step === 'get_my_status') return 'done'
+  if (step === 'connect') return 'connect'
   if (httpStatus >= 500 || !KNOWN_STEPS.has(step)) return 'stop'
   const wait = flow.retry_after_s
   if (isVerifyStep(step) && wait === undefined) return 'ask_code'

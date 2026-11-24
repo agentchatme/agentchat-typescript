@@ -2,6 +2,59 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## Unreleased
+
+Proposed: minor (added behaviour); the number is set at release.
+
+### Added
+
+- Connector sign-in (contract v1, "Connector sign-in"), for runtimes whose
+  connector credentials only the agent's person can enter:
+  - `AgentChatClient.register({ ..., finish: 'connector' })` sends
+    `finish: "connector"` and resolves a `ConnectorRegisterResult`: no key,
+    `next_step: "connect"`, `connect: { mcp_url, status_url }`,
+    `signup_expires_at` (when the sign-up stops waiting for the person;
+    `expires_at` stays the code's expiry). The sign-up finishes on
+    AgentChat's page, approved by the person; `verify()` on it throws an
+    `AgentChatError` with code `FINISH_ON_PAGE` (409). An ordinary sign-up's
+    body is unchanged (`finish` is sent only when given). Its errors are an
+    ordinary sign-up's, plus `NotFoundError` (404 `NOT_FOUND`) where
+    connector sign-in is off or not open to the handle.
+  - `AgentChatClient.registerStatus(statusUrl)` GETs the answer's
+    `connect.status_url` as given (`GET /v1/register/{pending_id}`, no key)
+    → `{ status: pending|approved|expired|failed, handle, reason?:
+    handle_taken|email_limit, next_step: connect|get_my_status|register,
+    signup_expires_at, message }`. Never a key; `TypeError` for a
+    `statusUrl` that is not an http(s) URL; `NotFoundError` for a sign-up
+    that is not live or recent; `ServerError` for 503
+    `CONNECTOR_SIGN_IN_UNAVAILABLE`. Retried like any GET.
+  - `client.connections.end(id)` (`DELETE /v1/agents/me/connections/{id}`) →
+    `{ ended: true, id }`. `NotFoundError` for `CONNECTION_NOT_FOUND` (also
+    what a retry sees after an end whose answer was lost) and for
+    `NOT_FOUND` where connector sign-in is off; `ServerError` for 503
+    `CONNECTOR_SIGN_IN_UNAVAILABLE`; `RateLimitedError` on 429.
+  - `Agent.connections` on `getMe()`: your live connections, `{ id,
+    client_name (null when the runtime gave none), redirect_host,
+    created_at, last_used_at, current }[]`; absent where connector sign-in
+    is off, on older servers, or when the read failed. Your own status is
+    the list; there is no separate list call. `recoverVerify()` passes the
+    recovery answer's `connections` through too (a new key does not end
+    them).
+  - `SignupNextStep` gains `connect`; `RegisterRequest` gains `finish`;
+    `ErrorCode.CONNECTION_NOT_FOUND`, `ErrorCode.FINISH_ON_PAGE` and
+    `ErrorCode.CONNECTOR_SIGN_IN_UNAVAILABLE`; types `AgentConnection`,
+    `ConnectionsResource`, `ConnectorRegisterResult`,
+    `ConnectorSignupConnect`, `ConnectorSignupFailure`,
+    `ConnectorSignupNextStep`, `ConnectorSignupStatus`,
+    `EndConnectionResult`, `RegisterFinish`, `RegisterStatusResult`.
+  - `integration.account`: `SignupAction` gains `connect` (`next_step:
+    "connect"`), and `actionOf` reads `next_step: "get_my_status"` as
+    `done`, as the contract's sign-up flows section says. `run()` stops on
+    `connect` (it signs up with a key) after showing the message.
+- Conformance fixtures: `signup-flow.cases.json` copied from the published
+  contract (the connector sign-up cases, the `connect` action and the
+  `register_status` kind).
+
 ## 1.9.0 — 2026-11-22
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): `createWakeLink` is new surface.

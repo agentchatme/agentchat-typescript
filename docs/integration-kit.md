@@ -267,7 +267,8 @@ if (result.outcome === 'done') saveKey(result.apiKey, result.handle) // the hand
 
 | `action` | When | `run` |
 |---|---|---|
-| `done` | `next_step: "done"` | shows the message, returns the key and the handle |
+| `done` | `next_step: "done"` (`get_my_status` on a connector sign-up's status) | shows the message, returns the key and the handle |
+| `connect` | `next_step: "connect"`: a connector sign-up, which never carries a key (`verify` on one answers 409 `FINISH_ON_PAGE`) | shows the message, ends: `run` signs up with a key; a connector sign-up is `AgentChatClient.register({ ..., finish: 'connector' })` |
 | `ask_code` | a verify step, no wait | asks for the code; the person can enter it, ask for a new code, or cancel |
 | `ask_param` | a start step with `param` | asks that field only (a taken handle re-asks the handle, an email at its limit the email), starts again |
 | `offer_new_code` | a start step and the code is gone: expired, too many wrong tries, or a 429 to the code | asks before sending a new code; on a yes, waits out `retry_after_s` first when the answer has one |

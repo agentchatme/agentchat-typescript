@@ -75,7 +75,6 @@ export {
   AwaitingReplyError,
   BlockedError,
   ConnectionError,
-  ConnectorSignInUnsupportedError,
   ContainsSecretError,
   EmailExhaustedError,
   EmailLimitReachedError,

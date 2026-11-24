@@ -345,32 +345,6 @@ export class ServerError extends AgentChatError {
 }
 
 /**
- * Raised by `AgentChatClient.register({ ..., finish: 'connector' })` when the
- * server's 2xx answer is not a connector sign-up answer (no `next_step:
- * "connect"` with a `connect` address, or a key in it): a server without
- * connector sign-in ignores `finish` and starts an ordinary sign-up. A code
- * may already have gone to the email, and finishing that sign-up with
- * `verify()` would return an API key, so the SDK stops here instead of
- * returning it as the connector path. `pendingId` and `serverMessage` are
- * the server's, for the record; don't finish that sign-up with `verify()`
- * unless an ordinary key-holding sign-up is what you want.
- */
-export class ConnectorSignInUnsupportedError extends Error {
-  readonly pendingId: string | null
-  readonly serverMessage: string | null
-
-  constructor(pendingId: unknown, serverMessage: unknown) {
-    super(
-      'This server answered an ordinary sign-up, not a connector sign-up (it does not offer connector sign-in). ' +
-        'Nothing was finished; do not call verify() on this sign-up unless you want an API key.',
-    )
-    this.name = 'ConnectorSignInUnsupportedError'
-    this.pendingId = typeof pendingId === 'string' ? pendingId : null
-    this.serverMessage = typeof serverMessage === 'string' ? serverMessage : null
-  }
-}
-
-/**
  * Raised when the transport cannot reach the server (DNS failure, socket
  * reset, TLS error, timeout, …). Distinct from `AgentChatError` — there
  * is no server response body to inspect.

@@ -45,7 +45,7 @@ export type RegisterFinish = 'connector'
 export interface ConnectorSignupConnect {
   /** The connector address to add in the runtime. */
   mcp_url: string
-  /** Where to check how the sign-up went: `AgentChatClient.registerStatus(pending_id)` calls it. */
+  /** Where to check how the sign-up went: pass it to `AgentChatClient.registerStatus()`. */
   status_url: string
 }
 
@@ -54,11 +54,10 @@ export type ConnectorSignupStatus = 'pending' | 'approved' | 'expired' | 'failed
 
 /**
  * Why a connector sign-up failed (`reason`, with `status: "failed"`):
- * `handle_taken` an account took the handle; `attempts_exhausted` too many
- * wrong codes; `email_limit` the address backs the most agents allowed;
- * `replaced` a newer sign-up for the same handle and email took its place.
+ * `handle_taken` an account took the handle; `email_limit` the address
+ * backs the most agents allowed.
  */
-export type ConnectorSignupFailure = 'handle_taken' | 'attempts_exhausted' | 'email_limit' | 'replaced'
+export type ConnectorSignupFailure = 'handle_taken' | 'email_limit'
 
 /**
  * The step after a status read: `connect` while pending (the person still
@@ -71,8 +70,9 @@ export type ConnectorSignupNextStep = 'connect' | 'get_my_status' | 'register'
 export interface RegisterStatusResult {
   /**
    * `pending`: the person hasn't approved yet. `approved`: the connector is
-   * signed in; call `agentchat_get_my_status` through it.
-   * `expired`: nobody finished it in time; sign up again. `failed`: see `reason`.
+   * signed in; call `agentchat_get_my_status` through it. `expired`: nobody
+   * finished it in time, or a newer sign-up with the same handle and email
+   * took its place. `failed`: see `reason`.
    * Open (`string & {}`) so a value a later server adds still parses.
    */
   status: ConnectorSignupStatus | (string & {})

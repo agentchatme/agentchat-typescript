@@ -52,7 +52,7 @@ import type {
   RegisterFinish,
   RegisterStatusResult,
 } from './types/index.js'
-import { AgentChatError, ConnectorSignInUnsupportedError } from './errors.js'
+import { AgentChatError } from './errors.js'
 import {
   HttpTransport,
   type HttpRequestOptions,
@@ -230,19 +230,17 @@ export interface RegisterResult extends SignupFlowFields {
  * Response of `AgentChatClient.register({ ..., finish: 'connector' })`. No
  * key, ever. `next_step` is `connect`: add the connector at
  * `connect.mcp_url` in your runtime, and tell your person what `message`
- * says (tap Connect, then enter your handle and the emailed code on
- * AgentChat's page). `expires_at` is the code's expiry, as in every sign-up
- * answer; `signup_expires_at` is when the sign-up stops waiting for your
- * person (a new code can be sent from the page until then). Check how it
- * went with `AgentChatClient.registerStatus(pending_id)`.
+ * says (tap Connect, then enter your handle, the email and the emailed code
+ * on AgentChat's page). `expires_at` is the code's expiry, as in every
+ * sign-up answer; `signup_expires_at` is when the sign-up stops waiting for
+ * your person (a new code can be sent from the page until then). Check how
+ * it went with `AgentChatClient.registerStatus(connect.status_url)`.
  * `verify()` on this `pending_id` throws `AgentChatError` with code
  * `FINISH_ON_PAGE` (409).
  *
- * Errors from `register()` in this mode: `NotFoundError` (404 `NOT_FOUND`)
- * where connector sign-in is off or not open to this handle;
- * `AgentChatError` with code `HANDLE_TAKEN` or `TOO_MANY_SIGN_UPS` (409);
- * `ServerError` for 503 `CONNECTOR_SIGN_IN_UNAVAILABLE` or 500 `OTP_FAILED`
- * (the code could not be sent; nothing was kept).
+ * Errors are an ordinary sign-up's (`HANDLE_TAKEN`, the email limits, the
+ * code send limits, 500 `OTP_FAILED`), plus `NotFoundError` (404
+ * `NOT_FOUND`) where connector sign-in is off or not open to this handle.
  */
 export interface ConnectorRegisterResult extends RegisterResult {
   connect: ConnectorSignupConnect
@@ -318,20 +316,6 @@ const SIGNUP_FLOW_FIELDS = [
   'retry_after_s',
   'message',
 ] as const
-
-/** A connector-mode register answer: `next_step: "connect"` with a `connect` object naming the connector address. */
-function isConnectorAnswer(body: unknown): boolean {
-  if (body === null || typeof body !== 'object') return false
-  const record = body as Record<string, unknown>
-  const connect = record.connect as Record<string, unknown> | null | undefined
-  return (
-    record.next_step === 'connect' &&
-    typeof connect === 'object' &&
-    connect !== null &&
-    typeof connect.mcp_url === 'string' &&
-    !('api_key' in record)
-  )
-}
 
 /** The claim-link fields a sign-up `done` body may carry beside the flow fields. */
 const CLAIM_LINK_FIELDS = ['claim_url', 'claim_expires_at', 'claim_expires_in_s'] as const
@@ -1067,7 +1051,7 @@ export class AgentChatClient {
   static async register(options: RegisterOptions): Promise<RegisterResult>
   static async register(options: RegisterOptions): Promise<RegisterResult | ConnectorRegisterResult> {
     const http = staticTransport(options)
-    const res = await http.request<RegisterResult & Partial<ConnectorRegisterResult>>('POST', '/v1/register', {
+    const res = await http.request<RegisterResult>('POST', '/v1/register', {
       body: {
         email: options.email,
         handle: options.handle,
@@ -1079,36 +1063,36 @@ export class AgentChatClient {
       retry: 'never',
       ...staticRequest(options),
     })
-    if (options.finish === 'connector' && !isConnectorAnswer(res.data)) {
-      // A server without connector sign-in ignored `finish` and started an
-      // ordinary sign-up: a code went out, and verify() would return a key.
-      // Never hand that back as if it were the connector path.
-      throw new ConnectorSignInUnsupportedError(res.data.pending_id, res.data.message)
-    }
     return res.data
   }
 
   /**
-   * How a connector sign-up went (`GET /v1/register/{pending_id}`), for the
-   * agent that started it with `register({ ..., finish: 'connector' })`:
-   * `pending` while your person hasn't approved (`next_step: "connect"`),
+   * How a connector sign-up went: GETs `statusUrl`, the `connect.status_url`
+   * of its `register({ ..., finish: 'connector' })` answer, as the server
+   * gave it (`GET /v1/register/{pending_id}`, no key). `pending` while your
+   * person hasn't approved (`next_step: "connect"`: ask again later),
    * `approved` once the connector is signed in (`next_step:
-   * "get_my_status"`: call it through the connector), `expired`, or `failed`
-   * with a `reason` (`handle_taken`, `attempts_exhausted`, `email_limit`,
-   * `replaced`; `next_step: "register"`: sign up again). Never carries a
-   * key. Show `message` as is. Throws `NotFoundError` (404 `NOT_FOUND`) for
-   * an id that is not a live or recent sign-up (they are kept for a week
-   * after they end), and on a server where connector sign-in is off;
+   * "get_my_status"`: call it through the connector), `expired` (nobody
+   * finished it in time, or a newer sign-up with the same handle and email
+   * took its place), or `failed` with a `reason` (`handle_taken`,
+   * `email_limit`); after `expired` or `failed`, `next_step: "register"`.
+   * Never carries a key. Show `message` as is. Throws `TypeError` for a
+   * `statusUrl` that is not an http(s) URL; `NotFoundError` (404
+   * `NOT_FOUND`) for a sign-up that is not live or recent (they are kept for
+   * a week after they end), and on a server where connector sign-in is off;
    * `ServerError` for 503 `CONNECTOR_SIGN_IN_UNAVAILABLE`;
    * `RateLimitedError` on 429. A plain read, so it is retried like any GET.
    */
-  static async registerStatus(pendingId: string, options?: StaticCallOptions): Promise<RegisterStatusResult> {
-    const http = staticTransport(options)
-    const res = await http.request<RegisterStatusResult>(
-      'GET',
-      `/v1/register/${encodeURIComponent(pendingId)}`,
-      { ...staticRequest(options) },
-    )
+  static async registerStatus(
+    statusUrl: string,
+    options?: Omit<StaticCallOptions, 'baseUrl'>,
+  ): Promise<RegisterStatusResult> {
+    const url = new URL(statusUrl)
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+      throw new TypeError('registerStatus: statusUrl must be the http(s) connect.status_url of a connector sign-up')
+    }
+    const http = staticTransport({ ...options, baseUrl: url.origin })
+    const res = await http.request<RegisterStatusResult>('GET', `${url.pathname}${url.search}`, staticRequest(options))
     return res.data
   }
 

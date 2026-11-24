@@ -1,5 +1,5 @@
 import type { AgentClaim } from './claim.js'
-import type { AgentConnection } from './connection.js'
+import type { AgentConnection, RegisterFinish } from './connection.js'
 import type { WakeCheckStatus } from './wake-check.js'
 import type { WakeWebhookStatus } from './wake-webhook.js'
 
@@ -83,7 +83,7 @@ export interface RegisterRequest {
   display_name?: string
   description?: string
   /** `connector`: the sign-up finishes on AgentChat's page, approved by your person; no answer carries a key. */
-  finish?: 'connector'
+  finish?: RegisterFinish
 }
 
 export interface VerifyRequest {

@@ -10,7 +10,8 @@ import {
   submitCode,
   type SignupAction,
 } from '../src/integration/account.js'
-import { createAgentChatError, type AgentChatErrorResponse } from '../src/errors.js'
+import { AgentChatClient } from '../src/client.js'
+import { AgentChatError, createAgentChatError, type AgentChatErrorResponse } from '../src/errors.js'
 import type { SignupFlow } from '../src/types/index.js'
 
 // ─── signup-flow.cases.json (contract v1, "Sign-up flows") ──────────────────
@@ -81,6 +82,7 @@ describe('conformance — signup-flow.cases.json: the vocabulary', () => {
       'wait_then_retry',
       'stop',
       'legacy',
+      'connect',
     ]
     expect([...fixture.actions].sort()).toEqual([...sdkActions].sort())
     expect(fixture.wait_limit_s).toBe(MAX_WAIT_S)
@@ -150,30 +152,39 @@ const LEGACY_READING: Record<string, { action: string; flow: Record<string, unkn
   },
 }
 
-const stepCases = fixture.cases.filter((c) => STEP_KINDS[c.request.kind] !== undefined)
+/** A connector sign-up's own calls: `AgentChatClient.register({ finish })` and `registerStatus`, below. */
+const isConnectorCall = (c: SignupCase) => c.request.body.finish !== undefined || c.request.kind === 'register_status'
+const stepCases = fixture.cases.filter((c) => STEP_KINDS[c.request.kind] !== undefined && !isConnectorCall(c))
+const API = 'https://api.agentchat.test'
+
+/** A fetch that answers the case's response and records each request. */
+function answering(c: SignupCase) {
+  const seen: Array<{ method: string; path: string; body: unknown }> = []
+  const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+    seen.push({
+      method: init?.method ?? 'GET',
+      path: new URL(String(input)).pathname,
+      body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
+    })
+    return new Response(JSON.stringify(c.response.body), {
+      status: c.response.status,
+      headers: { 'content-type': 'application/json', ...c.response.headers },
+    })
+  }) as unknown as typeof fetch
+  return { seen, fetchImpl }
+}
 
 describe('conformance — signup-flow.cases.json: start / submitCode', () => {
   it('drives every register and recover case (rotate key is the client’s rotateKey)', () => {
     expect(stepCases.length).toBeGreaterThan(0)
-    const rest = fixture.cases.filter((c) => STEP_KINDS[c.request.kind] === undefined)
+    const rest = fixture.cases.filter((c) => !stepCases.includes(c) && !isConnectorCall(c))
     for (const c of rest) expect(c.request.kind, c.name).toMatch(/^rotate_key/)
   })
 
   it.each(stepCases.map((c) => [c.name, c] as const))('%s', async (_name, c) => {
     const { kind, step } = STEP_KINDS[c.request.kind]!
-    const seen: Array<{ method: string; path: string; body: unknown }> = []
-    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      seen.push({
-        method: init?.method ?? 'GET',
-        path: new URL(String(input)).pathname,
-        body: typeof init?.body === 'string' ? JSON.parse(init.body) : undefined,
-      })
-      return new Response(JSON.stringify(c.response.body), {
-        status: c.response.status,
-        headers: { 'content-type': 'application/json', ...c.response.headers },
-      })
-    }) as unknown as typeof fetch
-    const options = { clientIdentity: { name: 'typescript_sdk' as const }, apiBase: 'https://api.agentchat.test', fetch: fetchImpl }
+    const { seen, fetchImpl } = answering(c)
+    const options = { clientIdentity: { name: 'typescript_sdk' as const }, apiBase: API, fetch: fetchImpl }
 
     const body = c.request.body
     if (step === 'verify' && typeof body.pending_id !== 'string') {
@@ -220,5 +231,32 @@ describe('conformance — signup-flow.cases.json: start / submitCode', () => {
       expect(result.apiKey).toBeUndefined()
     }
     if (result.action === 'ask_code') expect(result.flow.pending_id).toBe(c.request.body.pending_id ?? c.expect.flow?.pending_id)
+  })
+})
+
+describe('conformance — signup-flow.cases.json: connector sign-up', () => {
+  const connectorCases = fixture.cases.filter(isConnectorCall)
+
+  it.each(connectorCases.map((c) => [c.name, c] as const))('%s', async (_name, c) => {
+    const { seen, fetchImpl } = answering(c)
+    const outcome = await (c.request.kind === 'register_status'
+      ? AgentChatClient.registerStatus(`${API}${c.request.path}`, { fetch: fetchImpl })
+      : AgentChatClient.register({
+          ...(c.request.body as { email: string; handle: string; finish: 'connector' }),
+          baseUrl: API,
+          fetch: fetchImpl,
+        })
+    ).catch((e: unknown) => e)
+
+    // The request is the fixture's: one call, the status read with no body.
+    const body = c.request.method === 'GET' ? undefined : c.request.body
+    expect(seen).toEqual([{ method: c.request.method, path: c.request.path, body }])
+    if (isError(c)) {
+      expect(outcome).toBeInstanceOf(AgentChatError)
+      expect((outcome as AgentChatError).code).toBe(c.expect.code)
+      expect((outcome as AgentChatError).message).toBe(c.expect.message)
+    } else {
+      expect(outcome).toEqual(c.response.body)
+    }
   })
 })

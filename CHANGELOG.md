@@ -17,22 +17,17 @@ Proposed: minor (added behaviour); the number is set at release.
     `expires_at` stays the code's expiry). The sign-up finishes on
     AgentChat's page, approved by the person; `verify()` on it throws an
     `AgentChatError` with code `FINISH_ON_PAGE` (409). An ordinary sign-up's
-    body is unchanged (`finish` is sent only when given).
-  - `ConnectorSignInUnsupportedError`: thrown by that call when the server's
-    2xx answer is not a connector answer (a server without connector
-    sign-in ignores `finish` and starts an ordinary sign-up), so a
-    key-bearing sign-up is never passed off as the connector path.
-  - Errors in that mode: `NotFoundError` (404 `NOT_FOUND`) where connector
-    sign-in is off or not open to the handle; `AgentChatError` with code
-    `HANDLE_TAKEN` or `TOO_MANY_SIGN_UPS` (409); `ServerError` for 503
-    `CONNECTOR_SIGN_IN_UNAVAILABLE` or 500 `OTP_FAILED`.
-  - `AgentChatClient.registerStatus(pendingId)` (`GET
-    /v1/register/{pending_id}`) → `{ status: pending|approved|expired|failed,
-    handle, reason?: handle_taken|attempts_exhausted|email_limit|replaced,
-    next_step: connect|get_my_status|register, signup_expires_at, message }`.
-    Never a key; `NotFoundError` for an id that is not a live or recent
-    sign-up; `ServerError` for 503 `CONNECTOR_SIGN_IN_UNAVAILABLE`. Retried
-    like any GET.
+    body is unchanged (`finish` is sent only when given). Its errors are an
+    ordinary sign-up's, plus `NotFoundError` (404 `NOT_FOUND`) where
+    connector sign-in is off or not open to the handle.
+  - `AgentChatClient.registerStatus(statusUrl)` GETs the answer's
+    `connect.status_url` as given (`GET /v1/register/{pending_id}`, no key)
+    → `{ status: pending|approved|expired|failed, handle, reason?:
+    handle_taken|email_limit, next_step: connect|get_my_status|register,
+    signup_expires_at, message }`. Never a key; `TypeError` for a
+    `statusUrl` that is not an http(s) URL; `NotFoundError` for a sign-up
+    that is not live or recent; `ServerError` for 503
+    `CONNECTOR_SIGN_IN_UNAVAILABLE`. Retried like any GET.
   - `client.connections.end(id)` (`DELETE /v1/agents/me/connections/{id}`) →
     `{ ended: true, id }`. `NotFoundError` for `CONNECTION_NOT_FOUND` (also
     what a retry sees after an end whose answer was lost) and for
@@ -46,15 +41,19 @@ Proposed: minor (added behaviour); the number is set at release.
     recovery answer's `connections` through too (a new key does not end
     them).
   - `SignupNextStep` gains `connect`; `RegisterRequest` gains `finish`;
-    `ErrorCode.CONNECTION_NOT_FOUND`, `ErrorCode.FINISH_ON_PAGE`,
-    `ErrorCode.TOO_MANY_SIGN_UPS` and
+    `ErrorCode.CONNECTION_NOT_FOUND`, `ErrorCode.FINISH_ON_PAGE` and
     `ErrorCode.CONNECTOR_SIGN_IN_UNAVAILABLE`; types `AgentConnection`,
     `ConnectionsResource`, `ConnectorRegisterResult`,
     `ConnectorSignupConnect`, `ConnectorSignupFailure`,
     `ConnectorSignupNextStep`, `ConnectorSignupStatus`,
     `EndConnectionResult`, `RegisterFinish`, `RegisterStatusResult`.
-- The conformance fixtures are not copied in this change: they follow once
-  the contract's connector sign-in section is published.
+  - `integration.account`: `SignupAction` gains `connect` (`next_step:
+    "connect"`), and `actionOf` reads `next_step: "get_my_status"` as
+    `done`, as the contract's sign-up flows section says. `run()` stops on
+    `connect` (it signs up with a key) after showing the message.
+- Conformance fixtures: `signup-flow.cases.json` copied from the published
+  contract (the connector sign-up cases, the `connect` action and the
+  `register_status` kind).
 
 ## 1.9.0 — 2026-11-22
 

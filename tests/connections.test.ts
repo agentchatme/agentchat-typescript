@@ -2,7 +2,6 @@ import { describe, expect, it, vi } from 'vitest'
 import { AgentChatClient } from '../src/client.js'
 import {
   AgentChatError,
-  ConnectorSignInUnsupportedError,
   NotFoundError,
   RateLimitedError,
   ServerError,
@@ -43,25 +42,6 @@ const fastRetry = { maxRetries: 2, baseDelayMs: 1, maxDelayMs: 2 }
 
 const BASE = 'https://api.agentchat.me'
 
-// The shape the server answers in connector mode (placeholders, not real ids).
-const connectorAnswer = {
-  pending_id: 'pnd_example',
-  message:
-    'We sent a 6-digit code to agent@example.com. Add the connector at https://api.agentchat.me/mcp/connector; when your person taps Connect, they enter @my-agent and the code on AgentChat\'s page.',
-  version: 1,
-  flow: 'register',
-  next_step: 'connect',
-  status: 'pending',
-  expires_at: '2026-11-24T10:10:00.000Z',
-  expires_in_s: 600,
-  code_length: 6,
-  connect: {
-    mcp_url: 'https://api.agentchat.me/mcp/connector',
-    status_url: 'https://api.agentchat.me/v1/register/pnd_example',
-  },
-  signup_expires_at: '2026-11-25T10:00:00.000Z',
-}
-
 const ordinaryAnswer = {
   pending_id: 'pnd_example',
   message: 'We sent a 6-digit code to agent@example.com. It expires in 10 minutes.',
@@ -71,57 +51,17 @@ const ordinaryAnswer = {
   status: 'pending',
 }
 
+// The connector answers themselves, and the 404 where it is off, are the
+// contract fixture's cases (conformance-signup-flow.test.ts).
 describe('AgentChatClient.register with finish: "connector"', () => {
-  it('sends finish and returns the connector answer as is, with no key', async () => {
-    const { fetch, calls } = capture([() => json(201, connectorAnswer)])
-    const res = await AgentChatClient.register({
-      email: 'agent@example.com',
-      handle: 'my-agent',
-      finish: 'connector',
-      fetch,
-    })
-    expect(calls).toHaveLength(1)
-    expect(calls[0]).toMatchObject({ method: 'POST', url: `${BASE}/v1/register` })
-    expect(calls[0]!.body).toEqual({ email: 'agent@example.com', handle: 'my-agent', finish: 'connector' })
-    expect(res.next_step).toBe('connect')
-    expect(res.connect.mcp_url).toBe('https://api.agentchat.me/mcp/connector')
-    expect(res.connect.status_url).toBe('https://api.agentchat.me/v1/register/pnd_example')
-    expect(res.signup_expires_at).toBe('2026-11-25T10:00:00.000Z')
-    expect(res.expires_at).toBe('2026-11-24T10:10:00.000Z')
-    expect(res).not.toHaveProperty('api_key')
-  })
-
   it('leaves finish out of an ordinary sign-up body', async () => {
     const { fetch, calls } = capture([() => json(201, ordinaryAnswer)])
     await AgentChatClient.register({ email: 'agent@example.com', handle: 'my-agent', fetch })
     expect(calls[0]!.body).toEqual({ email: 'agent@example.com', handle: 'my-agent' })
-    expect(calls[0]!.body).not.toHaveProperty('finish')
-  })
-
-  it('refuses an ordinary answer to a connector sign-up instead of passing it off as one', async () => {
-    const { fetch } = capture([() => json(201, ordinaryAnswer)])
-    const err = await AgentChatClient.register({
-      email: 'agent@example.com',
-      handle: 'my-agent',
-      finish: 'connector',
-      fetch,
-    }).catch((e: unknown) => e)
-    expect(err).toBeInstanceOf(ConnectorSignInUnsupportedError)
-    expect((err as ConnectorSignInUnsupportedError).pendingId).toBe('pnd_example')
-    expect((err as ConnectorSignInUnsupportedError).serverMessage).toBe(ordinaryAnswer.message)
-  })
-
-  it('refuses a connector answer that carries a key', async () => {
-    const { fetch } = capture([() => json(201, { ...connectorAnswer, api_key: 'ac_not_a_real_key' })])
-    await expect(
-      AgentChatClient.register({ email: 'agent@example.com', handle: 'my-agent', finish: 'connector', fetch }),
-    ).rejects.toBeInstanceOf(ConnectorSignInUnsupportedError)
   })
 
   it.each([
     [409, 'HANDLE_TAKEN', AgentChatError],
-    [409, 'TOO_MANY_SIGN_UPS', AgentChatError],
-    [503, 'CONNECTOR_SIGN_IN_UNAVAILABLE', ServerError],
     [500, 'OTP_FAILED', ServerError],
   ] as const)('a %i %s from a connector sign-up is one attempt, with its code', async (status, code, cls) => {
     const { fetch, calls } = capture([() => json(status, { code, message: 'x', details: { param: 'handle' } })])
@@ -135,81 +75,47 @@ describe('AgentChatClient.register with finish: "connector"', () => {
     expect((err as AgentChatError).code).toBe(code)
     expect(calls).toHaveLength(1)
   })
-
-  it('surfaces the server 404 of a server where connector sign-in is off', async () => {
-    const { fetch } = capture([
-      () => json(404, { code: 'NOT_FOUND', message: 'Connector sign-in is not available on this server.' }),
-    ])
-    await expect(
-      AgentChatClient.register({ email: 'agent@example.com', handle: 'my-agent', finish: 'connector', fetch }),
-    ).rejects.toBeInstanceOf(NotFoundError)
-  })
-
-  it('verify() on a connector sign-up surfaces FINISH_ON_PAGE as a plain AgentChatError', async () => {
-    const { fetch } = capture([
-      () =>
-        json(409, {
-          code: 'FINISH_ON_PAGE',
-          message: "This sign-up finishes on AgentChat's page when your person approves the connector.",
-          details: { version: 1, flow: 'register', next_step: 'connect' },
-        }),
-    ])
-    const err = await AgentChatClient.verify('pnd_example', '123456', { fetch }).catch((e: unknown) => e)
-    expect(err).toBeInstanceOf(AgentChatError)
-    expect((err as AgentChatError).code).toBe('FINISH_ON_PAGE')
-    expect((err as AgentChatError).status).toBe(409)
-    expect(sdk.ErrorCode.FINISH_ON_PAGE).toBe('FINISH_ON_PAGE')
-  })
 })
 
 describe('AgentChatClient.registerStatus', () => {
+  const STATUS_URL = 'https://status.agentchat.test/v1/register/pnd_example'
   const approved: RegisterStatusResult = {
     status: 'approved',
     handle: 'my-agent',
     next_step: 'get_my_status',
     signup_expires_at: '2026-11-25T10:00:00.000Z',
-    message: 'Your person approved the connector. Call agentchat_get_my_status through it.',
+    message: 'Done: your connector is signed in as @my-agent.',
   }
 
-  it('GETs /v1/register/{pending_id} with the id encoded and returns the answer', async () => {
+  it('GETs connect.status_url as the server gave it, with no key', async () => {
     const { fetch, calls } = capture([() => json(200, approved)])
-    await expect(AgentChatClient.registerStatus('pnd_a/b', { fetch })).resolves.toEqual(approved)
-    expect(calls[0]).toMatchObject({ method: 'GET', url: `${BASE}/v1/register/pnd_a%2Fb` })
+    await expect(AgentChatClient.registerStatus(STATUS_URL, { fetch })).resolves.toEqual(approved)
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ method: 'GET', url: STATUS_URL })
     expect(calls[0]!.headers.authorization).toBeUndefined()
   })
 
-  it.each(['handle_taken', 'attempts_exhausted', 'email_limit', 'replaced'] as const)(
-    'passes the failure reason %s through, with next_step register',
-    async (reason) => {
-      const failed: RegisterStatusResult = {
-        status: 'failed',
-        handle: 'my-agent',
-        reason,
-        next_step: 'register',
-        signup_expires_at: '2026-11-25T10:00:00.000Z',
-        message: 'x',
-      }
-      const { fetch } = capture([() => json(200, failed)])
-      const res = await AgentChatClient.registerStatus('pnd_example', { fetch })
-      expect(res.status).toBe('failed')
-      expect(res.reason).toBe(reason)
-      expect(res.next_step).toBe('register')
+  it.each(['pnd_example', '/v1/register/pnd_example', 'ftp://api.agentchat.test/v1/register/pnd_example'])(
+    'refuses %s, which is not an http(s) status_url, before sending anything',
+    async (statusUrl) => {
+      const { fetch, calls } = capture([() => json(200, approved)])
+      await expect(AgentChatClient.registerStatus(statusUrl, { fetch })).rejects.toBeInstanceOf(TypeError)
+      expect(calls).toHaveLength(0)
     },
   )
 
   it('maps CONNECTOR_SIGN_IN_UNAVAILABLE (503) to ServerError after its retries', async () => {
-    const { fetch, calls } = capture([
+    const { fetch } = capture([
       () => json(503, { code: 'CONNECTOR_SIGN_IN_UNAVAILABLE', message: 'Connector sign-in is not available right now.' }),
     ])
-    const err = await AgentChatClient.registerStatus('pnd_example', { fetch }).catch((e: unknown) => e)
+    const err = await AgentChatClient.registerStatus(STATUS_URL, { fetch }).catch((e: unknown) => e)
     expect(err).toBeInstanceOf(ServerError)
     expect((err as ServerError).code).toBe('CONNECTOR_SIGN_IN_UNAVAILABLE')
-    expect(calls.length).toBeGreaterThanOrEqual(1)
   })
 
-  it('throws NotFoundError for an unknown pending id', async () => {
-    const { fetch } = capture([() => json(404, { code: 'NOT_FOUND', message: 'No such sign-up.' })])
-    await expect(AgentChatClient.registerStatus('pnd_unknown', { fetch })).rejects.toBeInstanceOf(NotFoundError)
+  it('throws NotFoundError for a sign-up that is not live or recent', async () => {
+    const { fetch } = capture([() => json(404, { code: 'NOT_FOUND', message: 'No connector sign-up has this id.' })])
+    await expect(AgentChatClient.registerStatus(STATUS_URL, { fetch })).rejects.toBeInstanceOf(NotFoundError)
   })
 })
 

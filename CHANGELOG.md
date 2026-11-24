@@ -2,9 +2,9 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
-## Unreleased
+## 1.10.0 — 2026-11-24
 
-Proposed: minor (added behaviour); the number is set at release.
+Minor release (added behaviour → minor +1, per VERSIONING.md): connector sign-in is new surface.
 
 ### Added
 

@@ -5,6 +5,7 @@ import {
   ConnectorSignInUnsupportedError,
   NotFoundError,
   RateLimitedError,
+  ServerError,
 } from '../src/errors.js'
 import * as sdk from '../src/index.js'
 import type { Agent, EndConnectionResult, RegisterStatusResult } from '../src/types/index.js'
@@ -117,6 +118,24 @@ describe('AgentChatClient.register with finish: "connector"', () => {
     ).rejects.toBeInstanceOf(ConnectorSignInUnsupportedError)
   })
 
+  it.each([
+    [409, 'HANDLE_TAKEN', AgentChatError],
+    [409, 'TOO_MANY_SIGN_UPS', AgentChatError],
+    [503, 'CONNECTOR_SIGN_IN_UNAVAILABLE', ServerError],
+    [500, 'OTP_FAILED', ServerError],
+  ] as const)('a %i %s from a connector sign-up is one attempt, with its code', async (status, code, cls) => {
+    const { fetch, calls } = capture([() => json(status, { code, message: 'x', details: { param: 'handle' } })])
+    const err = await AgentChatClient.register({
+      email: 'agent@example.com',
+      handle: 'my-agent',
+      finish: 'connector',
+      fetch,
+    }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(cls)
+    expect((err as AgentChatError).code).toBe(code)
+    expect(calls).toHaveLength(1)
+  })
+
   it('surfaces the server 404 of a server where connector sign-in is off', async () => {
     const { fetch } = capture([
       () => json(404, { code: 'NOT_FOUND', message: 'Connector sign-in is not available on this server.' }),
@@ -147,7 +166,8 @@ describe('AgentChatClient.registerStatus', () => {
   const approved: RegisterStatusResult = {
     status: 'approved',
     handle: 'my-agent',
-    next_step: 'done',
+    next_step: 'get_my_status',
+    signup_expires_at: '2026-11-25T10:00:00.000Z',
     message: 'Your person approved the connector. Call agentchat_get_my_status through it.',
   }
 
@@ -158,12 +178,33 @@ describe('AgentChatClient.registerStatus', () => {
     expect(calls[0]!.headers.authorization).toBeUndefined()
   })
 
-  it('passes a failure reason through', async () => {
-    const failed = { status: 'failed', handle: 'my-agent', reason: 'handle_taken', next_step: 'register', message: 'x' }
-    const { fetch } = capture([() => json(200, failed)])
-    const res = await AgentChatClient.registerStatus('pnd_example', { fetch })
-    expect(res.status).toBe('failed')
-    expect(res.reason).toBe('handle_taken')
+  it.each(['handle_taken', 'attempts_exhausted', 'email_limit', 'replaced'] as const)(
+    'passes the failure reason %s through, with next_step register',
+    async (reason) => {
+      const failed: RegisterStatusResult = {
+        status: 'failed',
+        handle: 'my-agent',
+        reason,
+        next_step: 'register',
+        signup_expires_at: '2026-11-25T10:00:00.000Z',
+        message: 'x',
+      }
+      const { fetch } = capture([() => json(200, failed)])
+      const res = await AgentChatClient.registerStatus('pnd_example', { fetch })
+      expect(res.status).toBe('failed')
+      expect(res.reason).toBe(reason)
+      expect(res.next_step).toBe('register')
+    },
+  )
+
+  it('maps CONNECTOR_SIGN_IN_UNAVAILABLE (503) to ServerError after its retries', async () => {
+    const { fetch, calls } = capture([
+      () => json(503, { code: 'CONNECTOR_SIGN_IN_UNAVAILABLE', message: 'Connector sign-in is not available right now.' }),
+    ])
+    const err = await AgentChatClient.registerStatus('pnd_example', { fetch }).catch((e: unknown) => e)
+    expect(err).toBeInstanceOf(ServerError)
+    expect((err as ServerError).code).toBe('CONNECTOR_SIGN_IN_UNAVAILABLE')
+    expect(calls.length).toBeGreaterThanOrEqual(1)
   })
 
   it('throws NotFoundError for an unknown pending id', async () => {
@@ -173,14 +214,14 @@ describe('AgentChatClient.registerStatus', () => {
 })
 
 describe('client.connections.end', () => {
-  const ended: EndConnectionResult = { ended: true, id: 'con_example' }
+  const ended: EndConnectionResult = { ended: true, id: '4f6c2a8e-1b3d-4c5e-9f7a-2b8d6e0c1a34' }
 
   it('DELETEs /v1/agents/me/connections/{id} with the key and returns the answer', async () => {
     const { fetch, calls } = capture([() => json(200, ended)])
     const client = new AgentChatClient({ apiKey: 'k', fetch })
-    await expect(client.connections.end('con_example')).resolves.toEqual(ended)
+    await expect(client.connections.end('4f6c2a8e-1b3d-4c5e-9f7a-2b8d6e0c1a34')).resolves.toEqual(ended)
     expect(calls).toHaveLength(1)
-    expect(calls[0]).toMatchObject({ method: 'DELETE', url: `${BASE}/v1/agents/me/connections/con_example` })
+    expect(calls[0]).toMatchObject({ method: 'DELETE', url: `${BASE}/v1/agents/me/connections/4f6c2a8e-1b3d-4c5e-9f7a-2b8d6e0c1a34` })
     expect(calls[0]!.headers.authorization).toBe('Bearer k')
   })
 
@@ -213,7 +254,7 @@ describe('client.connections.end', () => {
   it('is arrow-bound like the other resources', async () => {
     const { fetch } = capture([() => json(200, ended)])
     const { end } = new AgentChatClient({ apiKey: 'k', fetch, retry: fastRetry }).connections
-    await expect(end('con_example')).resolves.toEqual(ended)
+    await expect(end('4f6c2a8e-1b3d-4c5e-9f7a-2b8d6e0c1a34')).resolves.toEqual(ended)
   })
 })
 
@@ -221,12 +262,20 @@ describe('connections in your own status', () => {
   it('reads connections from getMe() as sent, and tolerates their absence', async () => {
     const connections = [
       {
-        id: 'con_example',
+        id: '4f6c2a8e-1b3d-4c5e-9f7a-2b8d6e0c1a34',
         client_name: 'Example runtime',
         redirect_host: 'runtime.example.com',
         created_at: '2026-11-24T10:00:00.000Z',
         last_used_at: null,
         current: true,
+      },
+      {
+        id: '0a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d',
+        client_name: null,
+        redirect_host: 'other.example.com',
+        created_at: '2026-11-24T11:00:00.000Z',
+        last_used_at: '2026-11-24T11:05:00.000Z',
+        current: false,
       },
     ]
     const base = {
@@ -248,5 +297,40 @@ describe('connections in your own status', () => {
     expect(me.connections).toEqual(connections)
     const older: Agent = await client.getMe()
     expect(older.connections).toBeUndefined()
+  })
+})
+
+describe('connections in the recovery answer', () => {
+  const recovered = {
+    handle: 'my-agent',
+    api_key: 'ac_not_a_real_key',
+    version: 1,
+    flow: 'recover',
+    next_step: 'done',
+    status: 'approved',
+    message: 'Your new key works now. 1 runtime is still signed in as you.',
+  }
+  const connections = [
+    {
+      id: '4f6c2a8e-1b3d-4c5e-9f7a-2b8d6e0c1a34',
+      client_name: 'Example runtime',
+      redirect_host: 'runtime.example.com',
+      created_at: '2026-11-24T10:00:00.000Z',
+      last_used_at: null,
+      current: false,
+    },
+  ]
+
+  it('passes connections through recoverVerify()', async () => {
+    const { fetch } = capture([() => json(200, { ...recovered, connections })])
+    const res = await AgentChatClient.recoverVerify('pnd_example', '123456', { fetch })
+    expect(res.connections).toEqual(connections)
+    expect(res.handle).toBe('my-agent')
+  })
+
+  it('leaves connections out when the server sends none', async () => {
+    const { fetch } = capture([() => json(200, recovered)])
+    const res = await AgentChatClient.recoverVerify('pnd_example', '123456', { fetch })
+    expect(res).not.toHaveProperty('connections')
   })
 })

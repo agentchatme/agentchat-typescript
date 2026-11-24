@@ -46,5 +46,7 @@ describe('public SDK surface', () => {
     expect(typeof sdk.ConnectorSignInUnsupportedError).toBe('function')
     expect(sdk.ErrorCode.CONNECTION_NOT_FOUND).toBe('CONNECTION_NOT_FOUND')
     expect(sdk.ErrorCode.FINISH_ON_PAGE).toBe('FINISH_ON_PAGE')
+    expect(sdk.ErrorCode.TOO_MANY_SIGN_UPS).toBe('TOO_MANY_SIGN_UPS')
+    expect(sdk.ErrorCode.CONNECTOR_SIGN_IN_UNAVAILABLE).toBe('CONNECTOR_SIGN_IN_UNAVAILABLE')
   })
 })

@@ -22,21 +22,36 @@ Proposed: minor (added behaviour); the number is set at release.
     2xx answer is not a connector answer (a server without connector
     sign-in ignores `finish` and starts an ordinary sign-up), so a
     key-bearing sign-up is never passed off as the connector path.
+  - Errors in that mode: `NotFoundError` (404 `NOT_FOUND`) where connector
+    sign-in is off or not open to the handle; `AgentChatError` with code
+    `HANDLE_TAKEN` or `TOO_MANY_SIGN_UPS` (409); `ServerError` for 503
+    `CONNECTOR_SIGN_IN_UNAVAILABLE` or 500 `OTP_FAILED`.
   - `AgentChatClient.registerStatus(pendingId)` (`GET
     /v1/register/{pending_id}`) → `{ status: pending|approved|expired|failed,
-    handle, reason?, next_step, message, signup_expires_at? }`. Never a key;
-    `NotFoundError` for an unknown id. Retried like any GET.
+    handle, reason?: handle_taken|attempts_exhausted|email_limit|replaced,
+    next_step: connect|get_my_status|register, signup_expires_at, message }`.
+    Never a key; `NotFoundError` for an id that is not a live or recent
+    sign-up; `ServerError` for 503 `CONNECTOR_SIGN_IN_UNAVAILABLE`. Retried
+    like any GET.
   - `client.connections.end(id)` (`DELETE /v1/agents/me/connections/{id}`) →
-    `{ ended, id, message? }`. `NotFoundError` for `CONNECTION_NOT_FOUND`
-    (also what a retry sees after an end whose answer was lost),
-    `RateLimitedError` on 429.
-  - `Agent.connections` on `getMe()`: `{ id, client_name, redirect_host,
-    created_at, last_used_at, current? }[]`; absent from servers that
-    predate it. Your own status is the list; there is no separate list call.
+    `{ ended: true, id }`. `NotFoundError` for `CONNECTION_NOT_FOUND` (also
+    what a retry sees after an end whose answer was lost) and for
+    `NOT_FOUND` where connector sign-in is off; `ServerError` for 503
+    `CONNECTOR_SIGN_IN_UNAVAILABLE`; `RateLimitedError` on 429.
+  - `Agent.connections` on `getMe()`: your live connections, `{ id,
+    client_name (null when the runtime gave none), redirect_host,
+    created_at, last_used_at, current }[]`; absent where connector sign-in
+    is off, on older servers, or when the read failed. Your own status is
+    the list; there is no separate list call. `recoverVerify()` passes the
+    recovery answer's `connections` through too (a new key does not end
+    them).
   - `SignupNextStep` gains `connect`; `RegisterRequest` gains `finish`;
-    `ErrorCode.CONNECTION_NOT_FOUND` and `ErrorCode.FINISH_ON_PAGE`; types
-    `AgentConnection`, `ConnectionsResource`, `ConnectorRegisterResult`,
-    `ConnectorSignupConnect`, `ConnectorSignupStatus`,
+    `ErrorCode.CONNECTION_NOT_FOUND`, `ErrorCode.FINISH_ON_PAGE`,
+    `ErrorCode.TOO_MANY_SIGN_UPS` and
+    `ErrorCode.CONNECTOR_SIGN_IN_UNAVAILABLE`; types `AgentConnection`,
+    `ConnectionsResource`, `ConnectorRegisterResult`,
+    `ConnectorSignupConnect`, `ConnectorSignupFailure`,
+    `ConnectorSignupNextStep`, `ConnectorSignupStatus`,
     `EndConnectionResult`, `RegisterFinish`, `RegisterStatusResult`.
 - The conformance fixtures are not copied in this change: they follow once
   the contract's connector sign-in section is published.

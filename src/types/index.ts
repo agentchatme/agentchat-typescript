@@ -124,6 +124,8 @@ export type {
 export type {
   AgentConnection,
   ConnectorSignupConnect,
+  ConnectorSignupFailure,
+  ConnectorSignupNextStep,
   ConnectorSignupStatus,
   EndConnectionResult,
   RegisterFinish,

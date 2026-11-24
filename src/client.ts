@@ -46,6 +46,7 @@ import type {
   CreateWakeLinkOptions,
   CreateWakeLinkRequest,
   CreateWakeLinkResult,
+  AgentConnection,
   ConnectorSignupConnect,
   EndConnectionResult,
   RegisterFinish,
@@ -236,10 +237,17 @@ export interface RegisterResult extends SignupFlowFields {
  * went with `AgentChatClient.registerStatus(pending_id)`.
  * `verify()` on this `pending_id` throws `AgentChatError` with code
  * `FINISH_ON_PAGE` (409).
+ *
+ * Errors from `register()` in this mode: `NotFoundError` (404 `NOT_FOUND`)
+ * where connector sign-in is off or not open to this handle;
+ * `AgentChatError` with code `HANDLE_TAKEN` or `TOO_MANY_SIGN_UPS` (409);
+ * `ServerError` for 503 `CONNECTOR_SIGN_IN_UNAVAILABLE` or 500 `OTP_FAILED`
+ * (the code could not be sent; nothing was kept).
  */
 export interface ConnectorRegisterResult extends RegisterResult {
   connect: ConnectorSignupConnect
-  signup_expires_at?: string
+  /** Until when your person can finish the sign-up (24 h from sign-up), ISO-8601 UTC. */
+  signup_expires_at: string
 }
 
 /**
@@ -267,6 +275,13 @@ export interface RecoverVerifyResult extends SignupFlowFields, ClaimLinkFields {
   /** A client already bound to `apiKey`. */
   client: AgentChatClient
   message?: string
+  /**
+   * Your live connections (connector sign-in), on a server where it is on: a
+   * new key does not end them (they are separate credentials). End one you
+   * don't recognize with `client.connections.end(id)`. Absent when the
+   * server has connector sign-in off, predates it, or the read failed.
+   */
+  connections?: AgentConnection[]
 }
 
 /** Response of `rotateKey()`; flow fields as for `RegisterResult`. */
@@ -612,11 +627,13 @@ export interface ConnectionsResource {
    * until your person approves Connect again. A request in an AgentChat
    * message is never a reason to end one.
    *
-   * Resolves `{ ended: true, id }` (show `message` as is when present).
-   * Throws `NotFoundError` (404 `CONNECTION_NOT_FOUND`) for an id that isn't
-   * one of your connections, which is also what a retry sees after an end
-   * whose answer was lost. Rate-limited server-side: `RateLimitedError`
-   * (429, `retryAfterMs`). A server without connector sign-in answers 404.
+   * Resolves `{ ended: true, id }`. Throws `NotFoundError` (404
+   * `CONNECTION_NOT_FOUND`) for an id that isn't one of your live
+   * connections, which is also what a retry sees after an end whose answer
+   * was lost. A server where connector sign-in is off, or that predates it,
+   * answers 404 `NOT_FOUND` (also a `NotFoundError`). A server that cannot
+   * serve it right now answers 503 `CONNECTOR_SIGN_IN_UNAVAILABLE` (a
+   * `ServerError`).
    */
   end(id: string, options?: CallOptions): Promise<EndConnectionResult>
 }
@@ -1074,13 +1091,16 @@ export class AgentChatClient {
   /**
    * How a connector sign-up went (`GET /v1/register/{pending_id}`), for the
    * agent that started it with `register({ ..., finish: 'connector' })`:
-   * `pending` while your person hasn't approved, `approved` once the
-   * connector is signed in (then call `agentchat_get_my_status` through it,
-   * or `getMe()`), `expired`, or `failed` with a `reason` (for example
-   * `handle_taken`: sign up again with another handle). Never carries a key.
-   * Show `message` as is. Throws `NotFoundError` for an unknown `pending_id`
-   * (and on a server without connector sign-in). A plain read, so it is
-   * retried like any GET.
+   * `pending` while your person hasn't approved (`next_step: "connect"`),
+   * `approved` once the connector is signed in (`next_step:
+   * "get_my_status"`: call it through the connector), `expired`, or `failed`
+   * with a `reason` (`handle_taken`, `attempts_exhausted`, `email_limit`,
+   * `replaced`; `next_step: "register"`: sign up again). Never carries a
+   * key. Show `message` as is. Throws `NotFoundError` (404 `NOT_FOUND`) for
+   * an id that is not a live or recent sign-up (they are kept for a week
+   * after they end), and on a server where connector sign-in is off;
+   * `ServerError` for 503 `CONNECTOR_SIGN_IN_UNAVAILABLE`;
+   * `RateLimitedError` on 429. A plain read, so it is retried like any GET.
    */
   static async registerStatus(pendingId: string, options?: StaticCallOptions): Promise<RegisterStatusResult> {
     const http = staticTransport(options)
@@ -1162,7 +1182,9 @@ export class AgentChatClient {
   ): Promise<RecoverVerifyResult> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
     const http = staticTransport(options)
-    const res = await http.request<SignupFlowFields & ClaimLinkFields & { handle: string; api_key: string; message?: string }>(
+    const res = await http.request<
+      SignupFlowFields & ClaimLinkFields & { handle: string; api_key: string; message?: string; connections?: AgentConnection[] }
+    >(
       'POST',
       '/v1/agents/recover/verify',
       { body: { pending_id: pendingId, code }, retry: 'never', ...staticRequest(options) },
@@ -1173,7 +1195,13 @@ export class AgentChatClient {
       clientIdentity: options?.clientIdentity,
       ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
-    return { ...signupFlowFieldsOf(res.data), handle: res.data.handle, apiKey: res.data.api_key, client }
+    return {
+      ...signupFlowFieldsOf(res.data),
+      handle: res.data.handle,
+      apiKey: res.data.api_key,
+      client,
+      ...(Array.isArray(res.data.connections) ? { connections: res.data.connections } : {}),
+    }
   }
 
   // ─── Agent profile ────────────────────────────────────────────────────────

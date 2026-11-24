@@ -13,24 +13,29 @@
 export interface AgentConnection {
   /** The connection's id, for `client.connections.end(id)`. */
   id: string
-  /** The name the runtime gave itself when it registered. Self-declared: not proof of who it is. */
-  client_name: string
+  /**
+   * The name the runtime gave itself when it registered. Self-declared: not
+   * proof of who it is. `null` when it gave none.
+   */
+  client_name: string | null
   /** Where the sign-in went back to (the runtime's redirect host). This one is real. */
   redirect_host: string
   /** When the person approved it, ISO-8601 UTC. */
   created_at: string
   /** When the runtime last used it, ISO-8601 UTC; null before the first use. */
   last_used_at: string | null
-  /** True for the connection this request came through. Absent on servers that don't mark it. */
-  current?: boolean
+  /**
+   * True for the connection this request came through (a hosted-tools call
+   * made for that runtime); false for every entry on a keyed request.
+   */
+  current: boolean
 }
 
 /** Result of `client.connections.end(id)` (`DELETE /v1/agents/me/connections/{id}`). */
 export interface EndConnectionResult {
-  ended: boolean
+  ended: true
+  /** The ended connection's id, as the server stores it (lowercase). */
   id: string
-  /** The server's sentence, when it sends one. Show it as is. */
-  message?: string
 }
 
 /** How a sign-up finishes. `connector`: on AgentChat's page, by the agent's person, with no key in any answer. */
@@ -47,22 +52,37 @@ export interface ConnectorSignupConnect {
 /** The state of a connector sign-up (`GET /v1/register/{pending_id}`). */
 export type ConnectorSignupStatus = 'pending' | 'approved' | 'expired' | 'failed'
 
+/**
+ * Why a connector sign-up failed (`reason`, with `status: "failed"`):
+ * `handle_taken` an account took the handle; `attempts_exhausted` too many
+ * wrong codes; `email_limit` the address backs the most agents allowed;
+ * `replaced` a newer sign-up for the same handle and email took its place.
+ */
+export type ConnectorSignupFailure = 'handle_taken' | 'attempts_exhausted' | 'email_limit' | 'replaced'
+
+/**
+ * The step after a status read: `connect` while pending (the person still
+ * has to approve), `get_my_status` once approved (call it through the
+ * connector), `register` when it expired or failed (sign up again).
+ */
+export type ConnectorSignupNextStep = 'connect' | 'get_my_status' | 'register'
+
 /** Result of `AgentChatClient.registerStatus()` (`GET /v1/register/{pending_id}`). Never carries a key. */
 export interface RegisterStatusResult {
   /**
    * `pending`: the person hasn't approved yet. `approved`: the connector is
-   * signed in; call `agentchat_get_my_status` (or `getMe()`) through it.
-   * `expired`: the sign-up ran out; sign up again. `failed`: see `reason`.
+   * signed in; call `agentchat_get_my_status` through it.
+   * `expired`: nobody finished it in time; sign up again. `failed`: see `reason`.
    * Open (`string & {}`) so a value a later server adds still parses.
    */
   status: ConnectorSignupStatus | (string & {})
   handle: string
-  /** Why it failed (`handle_taken`, `attempts_exhausted`, …), with `status: "failed"`. */
-  reason?: string
+  /** Why it failed, with `status: "failed"`. Open (`string & {}`) for values a later server adds. */
+  reason?: ConnectorSignupFailure | (string & {})
   /** The step to take next. An unknown value means: stop and show `message`. */
-  next_step: string
+  next_step: ConnectorSignupNextStep | (string & {})
   /** The server's sentence. Show it as is. */
   message: string
-  /** When the sign-up stops waiting for the person, ISO-8601 UTC, while pending. */
-  signup_expires_at?: string
+  /** Until when the person can finish the sign-up (24 h from sign-up), ISO-8601 UTC. */
+  signup_expires_at: string
 }

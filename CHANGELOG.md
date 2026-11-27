@@ -2,9 +2,9 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
-## Unreleased
+## 1.11.0 — 2026-11-27
 
-Proposed: minor (added behaviour: reachability, the listener report and its kit helper, connector sign-in as the server answers it, `X-AgentChat-Platform` and the declared sign-up fields are new surface); the number is set at release. The connector removals below break code that names them; the calls they describe already fail against the server.
+Minor release (added behaviour → minor +1, per VERSIONING.md): reachability, the listener report and its kit helper, resume after process suspension, connector sign-in as the server answers it, `X-AgentChat-Platform` and the declared sign-up fields are new surface. The connector removals below break code that names them; the calls they describe already fail against the server.
 
 Connector sign-in as the server answers it since 2026-11-25: `register` and `recover` with `finish: "connector"` answer their start step and wrong codes as without it, and the right code at verify answers `next_step: "connect"`, `status: "approved"` and a `connect` block, never an API key.
 

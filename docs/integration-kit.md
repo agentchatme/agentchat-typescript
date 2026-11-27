@@ -329,10 +329,11 @@ reporter.set('ok')                                      // the runtime starts an
 reporter.set('not_ready', 'not_signed_in')              // it cannot start the runtime, so it does not connect
 reporter.set('runs_failing', 'runtime_check_failed')    // connected, its runs fail and its own check fails too
 
-// switched off or uninstalled on purpose:
+// switched off or uninstalled on purpose, before the socket closes:
 reporter.set('stopped')
 await reporter.flush()                                  // true once the server holds it; never rejects
 reporter.stop()
+socket.close()
 ```
 
 | | |
@@ -341,10 +342,10 @@ reporter.stop()
 | The same state again | nothing |
 | Spacing | at most one attempt a minute (a flapping state stays far under the server's 120 an hour) |
 | While not `ok` | re-sent every 30 minutes (the server counts a report fresh for 45); `ok` is never re-sent |
-| A failure | `onError`, once per new failure; retried after 1 minute, doubling to 15, or after the wait the server names (429, or a 503 that says how long) |
+| A failure | `onError`, once per new failure; retried after 1 minute, doubling to 15, or after the wait the server names, at most an hour (429, or a 503 that says how long) |
 | `stop()` | no more reports, its timer cleared, a report under way abandoned; timers never keep the process alive |
 
-`set()` never throws for a send (a `TypeError` only for a state or reason that is not the contract's). Report from the process that holds the socket only: a standby reports nothing. `reasonKind` is a bounded kind (`not_signed_in`, `runtime_missing`, `runtime_outdated`, `runtime_check_failed`, `other`); no text from the machine is sent. `listenerInstanceId(file)` keeps the id in `file` (one line, mode 0600): of two processes that start together, both get the id written first; a new id is a new install to the server. `reporter.status()` is a snapshot for your status command (`pending`, `reported`, `failures`, `lastError`, `nextAttemptAt`).
+`set()` never throws for a send (a `TypeError` only for a state or reason that is not the contract's). Report from the process that holds the socket only: a standby reports nothing. Send `stopped` before the listener closes its socket (the server counts it against the socket's last life). `flush()` waits for a report under way for another state, then sends what `set()` said. `reasonKind` is a bounded kind (`not_signed_in`, `runtime_missing`, `runtime_outdated`, `runtime_check_failed`, `other`); no text from the machine is sent. `listenerInstanceId(file)` keeps the id in `file` (one line, mode 0600): of two processes that start together, both get the id written first; a new id is a new install to the server. `reporter.status()` is a snapshot for your status command (`pending`, `reported`, `failures`, `lastError`, `nextAttemptAt`).
 
 ## Install UX
 

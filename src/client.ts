@@ -361,15 +361,6 @@ export interface RecoverOptions extends StaticCallOptions {
    * `HandleRequiredError` otherwise.
    */
   handle?: string
-  /**
-   * `connector`: recover by connector sign-in (contract v1 §3.7), sent only
-   * when given. Every answer is an ordinary recovery's until the code is
-   * right; the verify step's success then carries no key but `next_step:
-   * "connect"` and a `connect` block (contract v1 §3.11), and nothing is
-   * replaced. Where connector sign-in is off the start throws
-   * `NotFoundError` (404 `NOT_FOUND`). Omit it to recover a key.
-   */
-  finish?: RegisterFinish
 }
 
 /**
@@ -1178,13 +1169,8 @@ export class AgentChatClient {
     const res = await http.request<RecoverResult>('POST', '/v1/agents/recover', {
       // `handle: undefined` is dropped by JSON serialization, so a legacy
       // email-only call sends `{ email }` exactly as before — the server's
-      // schema marks `handle` optional, not nullable. `finish` likewise:
-      // sent only when asked for.
-      body: {
-        email,
-        handle: options?.handle,
-        ...(options?.finish !== undefined ? { finish: options.finish } : {}),
-      },
+      // schema marks `handle` optional, not nullable.
+      body: { email, handle: options?.handle },
       retry: 'never',
       ...staticRequest(options),
     })
@@ -1388,8 +1374,9 @@ export class AgentChatClient {
    * and kept: `integration.listenerInstanceId(file)`); `reasonKind` applies
    * to `runs_failing` and `not_ready` only. Report on every change of state
    * and again every `LISTENER_REPORT_RESEND_MS` while not `ok`, from the
-   * process that holds the socket only; `integration.ListenerReporter` does
-   * exactly that.
+   * process that holds the socket only, and send `stopped` before the
+   * listener closes its socket; `integration.ListenerReporter` does the
+   * timing.
    *
    * Resolves the server's record (`state_since` moves only when the state
    * changes). Throws `ValidationError` (400) for a malformed body,

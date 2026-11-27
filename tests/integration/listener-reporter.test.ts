@@ -263,6 +263,43 @@ describe('ListenerReporter: failures', () => {
     reporter.stop()
   })
 
+  it('a server wait is kept to at most an hour (a far-off Retry-After)', async () => {
+    const limited = apiError(429, { code: 'RATE_LIMITED', message: 'Too many requests' }, { 'Retry-After': '86400' })
+    const { client, calls } = fakeClient([limited, 'ok'])
+    const reporter = new ListenerReporter({ client, instanceId: ID })
+    reporter.set('runs_failing')
+    await vi.advanceTimersByTimeAsync(1_000)
+    await vi.advanceTimersByTimeAsync(60 * MIN - 1)
+    expect(calls).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(calls).toHaveLength(2)
+    reporter.stop()
+  })
+
+  it('a delay past what a timer can hold is armed in parts, never as a 1 ms loop', async () => {
+    const { client, calls } = fakeClient()
+    const armed: number[] = []
+    const reporter = new ListenerReporter({
+      client,
+      instanceId: ID,
+      resendMs: 40 * 24 * 60 * MIN, // 40 days
+      setTimeout: (fn, ms) => {
+        armed.push(ms)
+        return setTimeout(fn, ms)
+      },
+    })
+    reporter.set('runs_failing')
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(calls).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(100)
+    expect(armed.every((ms) => ms <= 2_147_483_647)).toBe(true)
+    expect(armed.length).toBeLessThanOrEqual(2)
+    await vi.advanceTimersByTimeAsync(40 * 24 * 60 * MIN)
+    expect(calls).toHaveLength(2) // the re-send, on time
+    expect(armed.length).toBeLessThanOrEqual(5)
+    reporter.stop()
+  })
+
   it('a 503 LISTENER_REPORTS_UNAVAILABLE backs off; a 503 that names retry_after_s waits that long', async () => {
     const unavailable = apiError(503, { code: 'LISTENER_REPORTS_UNAVAILABLE', message: 'Listener reports are not available right now' })
     const busy = apiError(503, { code: 'SERVICE_UNAVAILABLE', message: 'busy', details: { retry_after_s: 300 } })
@@ -327,6 +364,29 @@ describe('ListenerReporter: flush and stop', () => {
     await vi.advanceTimersByTimeAsync(10 * MIN)
     expect(calls).toHaveLength(2)
     await expect(reporter.flush()).resolves.toBe(true)
+    reporter.stop()
+  })
+
+  it('flush while a report for another state is under way waits for it, then sends what set() says', async () => {
+    let release!: () => void
+    const { client, calls } = fakeClient()
+    const gated = vi.fn(async (opts: ReportListenerOptions & CallOptions) => {
+      if (calls.length === 1) await new Promise<void>((r) => (release = r))
+      return client.reportListener(opts)
+    })
+    const reporter = new ListenerReporter({ client: { reportListener: gated }, instanceId: ID })
+    reporter.set('ok')
+    await vi.advanceTimersByTimeAsync(MIN) // the server holds ok
+    reporter.set('runs_failing')
+    await vi.advanceTimersByTimeAsync(MIN) // under way, held
+    expect(gated).toHaveBeenCalledTimes(2)
+    reporter.set('ok') // the check recovered: ok again, while runs_failing is in flight
+    expect(reporter.status().pending).toBe(true) // runs_failing will land and replace ok
+    const flushed = reporter.flush()
+    release()
+    await expect(flushed).resolves.toBe(true)
+    expect(sent(calls)).toEqual([{ state: 'ok' }, { state: 'runs_failing', reasonKind: 'other' }, { state: 'ok' }])
+    expect(reporter.status()).toMatchObject({ pending: false, reported: { state: 'ok' } })
     reporter.stop()
   })
 

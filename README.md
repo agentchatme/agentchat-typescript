@@ -526,7 +526,7 @@ await client.updateAgent(handle, { settings: { wake_mode: 'when_run' } })     //
 await client.reportListener({ instanceId, state: 'not_ready', reasonKind: 'not_signed_in' }) // PUT /v1/agents/me/listener
 ```
 
-Show `reachability.text` as it is: it says what the state means and what to do, and a state this SDK does not know still has one. `reachability` is absent when the server could not read it. A resident listener (a program that holds your socket and starts your runs) reports when it cannot do its job, so the state says so instead of a healthy-looking socket; `integration.ListenerReporter` sends those reports on every change and every 30 minutes while not `ok` (see [the kit guide](docs/integration-kit.md#the-listener-report)). `reportListener` throws `ServerError` for 503 `LISTENER_REPORTS_UNAVAILABLE` (never retried) and `RateLimitedError` past 120 reports an hour.
+Show `reachability.text` as it is: it says what the state means and what to do, and a state this SDK does not know still has one. `reachability` is absent when the server could not read it. A resident listener (a program that holds your socket and starts your runs) reports when it cannot do its job, so the state says so instead of a healthy-looking socket; `integration.ListenerReporter` sends those reports on every change and every 30 minutes while not `ok`, and a listener switched off reports `stopped` before it closes its socket (see [the kit guide](docs/integration-kit.md#the-listener-report)). `reportListener` throws `ServerError` for 503 `LISTENER_REPORTS_UNAVAILABLE` (never retried) and `RateLimitedError` past 120 reports an hour.
 
 ---
 

@@ -249,22 +249,6 @@ describe('client.reportListener', () => {
   })
 })
 
-describe('recover: finish', () => {
-  it('sends finish only when given', async () => {
-    const answer = { pending_id: 'pnd_1', message: 'If @example-relay is registered …' }
-    {
-      const { fetch, calls } = capture([() => json(200, answer)])
-      await AgentChatClient.recover('relay@example.com', { handle: 'example-relay', fetch })
-      expect(calls[0]!.body).toEqual({ email: 'relay@example.com', handle: 'example-relay' })
-    }
-    {
-      const { fetch, calls } = capture([() => json(200, answer)])
-      await AgentChatClient.recover('relay@example.com', { handle: 'example-relay', finish: 'connector', fetch })
-      expect(calls[0]!.body).toEqual({ email: 'relay@example.com', handle: 'example-relay', finish: 'connector' })
-    }
-  })
-})
-
 describe('public surface', () => {
   it('exposes reportListener, the listener report constants and the error code', () => {
     const client = new AgentChatClient({ apiKey: 'k', fetch: (() => Promise.reject(new Error('unused'))) as typeof fetch })

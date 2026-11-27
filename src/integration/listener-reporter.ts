@@ -16,13 +16,14 @@
  *   - a change back to what the server already holds before it was sent is
  *     no report at all;
  *   - a failure is retried after 1 minute, doubling to 15 (`retryMs`,
- *     `retryMaxMs`), or after the wait the server names (a 429's
- *     `Retry-After`, a 429 / 503 body's `retry_after_s`).
+ *     `retryMaxMs`), or after the wait the server names, at most an hour (a
+ *     429's `Retry-After`, a 429 / 503 body's `retry_after_s`).
  * It never throws into the caller: a failure goes to `onError` (once per new
  * failure, not once per retry), and its timers never keep the process
  * alive. Report from the process that holds the socket only (a standby
- * reports nothing). To report `stopped` before exiting: `set('stopped')`,
- * `await flush()`, then `stop()`.
+ * reports nothing). When the listener is switched off or uninstalled, report
+ * `stopped` before it closes its socket: `set('stopped')`, `await flush()`,
+ * then `stop()`, then close the socket.
  *
  * `listenerInstanceId(file)` makes the install's id once and reuses it.
  */
@@ -40,6 +41,11 @@ export const LISTENER_REPORT_MIN_INTERVAL_MS = 60_000
 /** The first retry after a failed attempt; doubles per failure up to `LISTENER_REPORT_RETRY_MAX_MS`. */
 export const LISTENER_REPORT_RETRY_MS = 60_000
 export const LISTENER_REPORT_RETRY_MAX_MS = 15 * 60_000
+
+/** The longest wait a server's answer can set (its report budget is counted per hour). */
+const SERVER_WAIT_MAX_MS = 60 * 60_000
+/** The longest delay a timer takes; a longer one is re-armed when it fires. */
+const TIMER_MAX_MS = 2_147_483_647
 
 /** What the reporter needs from the client; `AgentChatClient` satisfies it. */
 export type ListenerReportClient = Pick<AgentChatClient, 'reportListener'>
@@ -111,13 +117,14 @@ function reasonOf(state: ListenerState, reasonKind: ListenerReasonKind | undefin
   return reasonKind ?? 'other'
 }
 
-/** The wait the server named for this failure, in ms, or null. */
+/** The wait the server named for this failure, in ms (at most an hour), or null. */
 function serverWaitMs(err: unknown): number | null {
-  if (err instanceof RateLimitedError && err.retryAfterMs !== null) return Math.max(0, err.retryAfterMs)
-  if (err instanceof AgentChatError && (err.status === 429 || err.status === 503) && err.retryAfterS !== null) {
-    return err.retryAfterS * 1000
+  let ms: number | null = null
+  if (err instanceof RateLimitedError && err.retryAfterMs !== null) ms = err.retryAfterMs
+  else if (err instanceof AgentChatError && (err.status === 429 || err.status === 503) && err.retryAfterS !== null) {
+    ms = err.retryAfterS * 1000
   }
-  return null
+  return ms === null ? null : Math.min(SERVER_WAIT_MAX_MS, Math.max(0, ms))
 }
 
 function failureText(err: unknown): string {
@@ -187,7 +194,11 @@ export class ListenerReporter {
     }
     if (this.stopped) return
     const next: Report = { state, reasonKind: reasonOf(state, reasonKind) }
-    if (sameReport(this.desired, next)) return
+    if (sameReport(this.desired, next)) {
+      // Nothing new; but if nothing is armed or under way, make sure what is due is.
+      if (this.timer === null && this.inFlight === null) this.schedule()
+      return
+    }
     // The wait runs from the first change the server has not heard of, so a
     // state that keeps changing is still reported, at its latest.
     if (!this.pending()) this.changedAt = this.now()
@@ -206,15 +217,15 @@ export class ListenerReporter {
     for (;;) {
       if (this.stopped) return false
       if (!this.pending()) return true
-      const inFlight = this.inFlight
-      if (inFlight !== null) {
-        const accepted = await inFlight.done
-        // The send under way was for what `set()` still says: its answer is the answer.
-        if (sameReport(inFlight.report, this.desired)) return accepted
-        continue
+      let inFlight = this.inFlight
+      if (inFlight === null) {
+        if (this.now() < this.serverWaitUntil) return false
+        this.send()
+        inFlight = this.inFlight!
       }
-      if (this.now() < this.serverWaitUntil) return false
-      return this.send()
+      const accepted = await inFlight.done
+      // The send under way was for what `set()` still says: its answer is the answer.
+      if (sameReport(inFlight.report, this.desired) || this.stopped) return accepted
     }
   }
 
@@ -244,8 +255,15 @@ export class ListenerReporter {
     }
   }
 
+  /**
+   * Whether the server does not (or will not, once the report under way
+   * lands) hold what `set()` said: a report in flight for another state
+   * counts, since it will replace what the server holds.
+   */
   private pending(): boolean {
-    return this.desired !== null && !sameReport(this.desired, this.reported)
+    if (this.desired === null) return false
+    if (this.inFlight !== null && !sameReport(this.inFlight.report, this.desired)) return true
+    return !sameReport(this.desired, this.reported)
   }
 
   /** When the next attempt is due, or null when nothing is to be sent. */
@@ -279,7 +297,7 @@ export class ListenerReporter {
       this.timer = null
       this.dueAt = null
       this.tick()
-    }, Math.max(0, due - this.now()))
+    }, Math.min(TIMER_MAX_MS, Math.max(0, due - this.now())))
     ;(this.timer as { unref?: () => void }).unref?.()
   }
 

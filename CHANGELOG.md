@@ -2,6 +2,33 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## Unreleased
+
+Proposed: patch (fixed existing behaviour); the number is set at release.
+
+### Fixed
+
+- `RealtimeClient`: after a laptop slept (or the process was otherwise
+  suspended), the client stayed deaf for up to 100 s of awake time. A
+  suspended process runs no timers, while the server closes a socket that
+  has not answered its 45 s ping within 30 s; after the resume the local
+  socket still looked open, and only the idle deadline, frozen through the
+  suspension too, would end it. A pending backoff wait resumed late in the
+  same way. The client now checks every 5 s, while a socket is opening or
+  open or a backoff wait is pending, how far the wall clock moved since the
+  last check. A check late by 75 s or more (the server's 45 s ping + 30 s
+  pong deadline) ends the socket at once as a client close (`close 4000
+  'client resumed after suspension'`, `terminate()` on `ws`) and reconnects
+  at once, the backoff from its first rung; a pending backoff wait is cut
+  short the same way. One `onError` notice, e.g. `resumed after suspension
+  (~80s) …`. A smaller gap changes nothing (the idle deadline stays in charge).
+  `blocked` keeps its 10–15 min retry, and a wait the server set (the
+  connect budget) is kept until it has run out in real time. The check is an
+  unref'd timer, stopped by `disconnect()` and off while `idle`, `blocked` or
+  `stopped`. Tests that drive a connected client with
+  `vi.runAllTimers()` no longer finish (the check repeats); use
+  `vi.advanceTimersByTime()` or `vi.runOnlyPendingTimers()`.
+
 ## 1.10.0 — 2026-11-24
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): connector sign-in is new surface.

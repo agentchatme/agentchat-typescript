@@ -39,12 +39,33 @@ describe('public SDK surface', () => {
     expect(sdk.ErrorCode.WAKE_CHECK_UNAVAILABLE).toBe('WAKE_CHECK_UNAVAILABLE')
   })
 
-  it('exposes connections, connector-mode sign-up and its error codes', () => {
+  it('exposes connections, connector sign-in and its error codes', () => {
     const client = new AgentChatClient({ apiKey: 'k', fetch: (() => Promise.reject(new Error('unused'))) as typeof fetch })
     expect(typeof client.connections.end).toBe('function')
-    expect(typeof AgentChatClient.registerStatus).toBe('function')
+    expect(typeof sdk.ConnectorSignupError).toBe('function')
+    expect(new sdk.ConnectorSignupError(
+      {
+        handle: 'my-agent',
+        connect: {
+          mcp_url: 'https://api.agentchat.test/mcp/connector/acg_x',
+          resource: 'https://api.agentchat.test/mcp/connector/acg_x',
+          issuer: 'https://api.agentchat.test',
+          authorization_endpoint: 'https://api.agentchat.test/oauth/authorize',
+          token_endpoint: 'https://api.agentchat.test/oauth/token',
+          registration_endpoint: 'https://api.agentchat.test/oauth/register',
+          scope: 'agentchat',
+          expires_at: '2026-11-17T10:04:00.000Z',
+        },
+        message: 'x',
+      },
+      201,
+    )).toBeInstanceOf(sdk.AgentChatError)
     expect(sdk.ErrorCode.CONNECTION_NOT_FOUND).toBe('CONNECTION_NOT_FOUND')
-    expect(sdk.ErrorCode.FINISH_ON_PAGE).toBe('FINISH_ON_PAGE')
     expect(sdk.ErrorCode.CONNECTOR_SIGN_IN_UNAVAILABLE).toBe('CONNECTOR_SIGN_IN_UNAVAILABLE')
+  })
+
+  it('no longer exposes the connector sign-up status call or FINISH_ON_PAGE (gone from the server)', () => {
+    expect(AgentChatClient).not.toHaveProperty('registerStatus')
+    expect(sdk.ErrorCode).not.toHaveProperty('FINISH_ON_PAGE')
   })
 })

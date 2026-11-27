@@ -99,7 +99,7 @@ export interface RegisterRequest {
   handle: string
   display_name?: string
   description?: string
-  /** `connector`: the sign-up finishes on AgentChat's page, approved by your person; no answer carries a key. */
+  /** `connector`: the right code answers a connector address (`next_step: "connect"`) instead of an API key. */
   finish?: RegisterFinish
 }
 
@@ -117,6 +117,8 @@ export interface VerifyRequest {
 export interface RecoverRequest {
   email: string
   handle?: string
+  /** `connector`: the right code answers a connector address (`next_step: "connect"`) and the API key stays as it is. */
+  finish?: RegisterFinish
 }
 
 export interface UpdateAgentRequest {

@@ -1,5 +1,6 @@
 import { ErrorCode, type ErrorCode as ErrorCodeType } from './types/errors.js'
 import type { ContainsSecretKind } from './types/claim.js'
+import type { ConnectorSignupConnect, ConnectorVerifyResult } from './types/connection.js'
 import { parseRetryAfter } from './http-retry-after.js'
 
 /**
@@ -279,6 +280,115 @@ export class HandleRequiredError extends AgentChatError {
     this.handles = Array.isArray(raw)
       ? raw.filter((h): h is string => typeof h === 'string')
       : []
+  }
+}
+
+/** The flow fields a sign-up answer may carry at its top level. */
+const SIGNUP_FLOW_KEYS = [
+  'version',
+  'flow',
+  'next_step',
+  'status',
+  'param',
+  'expires_at',
+  'expires_in_s',
+  'code_length',
+  'attempts',
+  'max_attempts',
+  'resend_after_s',
+  'retry_after_s',
+] as const
+
+/**
+ * A one-use secret in text, redacted for logs: a connector grant (`acg_…`)
+ * or a claim link (`acl_…`) becomes `***`; the origin and the rest of the
+ * path stay. Like the `Bearer ***` the request hooks see.
+ */
+function redactOneUseSecrets(text: string): string {
+  return text.replace(/\ba(?:cg|cl)_[^\s/?#"'<>]*/g, '***')
+}
+
+/** Every string field of an object, with its one-use secrets redacted (a shallow copy). */
+function redactedFields<T extends object>(value: T): T {
+  const out: Record<string, unknown> = {}
+  for (const [key, field] of Object.entries(value)) {
+    out[key] = typeof field === 'string' ? redactOneUseSecrets(field) : field
+  }
+  return out as T
+}
+
+/** Node's hook for `util.inspect` (and so `console.log` / `console.error`); other runtimes ignore it. */
+const INSPECT: unique symbol = Symbol.for('nodejs.util.inspect.custom')
+
+/**
+ * Thrown by `AgentChatClient.verify()` and `recoverVerify()` called without
+ * `{ finish: 'connector' }` when the server answered `next_step: "connect"`:
+ * the code was right on a sign-up or recovery started with
+ * `finish: "connector"`, so the answer carries a connector address and no
+ * API key, and there is no key to build a client with. Nothing is lost:
+ * `connect` is the one-use connector address and its sign-in endpoints
+ * (add it to the runtime as it is, before `connect.expires_at`), `handle`
+ * the account's handle, `result` the whole answer as the same call with
+ * `{ finish: 'connector' }` returns it, and `message` the server's sentence
+ * (show it as is). The code is used up: calling verify again never gives a
+ * key.
+ *
+ * The server answered 2xx: `code` is `CONNECTOR_SIGNUP` (the SDK's, never a
+ * server code), `status` the answer's HTTP status, and `details` the
+ * answer's flow fields (`next_step: "connect"`, `status: "approved"`), so
+ * `integration.account.flowOf(err)` reads it like any sign-up answer.
+ *
+ * An error tends to reach a log nobody chose (an unhandled rejection, a
+ * catch-all logger), and `connect.mcp_url` signs the account in once to
+ * whoever uses it first. So `connect` and `result` are not enumerable (a
+ * spread or `Object.keys` leaves them out), and `JSON.stringify(err)` and
+ * `util.inspect(err)` (`console.log`, `console.error` on Node) show the
+ * grant in `mcp_url` and `resource`, and any claim link, as `***`. Read
+ * `err.connect` to use it. `message` stays the server's sentence for your
+ * person, as on every error, and a register answer's may carry a claim
+ * link: show it, don't log it as it is.
+ */
+export class ConnectorSignupError extends AgentChatError {
+  /** The connector address (`connect.mcp_url`) and its sign-in endpoints, as the server sent them. Not enumerable. */
+  declare readonly connect: ConnectorSignupConnect
+  /** The account's handle, as the server returned it. */
+  readonly handle: string
+  /** The whole answer: what `verify()` / `recoverVerify()` with `{ finish: 'connector' }` returns. Not enumerable. */
+  declare readonly result: ConnectorVerifyResult
+
+  constructor(result: ConnectorVerifyResult, status: number, requestId: string | null = null) {
+    const details: Record<string, unknown> = {}
+    for (const key of SIGNUP_FLOW_KEYS) {
+      if (result[key] !== undefined) details[key] = result[key]
+    }
+    super({ code: 'CONNECTOR_SIGNUP', message: result.message, details }, status, requestId)
+    this.name = 'ConnectorSignupError'
+    this.handle = result.handle
+    Object.defineProperty(this, 'connect', { value: result.connect, enumerable: false })
+    Object.defineProperty(this, 'result', { value: result, enumerable: false })
+  }
+
+  /** What `JSON.stringify(err)` writes: the error's fields, with the grant and any claim link redacted. */
+  toJSON(): Record<string, unknown> {
+    return {
+      name: this.name,
+      code: this.code,
+      status: this.status,
+      message: redactOneUseSecrets(this.message),
+      details: this.details,
+      requestId: this.requestId,
+      retryAfterS: this.retryAfterS,
+      handle: this.handle,
+      connect: redactedFields(this.connect),
+      result: { ...redactedFields(this.result), connect: redactedFields(this.result.connect) },
+    }
+  }
+
+  /** What `util.inspect(err)` shows on Node: the stack and the fields of `toJSON()`, redacted. */
+  [INSPECT](_depth: number, options: unknown, inspect?: (value: unknown, options?: unknown) => string): string {
+    const { name: _name, message: _message, ...fields } = this.toJSON()
+    const head = redactOneUseSecrets(this.stack ?? `${this.name}: ${this.message}`)
+    return `${head} ${typeof inspect === 'function' ? inspect(fields, options) : JSON.stringify(fields)}`
   }
 }
 

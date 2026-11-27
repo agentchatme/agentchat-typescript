@@ -4,7 +4,9 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 
 ## Unreleased
 
-Proposed: minor (added behaviour: reachability, the listener report and its kit helper are new surface); the number is set at release.
+Proposed: minor (added behaviour: reachability, the listener report and its kit helper, and connector sign-in as the server answers it, are new surface); the number is set at release. The connector removals below break code that names them; the calls they describe already fail against the server.
+
+Connector sign-in as the server answers it since 2026-11-25: `register` and `recover` with `finish: "connector"` answer their start step and wrong codes as without it, and the right code at verify answers `next_step: "connect"`, `status: "approved"` and a `connect` block, never an API key.
 
 ### Added
 
@@ -59,17 +61,74 @@ Proposed: minor (added behaviour: reachability, the listener report and its kit 
   `text`, and the fields of each kind; `TrayNoticeKind` adds `no_wake_yet`
   and `socket_offline` to `wake_failing`, `no_wake`, `woken_undelivered`).
   An unknown kind is kept as sent; show `text`.
-- Conformance fixtures copied from the published contract: new
-  `reachability.v1.json`, `notice.no-wake-yet.v1.json`,
-  `notice.socket-offline.v1.json` and `notice.woken-undelivered.v1.json`;
-  `notice.no-wake.v1.json`, `notice.wake-failing.v1.json`,
-  `signup-flow.cases.json` (the done answers' new last lines, `reachability`
-  on the register done case, the connector recovery cases),
-  `texts.sample.json` (manual 2.4.26) and `manifest.sha256` updated. The
-  conformance tests accept every reachability and notice example and keep
-  values and fields they do not know. One connector case is listed as not
-  supported yet: a recovery started with `finish: "connector"`, whose verify
-  answer carries no key (`recover()` does not offer `finish`).
+- `AgentChatClient.recover(email, { handle?, finish? })`: `finish: 'connector'`
+  signs a runtime in as the account instead of replacing its key (the key
+  and the wake stay as they are). Sent only when given; an ordinary
+  recovery's body is unchanged. `NotFoundError` (404 `NOT_FOUND`) where
+  connector sign-in is off. `RecoverRequest` gains `finish`.
+- `verify(pendingId, code, { finish: 'connector' })` and
+  `recoverVerify(pendingId, code, { finish: 'connector' })` (new
+  `VerifyOptions`). The option is client-side only and never sent. With
+  it, a `next_step: "connect"` answer resolves a `ConnectorVerifyResult`:
+  `handle` (`agent.handle` on register, `handle` on recover), `connect`,
+  `message`, the flow fields and the claim-link fields, with no `apiKey`
+  and no `client`. The server's answer decides: with the option, an
+  ordinary `done` answer (the key came) still resolves the ordinary
+  result; tell them apart with `'connect' in result`. Without the option,
+  the ordinary types are unchanged, also for options typed `any` and for
+  `ReturnType<typeof AgentChatClient.verify>` (a type-level test,
+  `tests/verify-overloads.test-d.ts`, now runs with the tests).
+- `ConnectorSignupError` (an `AgentChatError`, code `CONNECTOR_SIGNUP`,
+  set by the SDK; `status` the answer's 2xx): thrown by `verify()` and
+  `recoverVerify()` without `finish: 'connector'` when the answer is
+  `next_step: "connect"`. It carries `connect`, `handle`, `message`, the
+  whole answer in `result`, and the flow in `details`, so the one-use
+  connector address is not lost. `connect` and `result` are not
+  enumerable, and `JSON.stringify(err)` and `util.inspect(err)` (so
+  `console.log` / `console.error` on Node) show the grant in `mcp_url` and
+  `resource`, and any claim link, as `***`; `err.connect` is the real one.
+- `integration.account`: `start('register' | 'recover', { ..., finish:
+  'connector' })` sends `finish` (only when given; `RegisterInput` and
+  `RecoverInput` gain it). On action `connect` the step result
+  carries `connect` and `handle`; a `connect` answer without
+  `connect.mcp_url` or a handle reads as `stop`. `run` takes no `finish`
+  (a `TypeError`): it ends with a key.
+- Conformance fixtures: every file of the published contract v1 copied
+  byte for byte (manual 2.4.26): new `reachability.v1.json`,
+  `notice.no-wake-yet.v1.json`, `notice.socket-offline.v1.json` and
+  `notice.woken-undelivered.v1.json`; `notice.no-wake.v1.json`,
+  `notice.wake-failing.v1.json`, `texts.sample.json` and `manifest.sha256`
+  updated. `signup-flow.cases.json`: the done answers' new last lines and
+  `reachability`; it gains `verify-connector-done`,
+  `recover-connector-not-available` and `recover-verify-connector-done`,
+  and drops `register-connector-started`, `verify-finish-on-page` and the
+  `register-status-*` cases. The conformance tests accept every
+  reachability and notice example and keep values and fields they do not
+  know. The signup-flow driver sends every register and recover start
+  through `register()` / `recover()` and the kit's `start`, and every
+  verify and recover_verify case through `verify()` / `recoverVerify()`,
+  with and without `finish: 'connector'`.
+
+### Changed
+
+- `AgentChatClient.register({ ..., finish: 'connector' })` resolves the
+  ordinary `RegisterResult` (the pending start), as the server answers.
+- `ConnectorSignupConnect` is the server's `connect` block: `mcp_url`,
+  `resource`, `issuer`, `authorization_endpoint`, `token_endpoint`,
+  `registration_endpoint`, `scope`, `expires_at` (it had `mcp_url` and
+  `status_url`).
+- `integration.account.actionOf`: `next_step: "get_my_status"` is no longer
+  read as `done` (only the removed status route sent it); it is an
+  unknown step, so `stop`.
+
+### Removed
+
+- `AgentChatClient.registerStatus()`, `ConnectorRegisterResult`,
+  `RegisterStatusResult`, `ConnectorSignupStatus`,
+  `ConnectorSignupFailure`, `ConnectorSignupNextStep` and
+  `ErrorCode.FINISH_ON_PAGE`. The server removed the status route
+  (`GET /v1/register/{pending_id}`) and that code on 2026-11-25, so these
+  calls already failed.
 
 ### Fixed
 
@@ -96,6 +155,11 @@ Proposed: minor (added behaviour: reachability, the listener report and its kit 
   `blocked` or `stopped`. Tests that drive a connected client with
   `vi.runAllTimers()` no longer finish (the check repeats); use
   `vi.advanceTimersByTime()` or `vi.runOnlyPendingTimers()`.
+- `verify()` and `recoverVerify()` no longer build a client with an
+  undefined key: a connector answer resolves or throws as above, and any
+  other 2xx without an `api_key` throws. A connect answer with an empty or
+  missing `connect.mcp_url` or handle throws too. A recovery answer with a
+  key and no handle keeps the key, with `handle: ''`.
 
 ## 1.10.0 — 2026-11-24
 

@@ -267,8 +267,8 @@ if (result.outcome === 'done') saveKey(result.apiKey, result.handle) // the hand
 
 | `action` | When | `run` |
 |---|---|---|
-| `done` | `next_step: "done"` (`get_my_status` on a connector sign-up's status) | shows the message, returns the key and the handle |
-| `connect` | `next_step: "connect"`: a connector sign-up, which never carries a key (`verify` on one answers 409 `FINISH_ON_PAGE`) | shows the message, ends: `run` signs up with a key; a connector sign-up is `AgentChatClient.register({ ..., finish: 'connector' })` |
+| `done` | `next_step: "done"` | shows the message, returns the key and the handle |
+| `connect` | `next_step: "connect"`: the right code on a flow started with `finish: "connector"`, which carries a connector address (`connect`) and never a key | shows the message, ends: `run` takes no `finish` and ends with a key; a connector sign-up or recovery is `start(kind, { ..., finish: 'connector' })` and `submitCode`, whose result then carries `connect` and `handle` |
 | `ask_code` | a verify step, no wait | asks for the code; the person can enter it, ask for a new code, or cancel |
 | `ask_param` | a start step with `param` | asks that field only (a taken handle re-asks the handle, an email at its limit the email), starts again |
 | `offer_new_code` | a start step and the code is gone: expired, too many wrong tries, or a 429 to the code | asks before sending a new code; on a yes, waits out `retry_after_s` first when the answer has one |
@@ -286,7 +286,7 @@ It never sends a new code the person did not ask for and keeps no attempt cap of
 
 ### One step per process: `start` / `submitCode`
 
-A CLI that exits between the code request and the code (`register --email --handle`, later `register --code`) uses the steps alone. Each makes one call, is never retried, resolves with every answer the server gives (`{flow, message, action, httpStatus, calledStep, legacy, code?, apiKey?, handle?, reachability?, handles?}`), and rejects only when no answer came (network, timeout, abort). `flow` is plain JSON: save it with the pending state and hand it back.
+A CLI that exits between the code request and the code (`register --email --handle`, later `register --code`) uses the steps alone. Each makes one call, is never retried, resolves with every answer the server gives (`{flow, message, action, httpStatus, calledStep, legacy, code?, apiKey?, handle?, connect?, reachability?, handles?}`), and rejects only when no answer came (network, timeout, abort). `start('register', { email, handle, finish: 'connector' }, …)` and `start('recover', { email, handle, finish: 'connector' }, …)` send `finish` (only when given); the right code then answers action `connect` with `connect` and `handle`, and no key. `flow` is plain JSON: save it with the pending state and hand it back.
 
 ```ts
 const opts = { clientIdentity, apiBase }

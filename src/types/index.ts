@@ -124,12 +124,9 @@ export type {
 export type {
   AgentConnection,
   ConnectorSignupConnect,
-  ConnectorSignupFailure,
-  ConnectorSignupNextStep,
-  ConnectorSignupStatus,
+  ConnectorVerifyResult,
   EndConnectionResult,
   RegisterFinish,
-  RegisterStatusResult,
 } from './connection.js'
 
 export type {

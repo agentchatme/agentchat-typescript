@@ -37,16 +37,18 @@ Connector sign-in as the server answers it since 2026-11-25: `register` and `rec
   `connect.mcp_url` or a handle reads as `stop`. `run` takes no `finish`
   (a `TypeError`): it ends with a key.
 - Conformance fixtures: every file of the published contract v1 copied
-  byte for byte (manual 2.4.25). `signup-flow.cases.json` gains
+  byte for byte (manual 2.4.26). `signup-flow.cases.json` gains
   `verify-connector-done`, `recover-connector-not-available` and
-  `recover-verify-connector-done`, and drops `register-connector-started`,
-  `verify-finish-on-page` and the `register-status-*` cases;
+  `recover-verify-connector-done`, drops `register-connector-started`,
+  `verify-finish-on-page` and the `register-status-*` cases, and its
+  `done` answers carry new wake texts and `reachability`;
   `notice.no-wake.v1.json`, `notice.wake-failing.v1.json`,
   `texts.sample.json` and `manifest.sha256` change, and
-  `notice.woken-undelivered.v1.json` is new. The driver sends `kind:
-  recover` cases with `finish` through `recover()` (and the kit's
-  `start`), and checks each connect answer through `verify()` /
-  `recoverVerify()` with and without the option.
+  `notice.woken-undelivered.v1.json`, `notice.no-wake-yet.v1.json`,
+  `notice.socket-offline.v1.json` and `reachability.v1.json` are new. The
+  driver sends `kind: recover` cases with `finish` through `recover()`
+  (and the kit's `start`), and checks each connect answer through
+  `verify()` / `recoverVerify()` with and without the option.
 
 ### Changed
 

@@ -95,6 +95,13 @@ export interface RegisterInput {
   handle: string
   display_name?: string
   description?: string
+  /**
+   * `connector`: the right code answers action `connect` with `connect` set
+   * (a connector address that signs the new account in once) instead of a
+   * key. Sent only when given. `start` and `submitCode` only: `run` signs up
+   * with a key.
+   */
+  finish?: RegisterFinish
 }
 
 /** Input of the recover start call (`POST /v1/agents/recover`). Pass `handle` whenever it is known. */
@@ -185,9 +192,9 @@ export interface RunOptions extends AccountCallOptions {
    * What is known up front. A missing `email` (or, to register, `handle`) is
    * asked first; `display_name` / `description` go with every register call.
    * `run` ends with a key, so it takes no `finish` (a `TypeError`): a
-   * connector recovery is `start` and `submitCode`.
+   * connector sign-up or recovery is `start` and `submitCode`.
    */
-  input?: Partial<RegisterInput> | Partial<Omit<RecoverInput, 'finish'>>
+  input?: Partial<Omit<RegisterInput, 'finish'>> | Partial<Omit<RecoverInput, 'finish'>>
   /** Ask the person one question. */
   ask: (question: AccountQuestion) => Promise<AccountAnswer>
   /** Show the person a server sentence, as is. */
@@ -535,8 +542,8 @@ function read(
 /**
  * Start a flow: `register` sends a code to `input.email` for a new agent
  * `input.handle`; `recover` sends a code to the email the agent was
- * registered with (with `input.finish: 'connector'`, its right code answers
- * action `connect` instead of a key). One call, never retried. Resolves
+ * registered with. With `input.finish: 'connector'`, on either, the right
+ * code answers action `connect` instead of a key. One call, never retried. Resolves
  * with every answer the server gives; rejects only when there is no answer
  * (network, timeout, abort).
  */
@@ -562,6 +569,8 @@ export async function start(
           handle: input.handle,
           display_name: (input as RegisterInput).display_name,
           description: (input as RegisterInput).description,
+          // Sent only when given: an ordinary sign-up's body is unchanged.
+          ...((input as RegisterInput).finish !== undefined ? { finish: (input as RegisterInput).finish } : {}),
         }
       : {
           email: input.email,

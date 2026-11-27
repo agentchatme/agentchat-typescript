@@ -1111,7 +1111,7 @@ describe('integration.account.start / submitCode — one step per process', () =
     expect(second.calledStep).toBe('recover_verify')
   })
 
-  describe('a recovery with finish: "connector"', () => {
+  describe('register and recover with finish: "connector"', () => {
     const CONNECT = {
       mcp_url: 'https://api.agentchat.test/mcp/connector/acg_example',
       resource: 'https://api.agentchat.test/mcp/connector/acg_example',
@@ -1164,6 +1164,41 @@ describe('integration.account.start / submitCode — one step per process', () =
       )
       expect(result.action).toBe('stop')
       expect(result.connect).toBeUndefined()
+    })
+
+    it('register start sends finish only when given; its right code answers connect', async () => {
+      const srv = server([
+        sent('register'),
+        sent('register'),
+        json(201, {
+          agent: { handle: 'alice', email: 'a@example.com' },
+          connect: CONNECT,
+          message: 'Email verified. @alice is registered. Add AgentChat to your runtime as a connector at connect.mcp_url.',
+          version: 1,
+          flow: 'register',
+          next_step: 'connect',
+          status: 'approved',
+        }),
+      ])
+      await start('register', { email: 'a@example.com', handle: 'alice' }, options(srv))
+      const first = await start('register', { email: 'a@example.com', handle: 'alice', finish: 'connector' }, options(srv))
+      expect(srv.seen.slice(0, 2).map((r) => r.body)).toEqual([
+        { email: 'a@example.com', handle: 'alice' },
+        { email: 'a@example.com', handle: 'alice', finish: 'connector' },
+      ])
+      const second = await submitCode(first.flow, '123456', options(srv))
+      expect(second).toMatchObject({ action: 'connect', handle: 'alice', connect: CONNECT, httpStatus: 201, calledStep: 'verify' })
+      expect(second.apiKey).toBeUndefined()
+      expect(srv.seen[2]!.body).toEqual({ pending_id: 'pnd_1', code: '123456' })
+    })
+
+    it.each(['register', 'recover'] as const)('run takes no finish on %s: it ends with a key', async (kind) => {
+      const srv = server([])
+      const who = person([])
+      await expect(
+        runWith(srv, who, { kind, input: { email: 'a@example.com', handle: 'alice', finish: 'connector' } as RunOptions['input'] }),
+      ).rejects.toThrow(TypeError)
+      expect(srv.seen).toHaveLength(0)
     })
 
     it('run takes no finish: it ends with a key', async () => {

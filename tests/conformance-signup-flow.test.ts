@@ -157,11 +157,9 @@ const LEGACY_READING: Record<string, { action: string; flow: Record<string, unkn
   },
 }
 
-/** A start with `finish` (connector sign-in): the kit's `start` takes it on recover only; every one is driven through the client below. */
+/** A start with `finish` (connector sign-in): driven through the kit's `start` here and through the client below. */
 const hasFinish = (c: SignupCase) => c.request.body.finish !== undefined
-const stepCases = fixture.cases.filter(
-  (c) => STEP_KINDS[c.request.kind] !== undefined && (!hasFinish(c) || c.request.kind === 'recover'),
-)
+const stepCases = fixture.cases.filter((c) => STEP_KINDS[c.request.kind] !== undefined)
 const API = 'https://api.agentchat.test'
 
 /** A fetch that answers the case's response and records each request. */
@@ -184,7 +182,7 @@ function answering(c: SignupCase) {
 describe('conformance — signup-flow.cases.json: start / submitCode', () => {
   it('drives every register and recover case (rotate key is the client’s rotateKey)', () => {
     expect(stepCases.length).toBeGreaterThan(0)
-    const rest = fixture.cases.filter((c) => !stepCases.includes(c) && !hasFinish(c))
+    const rest = fixture.cases.filter((c) => !stepCases.includes(c))
     for (const c of rest) expect(c.request.kind, c.name).toMatch(/^rotate_key/)
   })
 

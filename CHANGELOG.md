@@ -31,8 +31,9 @@ Connector sign-in as the server answers it since 2026-11-25: `register` and `rec
   `next_step: "connect"`. It carries `connect`, `handle`, `message`, the
   whole answer in `result`, and the flow in `details`, so the one-use
   connector address is not lost.
-- `integration.account`: `start('recover', { ..., finish: 'connector' })`
-  sends `finish` (only when given). On action `connect` the step result
+- `integration.account`: `start('register' | 'recover', { ..., finish:
+  'connector' })` sends `finish` (only when given; `RegisterInput` and
+  `RecoverInput` gain it). On action `connect` the step result
   carries `connect` and `handle`; a `connect` answer without
   `connect.mcp_url` or a handle reads as `stop`. `run` takes no `finish`
   (a `TypeError`): it ends with a key.
@@ -46,8 +47,8 @@ Connector sign-in as the server answers it since 2026-11-25: `register` and `rec
   `texts.sample.json` and `manifest.sha256` change, and
   `notice.woken-undelivered.v1.json`, `notice.no-wake-yet.v1.json`,
   `notice.socket-offline.v1.json` and `reachability.v1.json` are new. The
-  driver sends `kind: recover` cases with `finish` through `recover()`
-  (and the kit's `start`), and checks each connect answer through
+  driver sends the cases with `finish` through `register()` / `recover()`
+  and the kit's `start`, and checks each connect answer through
   `verify()` / `recoverVerify()` with and without the option.
 
 ### Changed

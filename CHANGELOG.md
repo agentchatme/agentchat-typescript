@@ -10,6 +10,7 @@ Connector sign-in as the server answers it since 2026-11-25: `register` and `rec
 
 ### Added
 
+- **The identity headers are exported**: `clientIdentityHeaders(identity)`, `platformHeaderValue(identity)` and `PLATFORM_HEADER`, so an integration that makes a request outside `AgentChatClient` (for one, `@agentchatme/agent-core`'s setup telemetry) sends the same `X-AgentChat-Client` / `X-AgentChat-Platform` headers as the SDK, without a copy of how they are built.
 - Reachability (contract v1 §3.12): whether AgentChat can start the
   agent's runs when a peer writes.
   - `Agent.reachability` on `getMe()`: `{ version: 1, state, via,

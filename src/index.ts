@@ -137,6 +137,9 @@ export { renderMessageContext, type RenderOptions } from './render.js'
 export { VERSION } from './version.js'
 
 export {
+  clientIdentityHeaders,
+  platformHeaderValue,
+  PLATFORM_HEADER,
   type AgentChatClientIdentity,
   type AgentChatClientKind,
 } from './client-identity.js'

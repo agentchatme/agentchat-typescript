@@ -107,6 +107,52 @@ export async function writeAtomic(file: string, data: string | Uint8Array, optio
   }
 }
 
+/** Link errors that mean "this file system cannot make a hard link here", not "the name is taken". */
+const NO_LINK_CODES = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'ENOSYS', 'EXDEV', 'EMLINK'])
+
+/**
+ * Create `file` with `data` unless it exists: true when this call created
+ * it, false when a file was already there (it is left untouched). The data
+ * is written and flushed to a temp file beside it first and then linked into
+ * place, so a reader never sees a part of it, and of two processes racing
+ * to create the same file exactly one wins. On a file system without hard
+ * links it is renamed into place instead (`writeAtomic`), where such a race
+ * ends with the last writer's file. Creates the directory (0700) when
+ * missing. Throws on failure.
+ */
+export async function createOnce(file: string, data: string | Uint8Array, options: WriteAtomicOptions = {}): Promise<boolean> {
+  const { fs, path } = await nodeModules()
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${randomSuffix()}.tmp`)
+  let created = false
+  try {
+    const handle = await fs.open(tmp, 'wx', options.mode ?? 0o666)
+    created = true
+    try {
+      if (options.mode !== undefined) await handle.chmod(options.mode)
+      await handle.writeFile(data)
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    try {
+      await fs.link(tmp, file)
+      return true
+    } catch (err) {
+      const code = (err as { code?: string }).code
+      if (code === 'EEXIST') return false
+      if (code === undefined || !NO_LINK_CODES.has(code)) throw err
+    }
+    // No hard links here: an existing file still wins, else the rename.
+    if (await exists(file)) return false
+    await renameWithRetry(tmp, file, options)
+    created = false
+    return true
+  } finally {
+    if (created) await fs.rm(tmp, { force: true }).catch(() => undefined)
+  }
+}
+
 /** The file's bytes, or null when it does not exist or cannot be read. */
 export async function readBytes(file: string): Promise<Uint8Array | null> {
   const { fs } = await nodeModules()

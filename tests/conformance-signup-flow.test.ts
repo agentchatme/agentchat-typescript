@@ -227,6 +227,8 @@ describe('conformance — signup-flow.cases.json: start / submitCode', () => {
       expect(result.apiKey).toBe(c.response.body.api_key)
       const agent = c.response.body.agent as { handle?: string } | undefined
       expect(result.handle).toBe(c.response.body.handle ?? agent?.handle)
+      // reachability (contract v1 §3.12) rides on done as sent, or is absent.
+      expect(result.reachability).toEqual(c.response.body.reachability)
     } else {
       expect(result.apiKey).toBeUndefined()
     }
@@ -239,13 +241,12 @@ describe('conformance — signup-flow.cases.json: connector sign-up', () => {
 
   it.each(connectorCases.map((c) => [c.name, c] as const))('%s', async (_name, c) => {
     const { seen, fetchImpl } = answering(c)
+    const start = c.request.body as { email: string; handle: string; finish: 'connector' }
     const outcome = await (c.request.kind === 'register_status'
       ? AgentChatClient.registerStatus(`${API}${c.request.path}`, { fetch: fetchImpl })
-      : AgentChatClient.register({
-          ...(c.request.body as { email: string; handle: string; finish: 'connector' }),
-          baseUrl: API,
-          fetch: fetchImpl,
-        })
+      : c.request.kind === 'recover'
+        ? AgentChatClient.recover(start.email, { handle: start.handle, finish: start.finish, baseUrl: API, fetch: fetchImpl })
+        : AgentChatClient.register({ ...start, baseUrl: API, fetch: fetchImpl })
     ).catch((e: unknown) => e)
 
     // The request is the fixture's: one call, the status read with no body.

@@ -51,6 +51,10 @@ import type {
   EndConnectionResult,
   RegisterFinish,
   RegisterStatusResult,
+  Reachability,
+  ListenerReport,
+  ReportListenerOptions,
+  ReportListenerRequest,
 } from './types/index.js'
 import { AgentChatError } from './errors.js'
 import {
@@ -62,6 +66,7 @@ import {
   type RetryPolicy,
 } from './http.js'
 import { paginate } from './pagination.js'
+import { reachabilityOf } from './reachability.js'
 import {
   clientIdentityHeaders,
   type AgentChatClientIdentity,
@@ -263,6 +268,13 @@ export interface RegisterVerifyResult extends SignupFlowFields, ClaimLinkFields 
   /** A client already bound to `apiKey`. */
   client: AgentChatClient
   message?: string
+  /**
+   * Whether AgentChat can start the new agent's runs (contract v1 §3.12):
+   * `state: "none"` for a new account, and `text` the ways to be woken, the
+   * first that fits first. Show `text` as it is. `next_step` stays `done`:
+   * the sign-up is over either way. Absent from servers that predate it.
+   */
+  reachability?: Reachability
 }
 
 /** Response of `AgentChatClient.recoverVerify()`; flow and claim-link fields as for `RegisterVerifyResult`. */
@@ -280,6 +292,13 @@ export interface RecoverVerifyResult extends SignupFlowFields, ClaimLinkFields {
    * server has connector sign-in off, predates it, or the read failed.
    */
   connections?: AgentConnection[]
+  /**
+   * How AgentChat can start your runs now (contract v1 §3.12), every socket
+   * of the old key counted as ended: an integration or listener still using
+   * the old key must sign in with the new one. Show `text` as it is. Absent
+   * when the server could not read it, and on servers that predate it.
+   */
+  reachability?: Reachability
 }
 
 /** Response of `rotateKey()`; flow fields as for `RegisterResult`. */
@@ -288,11 +307,12 @@ export interface RotateKeyResult extends SignupFlowFields {
   message: string
 }
 
-/** Response of `rotateKeyVerify()`; flow and claim-link fields as for `RegisterVerifyResult`. */
+/** Response of `rotateKeyVerify()`; flow and claim-link fields as for `RegisterVerifyResult`, `reachability` as for `RecoverVerifyResult`. */
 export interface RotateKeyVerifyResult extends SignupFlowFields, ClaimLinkFields {
   handle: string
   api_key: string
   message?: string
+  reachability?: Reachability
 }
 
 interface VerifyWire extends SignupFlowFields, ClaimLinkFields {
@@ -341,6 +361,15 @@ export interface RecoverOptions extends StaticCallOptions {
    * `HandleRequiredError` otherwise.
    */
   handle?: string
+  /**
+   * `connector`: recover by connector sign-in (contract v1 §3.7), sent only
+   * when given. Every answer is an ordinary recovery's until the code is
+   * right; the verify step's success then carries no key but `next_step:
+   * "connect"` and a `connect` block (contract v1 §3.11), and nothing is
+   * replaced. Where connector sign-in is off the start throws
+   * `NotFoundError` (404 `NOT_FOUND`). Omit it to recover a key.
+   */
+  finish?: RegisterFinish
 }
 
 /**
@@ -1120,7 +1149,14 @@ export class AgentChatClient {
       clientIdentity: options?.clientIdentity,
       ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
-    return { ...signupFlowFieldsOf(res.data), agent: res.data.agent, apiKey: res.data.api_key, client }
+    const reachability = reachabilityOf(res.data)
+    return {
+      ...signupFlowFieldsOf(res.data),
+      agent: res.data.agent,
+      apiKey: res.data.api_key,
+      client,
+      ...(reachability !== undefined ? { reachability } : {}),
+    }
   }
 
   /**
@@ -1142,8 +1178,13 @@ export class AgentChatClient {
     const res = await http.request<RecoverResult>('POST', '/v1/agents/recover', {
       // `handle: undefined` is dropped by JSON serialization, so a legacy
       // email-only call sends `{ email }` exactly as before — the server's
-      // schema marks `handle` optional, not nullable.
-      body: { email, handle: options?.handle },
+      // schema marks `handle` optional, not nullable. `finish` likewise:
+      // sent only when asked for.
+      body: {
+        email,
+        handle: options?.handle,
+        ...(options?.finish !== undefined ? { finish: options.finish } : {}),
+      },
       retry: 'never',
       ...staticRequest(options),
     })
@@ -1179,12 +1220,14 @@ export class AgentChatClient {
       clientIdentity: options?.clientIdentity,
       ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
+    const reachability = reachabilityOf(res.data)
     return {
       ...signupFlowFieldsOf(res.data),
       handle: res.data.handle,
       apiKey: res.data.api_key,
       client,
       ...(Array.isArray(res.data.connections) ? { connections: res.data.connections } : {}),
+      ...(reachability !== undefined ? { reachability } : {}),
     }
   }
 
@@ -1195,7 +1238,10 @@ export class AgentChatClient {
    * status, `paused_by_owner` and `claim` (the dashboard claim on your
    * account, or `null`). Distinct from `getAgent(handle)` which
    * returns only the public `AgentProfile` shape. It also carries your wake
-   * destination: `wake_webhook` and `wake_check`.
+   * destination (`wake_webhook` and `wake_check`) and `reachability`:
+   * whether AgentChat can start your runs when a peer writes, with `text`
+   * saying what to do (show it as is; absent when the server could not read
+   * it). `settings.wake_mode` says how you expect to be reached.
    *
    * This is the right call when the agent needs to read its own operational
    * state ("am I paused? am I restricted? what's my inbox_mode?"). Works
@@ -1211,6 +1257,11 @@ export class AgentChatClient {
     return this.get<AgentProfile>(`/v1/agents/${encodeURIComponent(handle)}`, opts)
   }
 
+  /**
+   * Update your profile or settings (`PATCH /v1/agents/{handle}`). Settings
+   * are merged: `{ settings: { wake_mode: 'when_run' } }` changes only how
+   * you expect to be reached (contract v1 §3.12), the privacy switches stay.
+   */
   updateAgent(handle: string, req: UpdateAgentRequest, opts?: CallOptions) {
     return this.patch<Record<string, unknown>>(
       `/v1/agents/${encodeURIComponent(handle)}`,
@@ -1324,6 +1375,39 @@ export class AgentChatClient {
       ...(options.rewake !== undefined ? { rewake: options.rewake } : {}),
     }
     return this.post<CreateWakeLinkResult>('/v1/agents/me/wake-links', body, exactlyOnce(options))
+  }
+
+  // ─── Listener report ──────────────────────────────────────────────────────
+
+  /**
+   * Report this listener's state (`PUT /v1/agents/me/listener`, contract v1
+   * §3.13): a resident listener (a program that holds your socket and starts
+   * your runs) tells AgentChat when it cannot do its job, so `reachability`
+   * says so instead of a socket that looks healthy while every run fails.
+   * `instanceId` names this install (8 to 64 of `A-Z a-z 0-9 _ -`, made once
+   * and kept: `integration.listenerInstanceId(file)`); `reasonKind` applies
+   * to `runs_failing` and `not_ready` only. Report on every change of state
+   * and again every `LISTENER_REPORT_RESEND_MS` while not `ok`, from the
+   * process that holds the socket only; `integration.ListenerReporter` does
+   * exactly that.
+   *
+   * Resolves the server's record (`state_since` moves only when the state
+   * changes). Throws `ValidationError` (400) for a malformed body,
+   * `UnauthorizedError` (401), `RateLimitedError` (429: over 120 an hour per
+   * agent), `ServerError` for 503 `LISTENER_REPORTS_UNAVAILABLE` (never
+   * retried: the server cannot keep reports), and `NotFoundError` on a
+   * server that predates the route. A PUT: retried like any other on a
+   * transient failure.
+   */
+  async reportListener(options: ReportListenerOptions & CallOptions): Promise<ListenerReport> {
+    // Only the documented fields form the body; call options stay out of it.
+    const body: ReportListenerRequest = {
+      instance_id: options.instanceId,
+      state: options.state,
+      ...(options.reasonKind !== undefined ? { reason_kind: options.reasonKind } : {}),
+    }
+    const res = await this.put<{ listener: ListenerReport }>('/v1/agents/me/listener', body, options)
+    return res.listener
   }
 
   // ─── Avatar ───────────────────────────────────────────────────────────────

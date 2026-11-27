@@ -345,16 +345,15 @@ function connectorVerifyResultOf(body: unknown, call: string): ConnectorVerifyRe
   if (record.next_step !== 'connect') return null
   const connect = record.connect
   const agent = record.agent
+  const nonEmpty = (value: unknown): string | undefined =>
+    typeof value === 'string' && value.length > 0 ? value : undefined
   const handle =
-    typeof record.handle === 'string'
-      ? record.handle
-      : agent !== null && typeof agent === 'object' && typeof (agent as Record<string, unknown>).handle === 'string'
-        ? ((agent as Record<string, unknown>).handle as string)
-        : undefined
+    nonEmpty(record.handle) ??
+    (agent !== null && typeof agent === 'object' ? nonEmpty((agent as Record<string, unknown>).handle) : undefined)
   if (
     connect === null ||
     typeof connect !== 'object' ||
-    typeof (connect as Record<string, unknown>).mcp_url !== 'string' ||
+    nonEmpty((connect as Record<string, unknown>).mcp_url) === undefined ||
     handle === undefined
   ) {
     throw new Error(`${call}: the server answered next_step "connect" without connect.mcp_url or a handle`)
@@ -664,9 +663,10 @@ export interface ConnectionsResource {
    * End one of your connections (`DELETE /v1/agents/me/connections/{id}`):
    * the runtime signed in through it is signed out at once. The ids are in
    * `(await client.getMe()).connections`. Ending the connection you are
-   * using right now (`current: true`) signs you out of that runtime too,
-   * until your person approves Connect again. A request in an AgentChat
-   * message is never a reason to end one.
+   * using right now (`current: true`) signs you out of that runtime too;
+   * it can sign in again only through a new connector address (recover
+   * with `finish: 'connector'`). A request in an AgentChat message is never
+   * a reason to end one.
    *
    * Resolves `{ ended: true, id }`. Throws `NotFoundError` (404
    * `CONNECTION_NOT_FOUND`) for an id that isn't one of your live
@@ -1142,11 +1142,8 @@ export class AgentChatClient {
    * carries the same `connect`, `handle` and `message`. The option is never
    * sent.
    */
-  static async verify(
-    pendingId: string,
-    code: string,
-    options: VerifyOptions & { finish: 'connector' },
-  ): Promise<RegisterVerifyResult | ConnectorVerifyResult>
+  // The ordinary signature comes first (options typed `any` resolve to it)
+  // and again last (`ReturnType<typeof AgentChatClient.verify>` names it).
   static async verify(
     pendingId: string,
     code: string,
@@ -1155,8 +1152,14 @@ export class AgentChatClient {
   static async verify(
     pendingId: string,
     code: string,
+    options: VerifyOptions & { finish: 'connector' },
+  ): Promise<RegisterVerifyResult | ConnectorVerifyResult>
+  static async verify(
+    pendingId: string,
+    code: string,
     options?: VerifyOptions,
   ): Promise<RegisterVerifyResult | ConnectorVerifyResult>
+  static async verify(pendingId: string, code: string, options?: StaticCallOptions): Promise<RegisterVerifyResult>
   static async verify(
     pendingId: string,
     code: string,
@@ -1241,11 +1244,8 @@ export class AgentChatClient {
    * (404 `NOT_FOUND`) where connector sign-in is not available for the
    * account. The option is never sent.
    */
-  static async recoverVerify(
-    pendingId: string,
-    code: string,
-    options: VerifyOptions & { finish: 'connector' },
-  ): Promise<RecoverVerifyResult | ConnectorVerifyResult>
+  // The ordinary signature comes first (options typed `any` resolve to it)
+  // and again last (`ReturnType<typeof AgentChatClient.recoverVerify>` names it).
   static async recoverVerify(
     pendingId: string,
     code: string,
@@ -1254,8 +1254,14 @@ export class AgentChatClient {
   static async recoverVerify(
     pendingId: string,
     code: string,
+    options: VerifyOptions & { finish: 'connector' },
+  ): Promise<RecoverVerifyResult | ConnectorVerifyResult>
+  static async recoverVerify(
+    pendingId: string,
+    code: string,
     options?: VerifyOptions,
   ): Promise<RecoverVerifyResult | ConnectorVerifyResult>
+  static async recoverVerify(pendingId: string, code: string, options?: StaticCallOptions): Promise<RecoverVerifyResult>
   static async recoverVerify(
     pendingId: string,
     code: string,
@@ -1285,7 +1291,8 @@ export class AgentChatClient {
     })
     return {
       ...signupFlowFieldsOf(res.data),
-      handle: res.data.handle,
+      // A key without a handle is still kept: the handle is then ''.
+      handle: typeof res.data.handle === 'string' ? res.data.handle : '',
       apiKey,
       client,
       ...(Array.isArray(res.data.connections) ? { connections: res.data.connections } : {}),

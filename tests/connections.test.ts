@@ -1,3 +1,4 @@
+import { inspect } from 'node:util'
 import { describe, expect, it, vi } from 'vitest'
 import { AgentChatClient } from '../src/client.js'
 import {
@@ -267,10 +268,55 @@ describe('AgentChatClient.verify / recoverVerify on a connector answer', () => {
     },
   )
 
+  it('ConnectorSignupError never prints the grant or the claim link: JSON, util.inspect, spreads', async () => {
+    const { fetch } = capture([() => json(201, registerConnect)])
+    const err = (await AgentChatClient.verify('pnd_example', '123456', { fetch }).catch((e: unknown) => e)) as ConnectorSignupError
+    expect(err).toBeInstanceOf(ConnectorSignupError)
+    // Still there to use.
+    expect(err.connect.mcp_url).toBe(CONNECT.mcp_url)
+    expect(err.result.connect.resource).toBe(CONNECT.resource)
+    expect(err.result.claim_url).toBe(registerConnect.claim_url)
+    // Not enumerable: spreads, Object.keys and plain logging of fields leave them out.
+    expect(Object.keys(err)).not.toContain('connect')
+    expect(Object.keys(err)).not.toContain('result')
+    expect({ ...err }).not.toHaveProperty('connect')
+
+    const written = JSON.stringify(err)
+    const shown = inspect(err, { depth: 10 })
+    const nested = JSON.stringify({ error: err })
+    for (const out of [written, shown, nested]) {
+      expect(out).not.toContain('acg_')
+      expect(out).not.toContain('acl_')
+      expect(out).toContain('https://api.agentchat.me/mcp/connector/***')
+    }
+    const parsed = JSON.parse(written) as Record<string, unknown>
+    expect(parsed).toMatchObject({
+      name: 'ConnectorSignupError',
+      code: 'CONNECTOR_SIGNUP',
+      status: 201,
+      handle: 'my-agent',
+      connect: { ...CONNECT, mcp_url: 'https://api.agentchat.me/mcp/connector/***', resource: 'https://api.agentchat.me/mcp/connector/***' },
+      details: { version: 1, flow: 'register', next_step: 'connect', status: 'approved' },
+    })
+    expect((parsed.result as Record<string, unknown>).claim_url).toBe('https://app.agentchat.me/claim/***')
+    expect(shown).toContain('ConnectorSignupError')
+    expect(shown).toContain('CONNECTOR_SIGNUP')
+  })
+
+  it('recoverVerify keeps a key that came without a handle: handle is empty', async () => {
+    const { fetch } = capture([() => json(200, { ...recoverDone, handle: undefined })])
+    const result = await AgentChatClient.recoverVerify('pnd_example', '123456', { fetch })
+    expect(result.handle).toBe('')
+    expect(result.apiKey).toBe(recoverDone.api_key)
+    expect(result.client).toBeInstanceOf(AgentChatClient)
+  })
+
   it.each([
     ['no connect block', { ...recoverConnect, connect: undefined }],
     ['no mcp_url', { ...recoverConnect, connect: { ...CONNECT, mcp_url: undefined } }],
     ['no handle', { ...recoverConnect, handle: undefined }],
+    ['an empty mcp_url', { ...recoverConnect, connect: { ...CONNECT, mcp_url: '' } }],
+    ['an empty handle', { ...recoverConnect, handle: '' }],
   ])('a connect answer with %s throws, with or without finish', async (_what, body) => {
     for (const options of [{}, { finish: 'connector' as const }]) {
       const { fetch } = capture([() => json(200, body)])

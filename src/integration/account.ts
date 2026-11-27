@@ -156,7 +156,9 @@ export interface StepResult {
   /**
    * On `connect`: the connector address (`mcp_url`, a one-use grant: use it
    * as it is) and its sign-in endpoints, as the server sent them. Add the
-   * connector from it before `connect.expires_at`; no key comes.
+   * connector from it before `connect.expires_at`; no key comes. In the
+   * clear, as `apiKey` is: the step result is plain data to act on or save.
+   * Don't log it.
    */
   connect?: ConnectorSignupConnect
   /** `HANDLE_REQUIRED`: the handles on this email (`details.handles`), to choose from. */

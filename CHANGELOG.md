@@ -24,13 +24,18 @@ Connector sign-in as the server answers it since 2026-11-25: `register` and `rec
   and no `client`. The server's answer decides: with the option, an
   ordinary `done` answer (the key came) still resolves the ordinary
   result; tell them apart with `'connect' in result`. Without the option,
-  the ordinary types are unchanged.
+  the ordinary types are unchanged, also for options typed `any` and for
+  `ReturnType<typeof AgentChatClient.verify>` (a type-level test,
+  `tests/verify-overloads.test-d.ts`, now runs with the tests).
 - `ConnectorSignupError` (an `AgentChatError`, code `CONNECTOR_SIGNUP`,
   set by the SDK; `status` the answer's 2xx): thrown by `verify()` and
   `recoverVerify()` without `finish: 'connector'` when the answer is
   `next_step: "connect"`. It carries `connect`, `handle`, `message`, the
   whole answer in `result`, and the flow in `details`, so the one-use
-  connector address is not lost.
+  connector address is not lost. `connect` and `result` are not
+  enumerable, and `JSON.stringify(err)` and `util.inspect(err)` (so
+  `console.log` / `console.error` on Node) show the grant in `mcp_url` and
+  `resource`, and any claim link, as `***`; `err.connect` is the real one.
 - `integration.account`: `start('register' | 'recover', { ..., finish:
   'connector' })` sends `finish` (only when given; `RegisterInput` and
   `RecoverInput` gain it). On action `connect` the step result
@@ -76,7 +81,9 @@ Connector sign-in as the server answers it since 2026-11-25: `register` and `rec
 
 - `verify()` and `recoverVerify()` no longer build a client with an
   undefined key: a connector answer resolves or throws as above, and any
-  other 2xx without an `api_key` throws.
+  other 2xx without an `api_key` throws. A connect answer with an empty or
+  missing `connect.mcp_url` or handle throws too. A recovery answer with a
+  key and no handle keeps the key, with `handle: ''`.
 
 ## 1.10.0 — 2026-11-24
 

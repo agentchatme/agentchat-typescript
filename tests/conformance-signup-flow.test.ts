@@ -18,6 +18,7 @@ import {
   type AgentChatErrorResponse,
 } from '../src/errors.js'
 import type { ConnectorVerifyResult, RegisterFinish, SignupFlow } from '../src/types/index.js'
+import type { RecoverVerifyResult, RegisterVerifyResult, VerifyOptions } from '../src/client.js'
 
 // ─── signup-flow.cases.json (contract v1, "Sign-up flows") ──────────────────
 //
@@ -280,29 +281,45 @@ function expectedConnectorResult(c: SignupCase): ConnectorVerifyResult {
   }
 }
 
-describe('conformance — signup-flow.cases.json: connector sign-in through the client', () => {
-  const startCases = fixture.cases.filter(hasFinish)
-  const connectCases = fixture.cases.filter((c) => c.expect.action === 'connect')
+// The client's static calls, against the fixture's responses. A start is
+// register(body) / recover(email, body); a verify is every verify and
+// recover_verify case a client can send (a body with a pending id and a
+// code: `verify-invalid-json` is a request no client method makes), with and
+// without `finish: 'connector'`, which is never sent: the answer decides.
+const CLIENT_START_CASES = fixture.cases.filter((c) => c.request.kind === 'register' || c.request.kind === 'recover')
+const CLIENT_VERIFY_CASES = fixture.cases.filter(
+  (c) =>
+    (c.request.kind === 'verify' || c.request.kind === 'recover_verify') &&
+    typeof c.request.body.pending_id === 'string' &&
+    typeof c.request.body.code === 'string',
+)
 
+describe('conformance — signup-flow.cases.json: the client’s static calls', () => {
   it('has connector starts and connect answers for both register and recover', () => {
-    expect(startCases.map((c) => c.request.kind).sort()).toEqual(['recover', 'register'])
-    expect(connectCases.map((c) => c.request.kind).sort()).toEqual(['recover_verify', 'verify'])
+    expect(fixture.cases.filter(hasFinish).map((c) => c.request.kind).sort()).toEqual(['recover', 'register'])
+    expect(
+      fixture.cases
+        .filter((c) => c.expect.action === 'connect')
+        .map((c) => c.request.kind)
+        .sort(),
+    ).toEqual(['recover_verify', 'verify'])
+    expect(CLIENT_VERIFY_CASES.filter((c) => c.expect.action === 'done').length).toBeGreaterThan(0)
   })
 
-  it.each(startCases.map((c) => [c.name, c] as const))('%s: register / recover with finish', async (_name, c) => {
+  it.each(CLIENT_START_CASES.map((c) => [c.name, c] as const))('%s: register / recover', async (_name, c) => {
     const { seen, fetchImpl } = answering(c)
-    const body = c.request.body as { email: string; handle?: string; finish: RegisterFinish }
+    const body = c.request.body as { email: string; handle?: string; finish?: RegisterFinish }
+    const options = { baseUrl: API, fetch: fetchImpl }
     const outcome = await (c.request.kind === 'recover'
       ? AgentChatClient.recover(body.email, {
           ...(body.handle !== undefined ? { handle: body.handle } : {}),
-          finish: body.finish,
-          baseUrl: API,
-          fetch: fetchImpl,
+          ...(body.finish !== undefined ? { finish: body.finish } : {}),
+          ...options,
         })
-      : AgentChatClient.register({ ...(body as { email: string; handle: string }), finish: body.finish, baseUrl: API, fetch: fetchImpl })
+      : AgentChatClient.register({ ...(body as { email: string; handle: string; finish?: RegisterFinish }), ...options })
     ).catch((e: unknown) => e)
 
-    // The request is the fixture's: one call.
+    // The request is the fixture's: one call; finish only when the case has it.
     expect(seen).toEqual([{ method: c.request.method, path: c.request.path, body: c.request.body }])
     if (isError(c)) {
       expect(outcome).toBeInstanceOf(AgentChatError)
@@ -310,38 +327,62 @@ describe('conformance — signup-flow.cases.json: connector sign-in through the 
       expect((outcome as AgentChatError).message).toBe(c.expect.message)
       expect(flowOf(outcome)).toEqual(flowOf(c.response.body))
     } else {
+      // A start with finish is the ordinary pending start: the body as served.
       expect(outcome).toEqual(c.response.body)
     }
   })
 
-  it.each(connectCases.map((c) => [c.name, c] as const))('%s: verify with finish: connector', async (_name, c) => {
+  it.each(
+    CLIENT_VERIFY_CASES.flatMap((c) =>
+      [undefined, 'connector' as const].map((finish) => [c.name, finish ?? 'no finish', c, finish] as const),
+    ),
+  )('%s (%s): verify / recoverVerify', async (_name, _label, c, finish) => {
     const { seen, fetchImpl } = answering(c)
     const body = c.request.body as { pending_id: string; code: string }
     const call = c.request.kind === 'recover_verify' ? AgentChatClient.recoverVerify : AgentChatClient.verify
-    const result = await call(body.pending_id, body.code, { finish: 'connector', baseUrl: API, fetch: fetchImpl })
+    const options: VerifyOptions = { baseUrl: API, fetch: fetchImpl, ...(finish !== undefined ? { finish } : {}) }
+    const outcome: unknown = await call(body.pending_id, body.code, options).catch((e: unknown) => e)
+    const served = c.response.body
 
     // The request is the fixture's: one call, and finish is never sent.
     expect(seen).toEqual([{ method: c.request.method, path: c.request.path, body: c.request.body }])
-    expect(result).toEqual(expectedConnectorResult(c))
-    expect(result).not.toHaveProperty('apiKey')
-    expect(result).not.toHaveProperty('client')
-    expectFlow(flowOf(result), c.expect.flow)
-  })
-
-  it.each(connectCases.map((c) => [c.name, c] as const))('%s: verify without finish throws ConnectorSignupError', async (_name, c) => {
-    const { seen, fetchImpl } = answering(c)
-    const body = c.request.body as { pending_id: string; code: string }
-    const call = c.request.kind === 'recover_verify' ? AgentChatClient.recoverVerify : AgentChatClient.verify
-    const err = await call(body.pending_id, body.code, { baseUrl: API, fetch: fetchImpl }).catch((e: unknown) => e)
-
-    expect(seen).toHaveLength(1)
-    expect(err).toBeInstanceOf(ConnectorSignupError)
-    const e = err as ConnectorSignupError
-    expect(e.message).toBe(c.expect.message)
-    expect(e.status).toBe(c.response.status)
-    expect(e.connect).toEqual(c.response.body.connect)
-    expect(e.result).toEqual(expectedConnectorResult(c))
-    expectFlow(flowOf(e), c.expect.flow)
-    expect(actionOf(flowOf(e), c.response.status, c.request.kind)).toBe('connect')
+    if (isError(c)) {
+      expect(outcome).toBeInstanceOf(AgentChatError)
+      expect(outcome).not.toBeInstanceOf(ConnectorSignupError)
+      expect((outcome as AgentChatError).code).toBe(c.expect.code)
+      expect((outcome as AgentChatError).message).toBe(c.expect.message)
+      return
+    }
+    if (c.expect.action === 'done') {
+      // A key came: the ordinary result, finish or not, with a client bound to it.
+      const result = outcome as RegisterVerifyResult | RecoverVerifyResult
+      expect(result).not.toHaveProperty('connect')
+      expect(result.apiKey).toBe(served.api_key)
+      expect(result.client).toBeInstanceOf(AgentChatClient)
+      expect(result.message).toBe(c.expect.message)
+      if (c.request.kind === 'recover_verify') expect((result as RecoverVerifyResult).handle).toBe(served.handle)
+      else expect((result as RegisterVerifyResult).agent).toEqual(served.agent)
+      expectFlow(flowOf(result), c.expect.flow)
+      return
+    }
+    expect(c.expect.action, c.name).toBe('connect')
+    if (finish === undefined) {
+      // No connector result asked for: an error that still carries the address.
+      expect(outcome).toBeInstanceOf(ConnectorSignupError)
+      const e = outcome as ConnectorSignupError
+      expect(e.message).toBe(c.expect.message)
+      expect(e.code).toBe('CONNECTOR_SIGNUP')
+      expect(e.status).toBe(c.response.status)
+      expect(e.connect).toEqual(served.connect)
+      expect(e.handle).toBe(expectedConnectorResult(c).handle)
+      expect(e.result).toEqual(expectedConnectorResult(c))
+      expectFlow(flowOf(e), c.expect.flow)
+      expect(actionOf(flowOf(e), c.response.status, c.request.kind)).toBe('connect')
+      return
+    }
+    expect(outcome).toEqual(expectedConnectorResult(c))
+    expect(outcome).not.toHaveProperty('apiKey')
+    expect(outcome).not.toHaveProperty('client')
+    expectFlow(flowOf(outcome), c.expect.flow)
   })
 })

@@ -83,6 +83,12 @@ export interface ConnectorSignupConnect {
  * answer may carry a claim link, as an ordinary `done` does (`message` then
  * includes it). There is no `apiKey` and no client: the connector signs in,
  * not this process.
+ *
+ * `connect.mcp_url` signs the account in once, to whoever uses it first,
+ * and it is in the clear here, as `RegisterVerifyResult.apiKey` holds the
+ * key: this is the value you asked for, to use, save or hand to the
+ * runtime. Don't log it. (`ConnectorSignupError`, which can reach a log
+ * nobody chose, redacts it when printed.)
  */
 export interface ConnectorVerifyResult extends SignupFlowFields, ClaimLinkFields {
   /** The account's handle, as the server returned it (`agent.handle` on register, `handle` on recover). */

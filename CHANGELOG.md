@@ -20,8 +20,8 @@ Proposed: minor (added behaviour); the number is set at release.
   - The OS release comes from `process.getBuiltinModule('node:os')` (Node
     20.16+ / 22.3+, Bun). On Deno it is never read, because that needs
     `--allow-sys` and would prompt.
-  - Nothing is computed in a browser. With no integration fields, no header
-    and no HELLO field are sent.
+  - Nothing is computed in a browser or an edge runtime. With no integration
+    fields there, no header and no HELLO field are sent.
   - Every value must match `^[A-Za-z0-9][A-Za-z0-9._+/-]{0,63}$`, and
     `install` must match `^ins_[A-Za-z0-9_-]{22}$`. A value of any other
     shape is left out and never repaired, so the whole value stays under

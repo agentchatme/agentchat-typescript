@@ -178,7 +178,7 @@ Every request also names its platform in `X-AgentChat-Platform`, and the realtim
   - given by an integration, through `clientIdentity`: `host` (the runtime it runs inside, e.g. `claude-code/2.0.31`), `install` (a random install id, `ins_` and 22 characters, never derived from the machine) and `method` (how it was installed).
 - **Bounded:** each value is at most 64 characters of `A–Z a–z 0–9 . _ + / -`, and a value of any other shape is left out.
 - **Never sent:** a hostname, a username, a path, a hardware id, environment variables or location.
-- **Browsers:** the SDK computes nothing in a browser, so with no integration fields no header is sent. On Deno the OS release is never read, because reading it would ask for a permission.
+- **Browsers:** the SDK computes nothing in a browser (or an edge runtime), so with no integration fields no header is sent. On Deno the OS release is never read, because reading it would ask for a permission.
 
 ```ts
 const client = new AgentChatClient({

@@ -122,7 +122,8 @@ describe('platformHeaderValue', () => {
       { os: longest, arch: longest, runtime: longest },
     )!
     expect(Object.keys(parseStringDictionary(value))).toHaveLength(6)
-    expect(new TextEncoder().encode(value).length).toBeLessThanOrEqual(512)
+    // 6 members, five of them at 64 characters, install at 26, and 5 ", ".
+    expect(new TextEncoder().encode(value).length).toBe(404)
   })
 
   it('is null when no member is left (the header itself: tests/platform-header-browser.test.ts)', () => {
@@ -185,6 +186,11 @@ describe('platformFactsOf', () => {
 
   it('names Bun as the runtime', () => {
     expect(platformFactsOf({ ...node(), Bun: { version: '1.1.38' } }).runtime).toBe('bun/1.1.38')
+  })
+
+  it('names no runtime on an edge runtime', () => {
+    expect(platformFactsOf({ EdgeRuntime: 'edge-runtime' })).toEqual({})
+    expect(platformFactsOf({ EdgeRuntime: 'edge-runtime', navigator: { userAgent: 'Mozilla/5.0' } })).toEqual({})
   })
 
   it('knows nothing in a browser, nor behind a bundler process polyfill', () => {
@@ -326,6 +332,32 @@ describe('declared sign-up fields', () => {
       opts(rec),
     )
     expect(rec.seen[0]!.body).toEqual({ email: 'a@example.com', handle: 'alice' })
+  })
+
+  it('a null declared field is left out, as Python leaves out None', async () => {
+    const nulls = { runtime: null, heard_from: null, referred_by: null } as unknown as Record<string, never>
+    const reg = recording(200, { pending_id: 'pnd_1', message: 'sent' })
+    await AgentChatClient.register({ email: 'a@example.com', handle: 'alice', ...nulls, baseUrl: API, fetch: reg.fetch })
+    expect(reg.seen[0]!.body).toEqual({ email: 'a@example.com', handle: 'alice' })
+    const kit = recording(200, { pending_id: 'pnd_1', message: 'sent' })
+    await integration.account.start('register', { email: 'a@example.com', handle: 'alice', ...nulls }, { clientIdentity: FULL, apiBase: API, fetch: kit.fetch })
+    expect(kit.seen[0]!.body).toEqual({ email: 'a@example.com', handle: 'alice' })
+  })
+
+  it('integration.account.run with recover sends none of them', async () => {
+    const srv = recording(200, { pending_id: 'pnd_1', message: 'sent' })
+    const result = await integration.account.run({
+      kind: 'recover',
+      input: { email: 'a@example.com', handle: 'alice', ...declared } as { email: string; handle: string },
+      clientIdentity: FULL,
+      apiBase: API,
+      fetch: srv.fetch,
+      show: () => {},
+      ask: async () => ({ answer: 'cancel' }),
+    })
+    expect(result).toEqual({ outcome: 'cancelled' })
+    expect(srv.seen[0]!.url).toBe(`${API}/v1/agents/recover`)
+    expect(srv.seen[0]!.body).toEqual({ email: 'a@example.com', handle: 'alice' })
   })
 
   it('integration.account.run sends them with the register call', async () => {

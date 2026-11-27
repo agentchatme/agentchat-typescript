@@ -532,16 +532,18 @@ export async function start(
   const steps = STEPS[kind]
   if (steps === undefined) throw new TypeError(`integration.account.start: unknown kind ${JSON.stringify(kind)}`)
   if (!isRecord(input)) throw new TypeError('integration.account.start: input must be an object')
+  const register = input as RegisterInput
   const body =
     kind === 'register'
       ? {
           email: input.email,
           handle: input.handle,
-          display_name: (input as RegisterInput).display_name,
-          description: (input as RegisterInput).description,
-          runtime: (input as RegisterInput).runtime,
-          heard_from: (input as RegisterInput).heard_from,
-          referred_by: (input as RegisterInput).referred_by,
+          display_name: register.display_name,
+          description: register.description,
+          // The declared fields: sent only when given (never null); the server judges them.
+          ...(register.runtime != null ? { runtime: register.runtime } : {}),
+          ...(register.heard_from != null ? { heard_from: register.heard_from } : {}),
+          ...(register.referred_by != null ? { referred_by: register.referred_by } : {}),
         }
       : { email: input.email, handle: input.handle }
   const answer = await call(options, 'POST', steps.startPath, body)

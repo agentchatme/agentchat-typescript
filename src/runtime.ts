@@ -70,12 +70,13 @@ export interface PlatformFacts {
  *   the os is the platform alone. Deno is never asked: its `os.release()`
  *   needs `--allow-sys` and would put a permission prompt in front of the
  *   person.
- * - runtime is `detectRuntime()`'s token, unless that is `browser` or `unknown`.
+ * - runtime is `detectRuntime()`'s token for Node, Bun and Deno; nothing elsewhere
+ *   (a browser, an edge runtime).
  */
 export function platformFactsOf(g: RuntimeGlobals): PlatformFacts {
   const facts: { os?: string; arch?: string; runtime?: string } = {}
   const runtime = detectRuntime(g)
-  if (runtime !== 'browser' && runtime !== 'unknown') facts.runtime = runtime
+  if (/^(?:node|bun|deno)\//.test(runtime)) facts.runtime = runtime
   const proc = g.process
   if (typeof proc?.versions?.node !== 'string') return facts
   if (typeof proc.arch === 'string') facts.arch = proc.arch

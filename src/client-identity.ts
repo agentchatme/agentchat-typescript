@@ -49,7 +49,7 @@ const INSTALL_ID = /^ins_[A-Za-z0-9_-]{22}$/
  * - Every value `^[A-Za-z0-9][A-Za-z0-9._+/-]{0,63}$`; `install`
  *   `^ins_[A-Za-z0-9_-]{22}$`. A value of another shape is left out, never
  *   repaired. So nothing needs escaping, and the whole value stays under 512
- *   bytes (at most 454).
+ *   bytes (at most 404).
  *
  * `null` when no member is left: then nothing is sent.
  */

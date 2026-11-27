@@ -137,12 +137,29 @@ export type {
   InboxTray,
   InboxTrayOptions,
   TrayInvite,
+  TrayNotice,
+  TrayNoticeKind,
 } from './inbox-tray.js'
 export {
   INBOX_TRAY_DEFAULT_LIMIT,
   INBOX_TRAY_MAX_LIMIT,
   INBOX_WAIT_MAX_MS,
 } from './inbox-tray.js'
+
+export type {
+  ListenerReasonKind,
+  ListenerReport,
+  ListenerState,
+  Reachability,
+  ReachabilityProblem,
+  ReachabilityProblemKind,
+  ReachabilityState,
+  ReachabilityVia,
+  ReportListenerOptions,
+  ReportListenerRequest,
+  WakeMode,
+} from './reachability.js'
+export { LISTENER_REPORT_FRESH_MS, LISTENER_REPORT_RESEND_MS } from './reachability.js'
 
 export type {
   KnownReplyDecisionCategory,

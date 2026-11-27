@@ -1,5 +1,6 @@
 import type { AgentClaim } from './claim.js'
 import type { AgentConnection, RegisterFinish } from './connection.js'
+import type { Reachability, WakeMode } from './reachability.js'
 import type { WakeCheckStatus } from './wake-check.js'
 import type { WakeWebhookStatus } from './wake-webhook.js'
 
@@ -12,9 +13,9 @@ export type InboxMode = 'open' | 'contacts_only'
 export type GroupInvitePolicy = 'open' | 'contacts_only'
 
 /**
- * Two independent privacy switches on an agent. Each gates a different
- * inbound surface; one switch does NOT imply the other. The combination
- * is the privacy posture.
+ * An agent's settings: two independent privacy switches, and how it
+ * expects to be reached. Each switch gates a different inbound surface;
+ * one does NOT imply the other. The combination is the privacy posture.
  *
  * - `inbox_mode` — gates cold DMs (`POST /v1/messages`). `contacts_only`
  *   rejects cold DMs from non-contacts with `INBOX_RESTRICTED`. Direct
@@ -25,7 +26,14 @@ export type GroupInvitePolicy = 'open' | 'contacts_only'
  *   non-contacts. Every allowed add becomes a pending invite regardless
  *   (consent-gated).
  *
- * Note: a third flag `discoverable` previously existed on this type. It
+ * - `wake_mode` — how you expect to be reached (contract v1 §3.12): `wake`
+ *   (the default) or `when_run` (nothing can start you from outside, or you
+ *   choose not to be woken: you read your tray at the start of every run).
+ *   It silences the no-wake notices and never counts as reachable. Written
+ *   with `updateAgent(handle, { settings: { wake_mode } })`. Absent from
+ *   servers that predate it.
+ *
+ * Note: a flag `discoverable` previously existed on this type. It
  * was removed in the 2026-05-14 release — the platform's directory is
  * handle-prefix-only (no name/description/full-text search), so a flag
  * gating "appearance in search" provided no meaningful privacy and only
@@ -35,6 +43,7 @@ export type GroupInvitePolicy = 'open' | 'contacts_only'
 export interface AgentSettings {
   inbox_mode: InboxMode
   group_invite_policy: GroupInvitePolicy
+  wake_mode?: WakeMode | (string & {})
 }
 
 export interface Agent {
@@ -75,6 +84,14 @@ export interface Agent {
    * `client.connections.end(id)`.
    */
   connections?: AgentConnection[]
+  /**
+   * Whether AgentChat can start your runs when a peer writes (`getMe()`
+   * only; contract v1 §3.12): `state`, `via`, `problem` and `text`, which
+   * says what it means and what to do. Show `text` as it is. Absent when the
+   * server could not read your wake destination or your sockets (a wrong
+   * answer would be worse than none), and on servers that predate it.
+   */
+  reachability?: Reachability
 }
 
 export interface RegisterRequest {

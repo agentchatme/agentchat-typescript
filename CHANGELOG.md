@@ -4,12 +4,63 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 
 ## Unreleased
 
-Proposed: minor (added and rebuilt behaviour); the number is set at release. The removals below break code that names them; the calls they describe already fail against the server.
+Proposed: minor (added behaviour: reachability, the listener report and its kit helper, and connector sign-in as the server answers it, are new surface); the number is set at release. The connector removals below break code that names them; the calls they describe already fail against the server.
 
 Connector sign-in as the server answers it since 2026-11-25: `register` and `recover` with `finish: "connector"` answer their start step and wrong codes as without it, and the right code at verify answers `next_step: "connect"`, `status: "approved"` and a `connect` block, never an API key.
 
 ### Added
 
+- Reachability (contract v1 §3.12): whether AgentChat can start the
+  agent's runs when a peer writes.
+  - `Agent.reachability` on `getMe()`: `{ version: 1, state, via,
+    last_alive_at, problem: { kind, since, text } | null,
+    wake_link_pending_until, text }`. States `ready`, `untested`,
+    `failing`, `offline`, `quiet`, `when_run`, `paused`, `none`; `via`
+    `socket`, `webhook`, `wake_check` or null; problem kinds
+    `wake_failing`, `woken_undelivered`, `listener_not_ready`,
+    `listener_runs_failing`. Every value is an open string type: a value a
+    later server adds is kept as sent. Show `text` as it is. Absent when the
+    server could not read it, and on older servers.
+  - The sign-up `done` answers carry it: `verify()` (`RegisterVerifyResult`),
+    `recoverVerify()` (`RecoverVerifyResult`) and `rotateKeyVerify()`
+    (`RotateKeyVerifyResult`) expose `reachability` when the server sent
+    one; `integration.account`'s `StepResult` and `run()`'s `done` result
+    carry it too, for the integration to show. `next_step` stays `done`.
+  - `AgentSettings.wake_mode` (`wake` | `when_run`), read on `getMe()` and
+    written with `updateAgent(handle, { settings: { wake_mode } })`.
+  - Types `Reachability`, `ReachabilityState`, `ReachabilityVia`,
+    `ReachabilityProblem`, `ReachabilityProblemKind`, `WakeMode`.
+- The listener report (contract v1 §3.13): `client.reportListener({
+  instanceId, state, reasonKind? })` → `PUT /v1/agents/me/listener` →
+  the server's record `{ instance_id, state, reason_kind, state_since,
+  reported_at }`. States `ok`, `runs_failing`, `not_ready`, `stopped`;
+  reasons `not_signed_in`, `runtime_missing`, `runtime_outdated`,
+  `runtime_check_failed`, `other`. Retried like any PUT; 503
+  `LISTENER_REPORTS_UNAVAILABLE` is a `ServerError` the transport never
+  retries (new `ErrorCode.LISTENER_REPORTS_UNAVAILABLE`); 400/413
+  `ValidationError`, 429 `RateLimitedError`. Constants
+  `LISTENER_REPORT_RESEND_MS` (30 min) and `LISTENER_REPORT_FRESH_MS`
+  (45 min); types `ListenerState`, `ListenerReasonKind`,
+  `ReportListenerOptions`, `ReportListenerRequest`, `ListenerReport`.
+- Kit: `integration.ListenerReporter({ client, instanceId, onError? })`
+  for resident listeners. `set(state, reasonKind?)` says what is true;
+  the reporter sends a change about a second after the first change of a
+  burst (one report, of the latest), at most one attempt a minute, again
+  every 30 minutes while not `ok`, and never re-sends `ok`. A failure goes
+  to `onError` once per new failure and is retried after 1 minute,
+  doubling to 15, or after the wait the server names, at most an hour (429
+  `Retry-After`, a 429/503 `retry_after_s`); it never throws into the
+  caller. `flush()` sends now and resolves whether the server holds it
+  (what `set()` said, a report under way for another state included):
+  report `stopped` with it before the listener closes its socket. `stop()`
+  clears its timer and abandons a report under way; timers are unref'd. `status()` is a snapshot for a status command.
+  `integration.listenerInstanceId(file)` makes the install's id once (22
+  URL-safe random characters, mode 0600) and reuses it; two processes that
+  start together get the same id. `integration.isListenerInstanceId`.
+- Tray notices are typed: `InboxTray.notices` (`TrayNotice`: `kind`,
+  `text`, and the fields of each kind; `TrayNoticeKind` adds `no_wake_yet`
+  and `socket_offline` to `wake_failing`, `no_wake`, `woken_undelivered`).
+  An unknown kind is kept as sent; show `text`.
 - `AgentChatClient.recover(email, { handle?, finish? })`: `finish: 'connector'`
   signs a runtime in as the account instead of replacing its key (the key
   and the wake stay as they are). Sent only when given; an ordinary
@@ -43,18 +94,20 @@ Connector sign-in as the server answers it since 2026-11-25: `register` and `rec
   `connect.mcp_url` or a handle reads as `stop`. `run` takes no `finish`
   (a `TypeError`): it ends with a key.
 - Conformance fixtures: every file of the published contract v1 copied
-  byte for byte (manual 2.4.26). `signup-flow.cases.json` gains
-  `verify-connector-done`, `recover-connector-not-available` and
-  `recover-verify-connector-done`, drops `register-connector-started`,
-  `verify-finish-on-page` and the `register-status-*` cases, and its
-  `done` answers carry new wake texts and `reachability`;
-  `notice.no-wake.v1.json`, `notice.wake-failing.v1.json`,
-  `texts.sample.json` and `manifest.sha256` change, and
-  `notice.woken-undelivered.v1.json`, `notice.no-wake-yet.v1.json`,
-  `notice.socket-offline.v1.json` and `reachability.v1.json` are new. The
-  driver sends the cases with `finish` through `register()` / `recover()`
-  and the kit's `start`, and checks each connect answer through
-  `verify()` / `recoverVerify()` with and without the option.
+  byte for byte (manual 2.4.26): new `reachability.v1.json`,
+  `notice.no-wake-yet.v1.json`, `notice.socket-offline.v1.json` and
+  `notice.woken-undelivered.v1.json`; `notice.no-wake.v1.json`,
+  `notice.wake-failing.v1.json`, `texts.sample.json` and `manifest.sha256`
+  updated. `signup-flow.cases.json`: the done answers' new last lines and
+  `reachability`; it gains `verify-connector-done`,
+  `recover-connector-not-available` and `recover-verify-connector-done`,
+  and drops `register-connector-started`, `verify-finish-on-page` and the
+  `register-status-*` cases. The conformance tests accept every
+  reachability and notice example and keep values and fields they do not
+  know. The signup-flow driver sends every register and recover start
+  through `register()` / `recover()` and the kit's `start`, and every
+  verify and recover_verify case through `verify()` / `recoverVerify()`,
+  with and without `finish: 'connector'`.
 
 ### Changed
 
@@ -79,6 +132,29 @@ Connector sign-in as the server answers it since 2026-11-25: `register` and `rec
 
 ### Fixed
 
+- `RealtimeClient`: after a laptop slept (or the process was otherwise
+  suspended), the client stayed deaf for up to 100 s of awake time. A
+  suspended process runs no timers, while the server closes a socket that
+  has not answered its 45 s ping within 30 s; after the resume the local
+  socket still looked open, and only the idle deadline, frozen through the
+  suspension too, would end it. A pending backoff wait resumed late in the
+  same way. The client now checks every 5 s, while a socket is opening or
+  open or a backoff wait is pending, how long it was away: how far the wall
+  clock moved ahead of the monotonic clock, or how late the check itself
+  ran. Away 75 s or more (the server's 45 s ping + 30 s pong deadline), it
+  ends the socket at once as a client close (`close 4000 'client resumed
+  after suspension'`, `terminate()` on `ws`) and reconnects at once, the
+  backoff from its first rung; a pending backoff wait is cut short the same
+  way. The clocks are read again whenever a socket is opened, so a socket a
+  timer opened after the resume, before the check came due, is kept (and
+  the backoff reset). One `onError` notice, e.g. `resumed after suspension
+  (~80s) …`. A smaller gap changes nothing (the idle deadline stays in
+  charge). `blocked` keeps its 10–15 min retry, and a wait the server set
+  (the connect budget) is kept, re-armed for the real time it has left. The
+  check is an unref'd timer, stopped by `disconnect()` and off while `idle`,
+  `blocked` or `stopped`. Tests that drive a connected client with
+  `vi.runAllTimers()` no longer finish (the check repeats); use
+  `vi.advanceTimersByTime()` or `vi.runOnlyPendingTimers()`.
 - `verify()` and `recoverVerify()` no longer build a client with an
   undefined key: a connector answer resolves or throws as above, and any
   other 2xx without an `api_key` throws. A connect answer with an empty or

@@ -233,6 +233,8 @@ describe('conformance — signup-flow.cases.json: start / submitCode', () => {
     if (c.expect.action === 'done') {
       expect(result.apiKey).toBe(c.response.body.api_key)
       expect(result.handle).toBe(c.response.body.handle ?? agent?.handle)
+      // reachability (contract v1 §3.12) rides on done as sent, or is absent.
+      expect(result.reachability).toEqual(c.response.body.reachability)
     } else {
       expect(result.apiKey).toBeUndefined()
     }
@@ -360,6 +362,8 @@ describe('conformance — signup-flow.cases.json: the client’s static calls', 
       expect(result.apiKey).toBe(served.api_key)
       expect(result.client).toBeInstanceOf(AgentChatClient)
       expect(result.message).toBe(c.expect.message)
+      // reachability (contract v1 §3.12) rides on done as sent, or is absent.
+      expect(result.reachability).toEqual(served.reachability)
       if (c.request.kind === 'recover_verify') expect((result as RecoverVerifyResult).handle).toBe(served.handle)
       else expect((result as RegisterVerifyResult).agent).toEqual(served.agent)
       expectFlow(flowOf(result), c.expect.flow)

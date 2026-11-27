@@ -107,6 +107,48 @@ export async function writeAtomic(file: string, data: string | Uint8Array, optio
   }
 }
 
+/**
+ * Create `file` with `data` unless it exists: true when this call created
+ * it, false when a file was already there (it is left untouched). The data
+ * is written and flushed to a temp file beside it first and then linked into
+ * place, so a reader never sees a part of it, and of two processes racing
+ * to create the same file exactly one wins. Where a hard link cannot be
+ * made (a file system without them) it is renamed into place instead, where
+ * such a race ends with the last writer's file. Creates the directory
+ * (0700) when missing. Throws on failure.
+ */
+export async function createOnce(file: string, data: string | Uint8Array, options: WriteAtomicOptions = {}): Promise<boolean> {
+  const { fs, path } = await nodeModules()
+  await fs.mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+  const tmp = path.join(path.dirname(file), `.${path.basename(file)}.${randomSuffix()}.tmp`)
+  let created = false
+  try {
+    const handle = await fs.open(tmp, 'wx', options.mode ?? 0o666)
+    created = true
+    try {
+      if (options.mode !== undefined) await handle.chmod(options.mode)
+      await handle.writeFile(data)
+      await handle.sync()
+    } finally {
+      await handle.close()
+    }
+    try {
+      await fs.link(tmp, file)
+      return true
+    } catch (err) {
+      if ((err as { code?: string }).code === 'EEXIST') return false
+    }
+    // No hard link here: an existing file still wins, else the rename (which
+    // throws the real error, if there is one).
+    if (await exists(file)) return false
+    await renameWithRetry(tmp, file, options)
+    created = false
+    return true
+  } finally {
+    if (created) await fs.rm(tmp, { force: true }).catch(() => undefined)
+  }
+}
+
 /** The file's bytes, or null when it does not exist or cannot be read. */
 export async function readBytes(file: string): Promise<Uint8Array | null> {
   const { fs } = await nodeModules()

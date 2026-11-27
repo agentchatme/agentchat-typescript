@@ -1111,6 +1111,71 @@ describe('integration.account.start / submitCode — one step per process', () =
     expect(second.calledStep).toBe('recover_verify')
   })
 
+  describe('a recovery with finish: "connector"', () => {
+    const CONNECT = {
+      mcp_url: 'https://api.agentchat.test/mcp/connector/acg_example',
+      resource: 'https://api.agentchat.test/mcp/connector/acg_example',
+      issuer: 'https://api.agentchat.test',
+      authorization_endpoint: 'https://api.agentchat.test/oauth/authorize',
+      token_endpoint: 'https://api.agentchat.test/oauth/token',
+      registration_endpoint: 'https://api.agentchat.test/oauth/register',
+      scope: 'agentchat',
+      expires_at: '2026-11-17T11:00:00.000Z',
+    }
+    const connected = (over: Record<string, unknown> = {}) =>
+      json(200, {
+        handle: 'alice',
+        connect: CONNECT,
+        message: 'Email verified. Add AgentChat to your runtime as a connector at connect.mcp_url.',
+        version: 1,
+        flow: 'recover',
+        next_step: 'connect',
+        status: 'approved',
+        ...over,
+      })
+
+    it('start sends finish only when given', async () => {
+      const srv = server([sent('recover'), sent('recover')])
+      await start('recover', { email: 'a@example.com', handle: 'alice' }, options(srv))
+      await start('recover', { email: 'a@example.com', handle: 'alice', finish: 'connector' }, options(srv))
+      expect(srv.seen.map((r) => r.body)).toEqual([
+        { email: 'a@example.com', handle: 'alice' },
+        { email: 'a@example.com', handle: 'alice', finish: 'connector' },
+      ])
+    })
+
+    it('the right code: action connect with the connect block and the handle, no key', async () => {
+      const srv = server([sent('recover'), connected()])
+      const first = await start('recover', { email: 'a@example.com', handle: 'alice', finish: 'connector' }, options(srv))
+      expect(first.action).toBe('ask_code')
+      const second = await submitCode(first.flow, '123456', options(srv))
+      expect(second).toMatchObject({ action: 'connect', handle: 'alice', connect: CONNECT, httpStatus: 200 })
+      expect(second.apiKey).toBeUndefined()
+      // The verify body never carries finish: the server kept the start's.
+      expect(srv.seen[1]!.body).toEqual({ pending_id: 'pnd_1', code: '123456' })
+    })
+
+    it('connect without a connect block is not connect', async () => {
+      const srv = server([connected({ connect: undefined })])
+      const result = await submitCode(
+        { version: 1, flow: 'recover', next_step: 'recover_verify', pending_id: 'pnd_1' },
+        '123456',
+        options(srv),
+      )
+      expect(result.action).toBe('stop')
+      expect(result.connect).toBeUndefined()
+    })
+
+    it('run takes no finish: it ends with a key', async () => {
+      const srv = server([])
+      const who = person([])
+      await expect(
+        runWith(srv, who, { kind: 'recover', input: { email: 'a@example.com', finish: 'connector' } as RunOptions['input'] }),
+      ).rejects.toThrow(TypeError)
+      expect(srv.seen).toHaveLength(0)
+    })
+  })
+
   it('never retries (one request per step)', async () => {
     const srv = server([error(503, 'INTERNAL_ERROR', 'Internal error', { flow: 'register', next_step: 'register' })])
     const result = await start('register', { email: 'a@example.com', handle: 'alice' }, options(srv))

@@ -76,16 +76,8 @@ export const ErrorCode = {
    */
   CONNECTION_NOT_FOUND: 'CONNECTION_NOT_FOUND',
   /**
-   * 409 from `POST /v1/register/verify` for a sign-up started with
-   * `finish: "connector"`: it finishes only on AgentChat's page, approved by
-   * your person, so no key comes back here. `details` carries the sign-up
-   * flow fields. Comes back as a plain `AgentChatError` (status 409).
-   */
-  FINISH_ON_PAGE: 'FINISH_ON_PAGE',
-  /**
-   * 503 from `GET /v1/register/{pending_id}` (`registerStatus`) and
-   * `DELETE /v1/agents/me/connections/{id}`: the server cannot serve
-   * connector sign-in right now. A `ServerError`.
+   * 503 from `DELETE /v1/agents/me/connections/{id}`: the server cannot
+   * serve connector sign-in right now. A `ServerError`.
    */
   CONNECTOR_SIGN_IN_UNAVAILABLE: 'CONNECTOR_SIGN_IN_UNAVAILABLE',
   /**

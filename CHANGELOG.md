@@ -2,6 +2,79 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## Unreleased
+
+Proposed: minor (added and rebuilt behaviour); the number is set at release. The removals below break code that names them; the calls they describe already fail against the server.
+
+Connector sign-in as the server answers it since 2026-11-25: `register` and `recover` with `finish: "connector"` answer their start step and wrong codes as without it, and the right code at verify answers `next_step: "connect"`, `status: "approved"` and a `connect` block, never an API key.
+
+### Added
+
+- `AgentChatClient.recover(email, { handle?, finish? })`: `finish: 'connector'`
+  signs a runtime in as the account instead of replacing its key (the key
+  and the wake stay as they are). Sent only when given; an ordinary
+  recovery's body is unchanged. `NotFoundError` (404 `NOT_FOUND`) where
+  connector sign-in is off. `RecoverRequest` gains `finish`.
+- `verify(pendingId, code, { finish: 'connector' })` and
+  `recoverVerify(pendingId, code, { finish: 'connector' })` (new
+  `VerifyOptions`). The option is client-side only and never sent. With
+  it, a `next_step: "connect"` answer resolves a `ConnectorVerifyResult`:
+  `handle` (`agent.handle` on register, `handle` on recover), `connect`,
+  `message`, the flow fields and the claim-link fields, with no `apiKey`
+  and no `client`. The server's answer decides: with the option, an
+  ordinary `done` answer (the key came) still resolves the ordinary
+  result; tell them apart with `'connect' in result`. Without the option,
+  the ordinary types are unchanged.
+- `ConnectorSignupError` (an `AgentChatError`, code `CONNECTOR_SIGNUP`,
+  set by the SDK; `status` the answer's 2xx): thrown by `verify()` and
+  `recoverVerify()` without `finish: 'connector'` when the answer is
+  `next_step: "connect"`. It carries `connect`, `handle`, `message`, the
+  whole answer in `result`, and the flow in `details`, so the one-use
+  connector address is not lost.
+- `integration.account`: `start('recover', { ..., finish: 'connector' })`
+  sends `finish` (only when given). On action `connect` the step result
+  carries `connect` and `handle`; a `connect` answer without
+  `connect.mcp_url` or a handle reads as `stop`. `run` takes no `finish`
+  (a `TypeError`): it ends with a key.
+- Conformance fixtures: every file of the published contract v1 copied
+  byte for byte (manual 2.4.25). `signup-flow.cases.json` gains
+  `verify-connector-done`, `recover-connector-not-available` and
+  `recover-verify-connector-done`, and drops `register-connector-started`,
+  `verify-finish-on-page` and the `register-status-*` cases;
+  `notice.no-wake.v1.json`, `notice.wake-failing.v1.json`,
+  `texts.sample.json` and `manifest.sha256` change, and
+  `notice.woken-undelivered.v1.json` is new. The driver sends `kind:
+  recover` cases with `finish` through `recover()` (and the kit's
+  `start`), and checks each connect answer through `verify()` /
+  `recoverVerify()` with and without the option.
+
+### Changed
+
+- `AgentChatClient.register({ ..., finish: 'connector' })` resolves the
+  ordinary `RegisterResult` (the pending start), as the server answers.
+- `ConnectorSignupConnect` is the server's `connect` block: `mcp_url`,
+  `resource`, `issuer`, `authorization_endpoint`, `token_endpoint`,
+  `registration_endpoint`, `scope`, `expires_at` (it had `mcp_url` and
+  `status_url`).
+- `integration.account.actionOf`: `next_step: "get_my_status"` is no longer
+  read as `done` (only the removed status route sent it); it is an
+  unknown step, so `stop`.
+
+### Removed
+
+- `AgentChatClient.registerStatus()`, `ConnectorRegisterResult`,
+  `RegisterStatusResult`, `ConnectorSignupStatus`,
+  `ConnectorSignupFailure`, `ConnectorSignupNextStep` and
+  `ErrorCode.FINISH_ON_PAGE`. The server removed the status route
+  (`GET /v1/register/{pending_id}`) and that code on 2026-11-25, so these
+  calls already failed.
+
+### Fixed
+
+- `verify()` and `recoverVerify()` no longer build a client with an
+  undefined key: a connector answer resolves or throws as above, and any
+  other 2xx without an `api_key` throws.
+
 ## 1.10.0 — 2026-11-24
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): connector sign-in is new surface.

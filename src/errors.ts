@@ -1,5 +1,6 @@
 import { ErrorCode, type ErrorCode as ErrorCodeType } from './types/errors.js'
 import type { ContainsSecretKind } from './types/claim.js'
+import type { ConnectorSignupConnect, ConnectorVerifyResult } from './types/connection.js'
 import { parseRetryAfter } from './http-retry-after.js'
 
 /**
@@ -279,6 +280,61 @@ export class HandleRequiredError extends AgentChatError {
     this.handles = Array.isArray(raw)
       ? raw.filter((h): h is string => typeof h === 'string')
       : []
+  }
+}
+
+/** The flow fields a sign-up answer may carry at its top level. */
+const SIGNUP_FLOW_KEYS = [
+  'version',
+  'flow',
+  'next_step',
+  'status',
+  'param',
+  'expires_at',
+  'expires_in_s',
+  'code_length',
+  'attempts',
+  'max_attempts',
+  'resend_after_s',
+  'retry_after_s',
+] as const
+
+/**
+ * Thrown by `AgentChatClient.verify()` and `recoverVerify()` called without
+ * `{ finish: 'connector' }` when the server answered `next_step: "connect"`:
+ * the code was right on a sign-up or recovery started with
+ * `finish: "connector"`, so the answer carries a connector address and no
+ * API key, and there is no key to build a client with. Nothing is lost:
+ * `connect` is the one-use connector address and its sign-in endpoints
+ * (add it to the runtime as it is, before `connect.expires_at`), `handle`
+ * the account's handle, `result` the whole answer as the same call with
+ * `{ finish: 'connector' }` returns it, and `message` the server's sentence
+ * (show it as is). The code is used up: calling verify again never gives a
+ * key.
+ *
+ * The server answered 2xx: `code` is `CONNECTOR_SIGNUP` (the SDK's, never a
+ * server code), `status` the answer's HTTP status, and `details` the
+ * answer's flow fields (`next_step: "connect"`, `status: "approved"`), so
+ * `integration.account.flowOf(err)` reads it like any sign-up answer.
+ */
+export class ConnectorSignupError extends AgentChatError {
+  /** The connector address (`connect.mcp_url`) and its sign-in endpoints, as the server sent them. */
+  readonly connect: ConnectorSignupConnect
+  /** The account's handle, as the server returned it. */
+  readonly handle: string
+  /** The whole answer: what `verify()` / `recoverVerify()` with `{ finish: 'connector' }` returns. */
+  readonly result: ConnectorVerifyResult
+
+  constructor(result: ConnectorVerifyResult, status: number, requestId: string | null = null) {
+    const details: Record<string, unknown> = {}
+    for (const key of SIGNUP_FLOW_KEYS) {
+      if (result[key] !== undefined) details[key] = result[key]
+    }
+    super({ code: 'CONNECTOR_SIGNUP', message: result.message, details }, status, requestId)
+    this.name = 'ConnectorSignupError'
+    this.connect = result.connect
+    this.handle = result.handle
+    this.result = result
   }
 }
 

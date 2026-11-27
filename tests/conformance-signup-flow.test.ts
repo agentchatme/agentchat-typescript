@@ -11,8 +11,13 @@ import {
   type SignupAction,
 } from '../src/integration/account.js'
 import { AgentChatClient } from '../src/client.js'
-import { AgentChatError, createAgentChatError, type AgentChatErrorResponse } from '../src/errors.js'
-import type { SignupFlow } from '../src/types/index.js'
+import {
+  AgentChatError,
+  ConnectorSignupError,
+  createAgentChatError,
+  type AgentChatErrorResponse,
+} from '../src/errors.js'
+import type { ConnectorVerifyResult, RegisterFinish, SignupFlow } from '../src/types/index.js'
 
 // ─── signup-flow.cases.json (contract v1, "Sign-up flows") ──────────────────
 //
@@ -152,9 +157,11 @@ const LEGACY_READING: Record<string, { action: string; flow: Record<string, unkn
   },
 }
 
-/** A connector sign-up's own calls: `AgentChatClient.register({ finish })` and `registerStatus`, below. */
-const isConnectorCall = (c: SignupCase) => c.request.body.finish !== undefined || c.request.kind === 'register_status'
-const stepCases = fixture.cases.filter((c) => STEP_KINDS[c.request.kind] !== undefined && !isConnectorCall(c))
+/** A start with `finish` (connector sign-in): the kit's `start` takes it on recover only; every one is driven through the client below. */
+const hasFinish = (c: SignupCase) => c.request.body.finish !== undefined
+const stepCases = fixture.cases.filter(
+  (c) => STEP_KINDS[c.request.kind] !== undefined && (!hasFinish(c) || c.request.kind === 'recover'),
+)
 const API = 'https://api.agentchat.test'
 
 /** A fetch that answers the case's response and records each request. */
@@ -177,7 +184,7 @@ function answering(c: SignupCase) {
 describe('conformance — signup-flow.cases.json: start / submitCode', () => {
   it('drives every register and recover case (rotate key is the client’s rotateKey)', () => {
     expect(stepCases.length).toBeGreaterThan(0)
-    const rest = fixture.cases.filter((c) => !stepCases.includes(c) && !isConnectorCall(c))
+    const rest = fixture.cases.filter((c) => !stepCases.includes(c) && !hasFinish(c))
     for (const c of rest) expect(c.request.kind, c.name).toMatch(/^rotate_key/)
   })
 
@@ -198,7 +205,7 @@ describe('conformance — signup-flow.cases.json: start / submitCode', () => {
     }
     const result =
       step === 'start'
-        ? await start(kind, body as { email: string; handle: string }, options)
+        ? await start(kind, body as { email: string; handle: string; finish?: RegisterFinish }, options)
         : await submitCode(
             { version: 1, flow: kind, next_step: c.request.kind, pending_id: body.pending_id as string },
             body.code as string,
@@ -223,40 +230,120 @@ describe('conformance — signup-flow.cases.json: start / submitCode', () => {
     expect(result.legacy).toBe(false)
     expect(result.action).toBe(c.expect.action)
     expectFlow(result.flow, c.expect.flow)
+    const agent = c.response.body.agent as { handle?: string } | undefined
     if (c.expect.action === 'done') {
       expect(result.apiKey).toBe(c.response.body.api_key)
-      const agent = c.response.body.agent as { handle?: string } | undefined
       expect(result.handle).toBe(c.response.body.handle ?? agent?.handle)
     } else {
       expect(result.apiKey).toBeUndefined()
+    }
+    if (c.expect.action === 'connect') {
+      expect(result.connect).toEqual(c.response.body.connect)
+      expect(result.handle).toBe(c.response.body.handle ?? agent?.handle)
+    } else {
+      expect(result.connect).toBeUndefined()
     }
     if (result.action === 'ask_code') expect(result.flow.pending_id).toBe(c.request.body.pending_id ?? c.expect.flow?.pending_id)
   })
 })
 
-describe('conformance — signup-flow.cases.json: connector sign-up', () => {
-  const connectorCases = fixture.cases.filter(isConnectorCall)
+// ─── Connector sign-in through the client ───────────────────────────────────
 
-  it.each(connectorCases.map((c) => [c.name, c] as const))('%s', async (_name, c) => {
+/** The flow and claim-link fields a 2xx sign-up body carries, as `ConnectorVerifyResult` keeps them. */
+const RESULT_FIELDS = [
+  'version',
+  'flow',
+  'next_step',
+  'status',
+  'param',
+  'expires_at',
+  'expires_in_s',
+  'code_length',
+  'attempts',
+  'max_attempts',
+  'resend_after_s',
+  'retry_after_s',
+  'claim_url',
+  'claim_expires_at',
+  'claim_expires_in_s',
+] as const
+
+/** What the client's verify with `{ finish: 'connector' }` returns for a connect case, from the fixture alone. */
+function expectedConnectorResult(c: SignupCase): ConnectorVerifyResult {
+  const body = c.response.body
+  const agent = body.agent as { handle?: string } | undefined
+  const out: Record<string, unknown> = {}
+  for (const key of RESULT_FIELDS) if (body[key] !== undefined) out[key] = body[key]
+  return {
+    ...out,
+    handle: (body.handle as string | undefined) ?? agent!.handle!,
+    connect: body.connect as ConnectorVerifyResult['connect'],
+    message: c.expect.message,
+  }
+}
+
+describe('conformance — signup-flow.cases.json: connector sign-in through the client', () => {
+  const startCases = fixture.cases.filter(hasFinish)
+  const connectCases = fixture.cases.filter((c) => c.expect.action === 'connect')
+
+  it('has connector starts and connect answers for both register and recover', () => {
+    expect(startCases.map((c) => c.request.kind).sort()).toEqual(['recover', 'register'])
+    expect(connectCases.map((c) => c.request.kind).sort()).toEqual(['recover_verify', 'verify'])
+  })
+
+  it.each(startCases.map((c) => [c.name, c] as const))('%s: register / recover with finish', async (_name, c) => {
     const { seen, fetchImpl } = answering(c)
-    const outcome = await (c.request.kind === 'register_status'
-      ? AgentChatClient.registerStatus(`${API}${c.request.path}`, { fetch: fetchImpl })
-      : AgentChatClient.register({
-          ...(c.request.body as { email: string; handle: string; finish: 'connector' }),
+    const body = c.request.body as { email: string; handle?: string; finish: RegisterFinish }
+    const outcome = await (c.request.kind === 'recover'
+      ? AgentChatClient.recover(body.email, {
+          ...(body.handle !== undefined ? { handle: body.handle } : {}),
+          finish: body.finish,
           baseUrl: API,
           fetch: fetchImpl,
         })
+      : AgentChatClient.register({ ...(body as { email: string; handle: string }), finish: body.finish, baseUrl: API, fetch: fetchImpl })
     ).catch((e: unknown) => e)
 
-    // The request is the fixture's: one call, the status read with no body.
-    const body = c.request.method === 'GET' ? undefined : c.request.body
-    expect(seen).toEqual([{ method: c.request.method, path: c.request.path, body }])
+    // The request is the fixture's: one call.
+    expect(seen).toEqual([{ method: c.request.method, path: c.request.path, body: c.request.body }])
     if (isError(c)) {
       expect(outcome).toBeInstanceOf(AgentChatError)
       expect((outcome as AgentChatError).code).toBe(c.expect.code)
       expect((outcome as AgentChatError).message).toBe(c.expect.message)
+      expect(flowOf(outcome)).toEqual(flowOf(c.response.body))
     } else {
       expect(outcome).toEqual(c.response.body)
     }
+  })
+
+  it.each(connectCases.map((c) => [c.name, c] as const))('%s: verify with finish: connector', async (_name, c) => {
+    const { seen, fetchImpl } = answering(c)
+    const body = c.request.body as { pending_id: string; code: string }
+    const call = c.request.kind === 'recover_verify' ? AgentChatClient.recoverVerify : AgentChatClient.verify
+    const result = await call(body.pending_id, body.code, { finish: 'connector', baseUrl: API, fetch: fetchImpl })
+
+    // The request is the fixture's: one call, and finish is never sent.
+    expect(seen).toEqual([{ method: c.request.method, path: c.request.path, body: c.request.body }])
+    expect(result).toEqual(expectedConnectorResult(c))
+    expect(result).not.toHaveProperty('apiKey')
+    expect(result).not.toHaveProperty('client')
+    expectFlow(flowOf(result), c.expect.flow)
+  })
+
+  it.each(connectCases.map((c) => [c.name, c] as const))('%s: verify without finish throws ConnectorSignupError', async (_name, c) => {
+    const { seen, fetchImpl } = answering(c)
+    const body = c.request.body as { pending_id: string; code: string }
+    const call = c.request.kind === 'recover_verify' ? AgentChatClient.recoverVerify : AgentChatClient.verify
+    const err = await call(body.pending_id, body.code, { baseUrl: API, fetch: fetchImpl }).catch((e: unknown) => e)
+
+    expect(seen).toHaveLength(1)
+    expect(err).toBeInstanceOf(ConnectorSignupError)
+    const e = err as ConnectorSignupError
+    expect(e.message).toBe(c.expect.message)
+    expect(e.status).toBe(c.response.status)
+    expect(e.connect).toEqual(c.response.body.connect)
+    expect(e.result).toEqual(expectedConnectorResult(c))
+    expectFlow(flowOf(e), c.expect.flow)
+    expect(actionOf(flowOf(e), c.response.status, c.request.kind)).toBe('connect')
   })
 })

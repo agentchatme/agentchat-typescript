@@ -1604,7 +1604,10 @@ export class RealtimeClient {
     const monoMs = mono - this.lastMonoReading
     this.lastWallReading = wall
     this.lastMonoReading = mono
-    return Math.max(wallMs - monoMs, wallMs - SUSPENSION_CHECK_INTERVAL_MS)
+    // A monotonic clock that went backward is not one (a test's fake clock
+    // installed mid-run): its lead says nothing.
+    const leadMs = monoMs >= 0 ? wallMs - monoMs : 0
+    return Math.max(leadMs, wallMs - SUSPENSION_CHECK_INTERVAL_MS)
   }
 
   private checkForSuspension(): void {
@@ -1639,9 +1642,7 @@ export class RealtimeClient {
     if (this.disposed) return
     this.reconnectAttempts = 0
     const ws = this.ws
-    if (ws === null) {
-      // No socket and no wait: an attempt is starting, with a fresh socket.
-      if (this._state !== 'backoff' || this.reconnectTimer === null) return
+    if (ws === null && this._state === 'backoff' && this.reconnectTimer !== null) {
       const serverWaitLeftMs = this.reconnectNotBefore === null ? 0 : this.reconnectNotBefore - Date.now()
       if (serverWaitLeftMs > 0) {
         this.clearReconnectTimer()
@@ -1649,6 +1650,8 @@ export class RealtimeClient {
         return
       }
     }
+    // Announced whatever there is to end: also when an attempt is already
+    // starting (its socket will be fresh).
     this.announceResume(awayMs)
     if (this.disposed) return
     // An onError observer may have replaced the socket itself (connect()).

@@ -1686,6 +1686,20 @@ describe('RealtimeClient — resumed after a suspension', () => {
     rt.disconnect()
   })
 
+  it('a monotonic clock that goes backward (a fake clock installed mid-run) is no suspension', async () => {
+    vi.useFakeTimers()
+    const rt = makeClient({ webSocket: MockNodeWebSocketCtor })
+    const p = probe(rt)
+    await rt.connect()
+    const ws = handshake(MockWebSocket.latest()) as MockNodeWebSocket
+    const realNow = performance.now.bind(performance)
+    vi.spyOn(performance, 'now').mockImplementation(() => realNow() - 10 * 60_000)
+    await vi.advanceTimersByTimeAsync(10_000) // two checks
+    expect(ws.terminated).toBe(false)
+    expect(count(p.errors, /suspension/)).toBe(0)
+    rt.disconnect()
+  })
+
   it('one check per client across connecting, ready and backoff; off while idle', async () => {
     vi.useFakeTimers()
     const intervals = vi.spyOn(globalThis, 'setInterval')

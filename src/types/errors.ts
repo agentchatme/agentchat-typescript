@@ -76,16 +76,8 @@ export const ErrorCode = {
    */
   CONNECTION_NOT_FOUND: 'CONNECTION_NOT_FOUND',
   /**
-   * 409 from `POST /v1/register/verify` for a sign-up started with
-   * `finish: "connector"`: it finishes only on AgentChat's page, approved by
-   * your person, so no key comes back here. `details` carries the sign-up
-   * flow fields. Comes back as a plain `AgentChatError` (status 409).
-   */
-  FINISH_ON_PAGE: 'FINISH_ON_PAGE',
-  /**
-   * 503 from `GET /v1/register/{pending_id}` (`registerStatus`) and
-   * `DELETE /v1/agents/me/connections/{id}`: the server cannot serve
-   * connector sign-in right now. A `ServerError`.
+   * 503 from `DELETE /v1/agents/me/connections/{id}`: the server cannot
+   * serve connector sign-in right now. A `ServerError`.
    */
   CONNECTOR_SIGN_IN_UNAVAILABLE: 'CONNECTOR_SIGN_IN_UNAVAILABLE',
   /**
@@ -133,6 +125,13 @@ export const ErrorCode = {
    * this server cannot seal or open wake secrets. A `ServerError`.
    */
   WAKE_SECRET_UNAVAILABLE: 'WAKE_SECRET_UNAVAILABLE',
+  /**
+   * 503 from `PUT /v1/agents/me/listener`: this server cannot keep listener
+   * reports (it is not set up for them). A `ServerError` that is never
+   * retried by the transport: asking again seconds later meets the same
+   * answer (`integration.ListenerReporter` tries again later on its own).
+   */
+  LISTENER_REPORTS_UNAVAILABLE: 'LISTENER_REPORTS_UNAVAILABLE',
 } as const
 
 export type ErrorCode = (typeof ErrorCode)[keyof typeof ErrorCode]

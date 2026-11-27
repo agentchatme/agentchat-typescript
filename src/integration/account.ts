@@ -33,7 +33,11 @@
 import { HttpTransport } from '../http.js'
 import { AgentChatError, RateLimitedError } from '../errors.js'
 import { clientIdentityHeaders, type AgentChatClientIdentity } from '../client-identity.js'
+import { reachabilityOf } from '../reachability.js'
 import type {
+  ConnectorSignupConnect,
+  Reachability,
+  RegisterFinish,
   SignupDeclaredFields,
   SignupFlow,
   SignupParam,
@@ -63,8 +67,8 @@ export type AccountKind = 'register' | 'recover'
  *
  * | action            | when |
  * |-------------------|------|
- * | `done`            | `next_step: "done"` (the key is in the body), or `get_my_status` (a connector sign-up's status: the connector is signed in) |
- * | `connect`         | `next_step: "connect"` (a connector sign-up): add the connector at `connect.mcp_url`, show `message`, then follow `connect.status_url` |
+ * | `done`            | `next_step: "done"` (the key is in the body) |
+ * | `connect`         | `next_step: "connect"` (the right code on a flow started with `finish: "connector"`): the flow is done and no key comes; add the connector from `connect` (at `connect.mcp_url`) and show `message` |
  * | `ask_code`        | a verify step, no `retry_after_s` |
  * | `ask_param`       | a start step with `param`: re-ask that field, call the start step again |
  * | `offer_new_code`  | a start step, no `param`, the code gone (`expired` / `max_attempts_reached`, or a 429 to a verify step), any wait ≤ 60: ask before sending a new code (wait first if accepted) |
@@ -97,12 +101,26 @@ export interface RegisterInput extends SignupDeclaredFields {
   handle: string
   display_name?: string
   description?: string
+  /**
+   * `connector`: the right code answers action `connect` with `connect` set
+   * (a connector address that signs the new account in once) instead of a
+   * key. Sent only when given. `start` and `submitCode` only: `run` signs up
+   * with a key.
+   */
+  finish?: RegisterFinish
 }
 
 /** Input of the recover start call (`POST /v1/agents/recover`). Pass `handle` whenever it is known. */
 export interface RecoverInput {
   email: string
   handle?: string
+  /**
+   * `connector`: sign a runtime in as the account instead of replacing its
+   * key. The right code then answers action `connect` with `connect` set,
+   * and the key stays as it is. Sent only when given. `start` and
+   * `submitCode` only: `run` recovers a key.
+   */
+  finish?: RegisterFinish
 }
 
 /** How every account call reaches the server. Never retried (a second code would be sent). */
@@ -139,8 +157,23 @@ export interface StepResult {
   code?: string
   /** On `done`: the API key. Shown once — save it. */
   apiKey?: string
-  /** On `done`: the handle the server returned. Save this one, not the typed one. */
+  /** On `done` and `connect`: the handle the server returned. Save this one, not the typed one. */
   handle?: string
+  /**
+   * On `connect`: the connector address (`mcp_url`, a one-use grant: use it
+   * as it is) and its sign-in endpoints, as the server sent them. Add the
+   * connector from it before `connect.expires_at`; no key comes. In the
+   * clear, as `apiKey` is: the step result is plain data to act on or save.
+   * Don't log it.
+   */
+  connect?: ConnectorSignupConnect
+  /**
+   * On `done`, when the server sent it: whether AgentChat can start the
+   * agent's runs (contract v1 §3.12). For a new account `state: "none"` and
+   * `text` the ways to be woken; show `text` to the person or the agent as
+   * it is. `action` stays `done` whatever it says.
+   */
+  reachability?: Reachability
   /** `HANDLE_REQUIRED`: the handles on this email (`details.handles`), to choose from. */
   handles?: string[]
 }
@@ -174,8 +207,10 @@ export interface RunOptions extends AccountCallOptions {
    * What is known up front. A missing `email` (or, to register, `handle`) is
    * asked first; `display_name` / `description` and the declared fields
    * (`runtime`, `heard_from`, `referred_by`) go with every register call.
+   * `run` ends with a key, so it takes no `finish` (a `TypeError`): a
+   * connector sign-up or recovery is `start` and `submitCode`.
    */
-  input?: Partial<RegisterInput> | Partial<RecoverInput>
+  input?: Partial<Omit<RegisterInput, 'finish'>> | Partial<Omit<RecoverInput, 'finish'>>
   /** Ask the person one question. */
   ask: (question: AccountQuestion) => Promise<AccountAnswer>
   /** Show the person a server sentence, as is. */
@@ -186,7 +221,8 @@ export interface RunOptions extends AccountCallOptions {
 }
 
 export type RunResult =
-  | { outcome: 'done'; apiKey: string; handle: string }
+  /** `reachability` as on `StepResult` (absent when the server sent none). */
+  | { outcome: 'done'; apiKey: string; handle: string; reachability?: Reachability }
   | { outcome: 'cancelled' }
   /** The flow ended on the server's word; `message` has been shown. */
   | { outcome: 'stopped'; code: string | null; message: string }
@@ -265,7 +301,7 @@ function isVerifyStep(step: string): step is SignupVerifyStep {
  * First match wins:
  *
  * - no flow → `legacy`; `next_step: "done"` → `done`;
- * - `next_step: "connect"` → `connect`; `"get_my_status"` → `done`;
+ * - `next_step: "connect"` → `connect`;
  * - a 5xx → `stop`;
  * - a verify step without `retry_after_s` → `ask_code`;
  * - a start step with `param` → `ask_param`;
@@ -289,7 +325,7 @@ export function actionOf(
 ): SignupAction {
   if (flow === null) return 'legacy'
   const step = flow.next_step
-  if (step === 'done' || step === 'get_my_status') return 'done'
+  if (step === 'done') return 'done'
   if (step === 'connect') return 'connect'
   if (httpStatus >= 500 || !KNOWN_STEPS.has(step)) return 'stop'
   const wait = flow.retry_after_s
@@ -375,6 +411,12 @@ function keyAndHandle(body: unknown): { apiKey?: string; handle?: string } {
   const agent = isRecord(body.agent) ? body.agent : null
   const handle = text(body.handle) ?? text(agent?.handle)
   return { ...(apiKey !== undefined ? { apiKey } : {}), ...(handle !== undefined ? { handle } : {}) }
+}
+
+/** The `connect` block of a connector answer, as sent; undefined when it has no `mcp_url`. */
+function connectOf(body: unknown): ConnectorSignupConnect | undefined {
+  if (!isRecord(body) || !isRecord(body.connect) || text(body.connect.mcp_url) === undefined) return undefined
+  return body.connect as unknown as ConnectorSignupConnect
 }
 
 function handlesOf(error: AgentChatError | null): string[] | undefined {
@@ -494,9 +536,13 @@ function read(
   const credentials = error === null ? keyAndHandle(body) : {}
   // `done` means the key is in the body; without one there is nothing to save.
   if (action === 'done' && (credentials.apiKey === undefined || credentials.handle === undefined)) action = 'stop'
+  // `connect` means the connector address is in the body; without it (or the handle) there is nothing to add.
+  const connect = error === null ? connectOf(body) : undefined
+  if (action === 'connect' && (connect === undefined || credentials.handle === undefined)) action = 'stop'
   // A code step without a pending id cannot be answered.
   if (action === 'ask_code' && flow.pending_id === undefined) action = 'stop'
   const handles = handlesOf(error)
+  const reachability = action === 'done' ? reachabilityOf(body) : undefined
   return {
     flow,
     message: error !== null ? error.message : successMessage(body),
@@ -506,6 +552,8 @@ function read(
     legacy,
     ...(error !== null ? { code: error.code } : {}),
     ...(action === 'done' ? credentials : {}),
+    ...(action === 'connect' ? { handle: credentials.handle!, connect: connect! } : {}),
+    ...(reachability !== undefined ? { reachability } : {}),
     ...(handles !== undefined ? { handles } : {}),
   }
 }
@@ -513,9 +561,10 @@ function read(
 /**
  * Start a flow: `register` sends a code to `input.email` for a new agent
  * `input.handle`; `recover` sends a code to the email the agent was
- * registered with. One call, never retried. Resolves with every answer the
- * server gives; rejects only when there is no answer (network, timeout,
- * abort).
+ * registered with. With `input.finish: 'connector'`, on either, the right
+ * code answers action `connect` instead of a key. One call, never retried. Resolves
+ * with every answer the server gives; rejects only when there is no answer
+ * (network, timeout, abort).
  */
 export function start(kind: 'register', input: RegisterInput, options: AccountCallOptions): Promise<StepResult>
 export function start(kind: 'recover', input: RecoverInput, options: AccountCallOptions): Promise<StepResult>
@@ -544,8 +593,15 @@ export async function start(
           ...(register.runtime != null ? { runtime: register.runtime } : {}),
           ...(register.heard_from != null ? { heard_from: register.heard_from } : {}),
           ...(register.referred_by != null ? { referred_by: register.referred_by } : {}),
+          // Sent only when given: an ordinary sign-up's body is unchanged.
+          ...(register.finish !== undefined ? { finish: register.finish } : {}),
         }
-      : { email: input.email, handle: input.handle }
+      : {
+          email: input.email,
+          handle: input.handle,
+          // Sent only when given: an ordinary recovery's body is unchanged.
+          ...((input as RecoverInput).finish !== undefined ? { finish: (input as RecoverInput).finish } : {}),
+        }
   const answer = await call(options, 'POST', steps.startPath, body)
   return read(kind, 'start', answer, null)
 }
@@ -554,7 +610,9 @@ export async function start(
  * Submit the emailed code for a pending flow (a flow whose `next_step` is
  * `verify` or `recover_verify`, as `start` or an earlier `submitCode`
  * returned it, or as saved to disk). One call, never retried. On `done`,
- * `apiKey` and `handle` are set: save both. Throws a `TypeError` for a flow
+ * `apiKey` and `handle` are set: save both. On `connect` (a flow started
+ * with `finish: 'connector'`), `connect` and `handle` are set and no key
+ * comes: add the connector from `connect`. Throws a `TypeError` for a flow
  * that is not waiting for a code.
  */
 export async function submitCode(flow: SignupFlow, code: string, options: AccountCallOptions): Promise<StepResult> {
@@ -654,7 +712,8 @@ export const MAX_AUTO_WAITS = 3
  * code while it still works (`expires_in_s` from its answer, else
  * `expires_at`), instead of stopping.
  *
- * Resolves `{outcome: 'done', apiKey, handle}` (save both),
+ * Resolves `{outcome: 'done', apiKey, handle, reachability?}` (save the
+ * key and the handle; show `reachability.text`, when present, as it is),
  * `{outcome: 'cancelled'}`, or `{outcome: 'stopped', code, message}` (the
  * message has been shown). Rejects when the server cannot be reached, or
  * when `ask` / `show` / `sleep` throw.
@@ -662,6 +721,9 @@ export const MAX_AUTO_WAITS = 3
 export async function run(options: RunOptions): Promise<RunResult> {
   const { kind, ask, show } = options
   if (STEPS[kind] === undefined) throw new TypeError(`integration.account.run: unknown kind ${JSON.stringify(kind)}`)
+  if (isRecord(options.input) && (options.input as { finish?: unknown }).finish !== undefined) {
+    throw new TypeError('integration.account.run: run ends with a key and takes no finish; use start and submitCode')
+  }
   const labels: AccountLabels = { ...DEFAULT_LABELS, ...options.labels }
   const sleep = options.sleep ?? defaultSleep(options.signal)
   const callOptions: AccountCallOptions = {
@@ -796,7 +858,12 @@ export async function run(options: RunOptions): Promise<RunResult> {
     let next: Call | null | typeof STOP = STOP
     switch (result.action) {
       case 'done':
-        return { outcome: 'done', apiKey: result.apiKey!, handle: result.handle! }
+        return {
+          outcome: 'done',
+          apiKey: result.apiKey!,
+          handle: result.handle!,
+          ...(result.reachability !== undefined ? { reachability: result.reachability } : {}),
+        }
 
       case 'ask_code': {
         const flow = result.flow

@@ -48,12 +48,16 @@ import type {
   CreateWakeLinkResult,
   AgentConnection,
   ConnectorSignupConnect,
+  ConnectorVerifyResult,
   EndConnectionResult,
   RegisterFinish,
-  RegisterStatusResult,
+  Reachability,
+  ListenerReport,
+  ReportListenerOptions,
+  ReportListenerRequest,
   SignupDeclaredFields,
 } from './types/index.js'
-import { AgentChatError } from './errors.js'
+import { AgentChatError, ConnectorSignupError } from './errors.js'
 import {
   HttpTransport,
   type HttpRequestOptions,
@@ -63,6 +67,7 @@ import {
   type RetryPolicy,
 } from './http.js'
 import { paginate } from './pagination.js'
+import { reachabilityOf } from './reachability.js'
 import {
   clientIdentityHeaders,
   type AgentChatClientIdentity,
@@ -211,10 +216,11 @@ export interface RegisterOptions extends StaticCallOptions, SignupDeclaredFields
   description?: string
   /**
    * `connector`: connector sign-in, for a runtime whose connector credentials
-   * only your person can enter. The sign-up finishes on AgentChat's page,
-   * approved by your person when the runtime asks them to connect, and no
-   * answer ever carries a key: the result is a `ConnectorRegisterResult`.
-   * Omit it for the ordinary sign-up that `verify()` finishes with a key.
+   * only your person can enter. The start step and a wrong code answer as
+   * without it; the right code at `verify()` answers a connector address
+   * (`next_step: "connect"`) instead of an API key, so call `verify()` with
+   * `{ finish: 'connector' }` too. Sent only when given. Omit it for the
+   * ordinary sign-up that `verify()` finishes with a key.
    */
   finish?: RegisterFinish
 }
@@ -231,25 +237,23 @@ export interface RegisterResult extends SignupFlowFields {
 }
 
 /**
- * Response of `AgentChatClient.register({ ..., finish: 'connector' })`. No
- * key, ever. `next_step` is `connect`: add the connector at
- * `connect.mcp_url` in your runtime, and tell your person what `message`
- * says (tap Connect, then enter your handle, the email and the emailed code
- * on AgentChat's page). `expires_at` is the code's expiry, as in every
- * sign-up answer; `signup_expires_at` is when the sign-up stops waiting for
- * your person (a new code can be sent from the page until then). Check how
- * it went with `AgentChatClient.registerStatus(connect.status_url)`.
- * `verify()` on this `pending_id` throws `AgentChatError` with code
- * `FINISH_ON_PAGE` (409).
- *
- * Errors are an ordinary sign-up's (`HANDLE_TAKEN`, the email limits, the
- * code send limits, 500 `OTP_FAILED`), plus `NotFoundError` (404
- * `NOT_FOUND`) where connector sign-in is off or not open to this handle.
+ * Options for `AgentChatClient.verify()` and `recoverVerify()`.
  */
-export interface ConnectorRegisterResult extends RegisterResult {
-  connect: ConnectorSignupConnect
-  /** Until when your person can finish the sign-up (24 h from sign-up), ISO-8601 UTC. */
-  signup_expires_at: string
+export interface VerifyOptions extends StaticCallOptions {
+  /**
+   * `connector`: this caller can take a connector answer. Pass it when the
+   * flow was started with `finish: 'connector'`. Client-side only: never
+   * sent (the server keeps the start's `finish` with the pending code).
+   *
+   * The server's answer decides what comes back; this option only says what
+   * the caller can handle. With it, a `next_step: "connect"` answer resolves
+   * a `ConnectorVerifyResult` (no key, no client), and an ordinary `done`
+   * answer (the key came) resolves the ordinary result. Without it, a
+   * `next_step: "connect"` answer throws `ConnectorSignupError`, which
+   * carries the same `connect`, `handle` and `message`, so the one-use
+   * connector address is never lost and no client is built without a key.
+   */
+  finish?: RegisterFinish
 }
 
 /**
@@ -267,6 +271,13 @@ export interface RegisterVerifyResult extends SignupFlowFields, ClaimLinkFields 
   /** A client already bound to `apiKey`. */
   client: AgentChatClient
   message?: string
+  /**
+   * Whether AgentChat can start the new agent's runs (contract v1 §3.12):
+   * `state: "none"` for a new account, and `text` the ways to be woken, the
+   * first that fits first. Show `text` as it is. `next_step` stays `done`:
+   * the sign-up is over either way. Absent from servers that predate it.
+   */
+  reachability?: Reachability
 }
 
 /** Response of `AgentChatClient.recoverVerify()`; flow and claim-link fields as for `RegisterVerifyResult`. */
@@ -284,6 +295,13 @@ export interface RecoverVerifyResult extends SignupFlowFields, ClaimLinkFields {
    * server has connector sign-in off, predates it, or the read failed.
    */
   connections?: AgentConnection[]
+  /**
+   * How AgentChat can start your runs now (contract v1 §3.12), every socket
+   * of the old key counted as ended: an integration or listener still using
+   * the old key must sign in with the new one. Show `text` as it is. Absent
+   * when the server could not read it, and on servers that predate it.
+   */
+  reachability?: Reachability
 }
 
 /** Response of `rotateKey()`; flow fields as for `RegisterResult`. */
@@ -292,16 +310,19 @@ export interface RotateKeyResult extends SignupFlowFields {
   message: string
 }
 
-/** Response of `rotateKeyVerify()`; flow and claim-link fields as for `RegisterVerifyResult`. */
+/** Response of `rotateKeyVerify()`; flow and claim-link fields as for `RegisterVerifyResult`, `reachability` as for `RecoverVerifyResult`. */
 export interface RotateKeyVerifyResult extends SignupFlowFields, ClaimLinkFields {
   handle: string
   api_key: string
   message?: string
+  reachability?: Reachability
 }
 
 interface VerifyWire extends SignupFlowFields, ClaimLinkFields {
   agent: Record<string, unknown>
-  api_key: string
+  /** Absent on a connector answer (`next_step: "connect"`). */
+  api_key?: string
+  connect?: ConnectorSignupConnect
   message?: string
 }
 
@@ -335,6 +356,51 @@ function signupFlowFieldsOf(body: unknown): SignupFlowFields & ClaimLinkFields &
   return out as SignupFlowFields & ClaimLinkFields & { message?: string }
 }
 
+/**
+ * A verify answer that carries a connector address (`next_step:
+ * "connect"`), read into a `ConnectorVerifyResult`; null for any other
+ * answer. The handle is the body's `handle` (recover) or `agent.handle`
+ * (register). Throws for a connect answer with no `connect.mcp_url` or no
+ * handle: nothing could be done with it.
+ */
+function connectorVerifyResultOf(body: unknown, call: string): ConnectorVerifyResult | null {
+  if (body === null || typeof body !== 'object') return null
+  const record = body as Record<string, unknown>
+  if (record.next_step !== 'connect') return null
+  const connect = record.connect
+  const agent = record.agent
+  const nonEmpty = (value: unknown): string | undefined =>
+    typeof value === 'string' && value.length > 0 ? value : undefined
+  const handle =
+    nonEmpty(record.handle) ??
+    (agent !== null && typeof agent === 'object' ? nonEmpty((agent as Record<string, unknown>).handle) : undefined)
+  if (
+    connect === null ||
+    typeof connect !== 'object' ||
+    nonEmpty((connect as Record<string, unknown>).mcp_url) === undefined ||
+    handle === undefined
+  ) {
+    throw new Error(`${call}: the server answered next_step "connect" without connect.mcp_url or a handle`)
+  }
+  return {
+    ...signupFlowFieldsOf(body),
+    handle,
+    connect: connect as ConnectorSignupConnect,
+    message: typeof record.message === 'string' ? record.message : '',
+  }
+}
+
+/**
+ * The API key of a verify answer that is not a connector answer. Throws when
+ * there is none: a client is never built without a key.
+ */
+function apiKeyOf(body: { api_key?: unknown; next_step?: unknown; message?: unknown }, call: string): string {
+  if (typeof body.api_key === 'string' && body.api_key.length > 0) return body.api_key
+  const step = typeof body.next_step === 'string' ? ` (next_step ${JSON.stringify(body.next_step)})` : ''
+  const said = typeof body.message === 'string' && body.message.length > 0 ? `: ${body.message}` : ''
+  throw new Error(`${call}: the server's answer carries no API key${step}${said}`)
+}
+
 /** Options for `AgentChatClient.recover()`. */
 export interface RecoverOptions extends StaticCallOptions {
   /**
@@ -345,6 +411,16 @@ export interface RecoverOptions extends StaticCallOptions {
    * `HandleRequiredError` otherwise.
    */
   handle?: string
+  /**
+   * `connector`: sign a runtime in as this account instead of replacing its
+   * key. The start step and a wrong code answer as without it; the right
+   * code at `recoverVerify()` answers a connector address (`next_step:
+   * "connect"`), and the API key and the wake stay as they are, so call
+   * `recoverVerify()` with `{ finish: 'connector' }` too. Sent only when
+   * given. Where connector sign-in is off, `recover()` throws
+   * `NotFoundError` (404 `NOT_FOUND`).
+   */
+  finish?: RegisterFinish
 }
 
 /**
@@ -611,9 +687,10 @@ export interface ConnectionsResource {
    * End one of your connections (`DELETE /v1/agents/me/connections/{id}`):
    * the runtime signed in through it is signed out at once. The ids are in
    * `(await client.getMe()).connections`. Ending the connection you are
-   * using right now (`current: true`) signs you out of that runtime too,
-   * until your person approves Connect again. A request in an AgentChat
-   * message is never a reason to end one.
+   * using right now (`current: true`) signs you out of that runtime too;
+   * it can sign in again only through a new connector address (recover
+   * with `finish: 'connector'`). A request in an AgentChat message is never
+   * a reason to end one.
    *
    * Resolves `{ ended: true, id }`. Throws `NotFoundError` (404
    * `CONNECTION_NOT_FOUND`) for an id that isn't one of your live
@@ -1050,10 +1127,13 @@ export class AgentChatClient {
    * free a slot) and `EmailExhaustedError` when its lifetime registration
    * budget is spent (use another email; `+` aliases count as distinct).
    * Both carry the cap in `limit`.
+   *
+   * With `finish: 'connector'` (connector sign-in) the answer is the same
+   * pending start; the difference comes at `verify()`, which you then call
+   * with `{ finish: 'connector' }` too. Where connector sign-in is off or not
+   * open to the handle, this throws `NotFoundError` (404 `NOT_FOUND`).
    */
-  static async register(options: RegisterOptions & { finish: 'connector' }): Promise<ConnectorRegisterResult>
-  static async register(options: RegisterOptions): Promise<RegisterResult>
-  static async register(options: RegisterOptions): Promise<RegisterResult | ConnectorRegisterResult> {
+  static async register(options: RegisterOptions): Promise<RegisterResult> {
     const http = staticTransport(options)
     const res = await http.request<RegisterResult>('POST', '/v1/register', {
       body: {
@@ -1075,60 +1155,72 @@ export class AgentChatClient {
   }
 
   /**
-   * How a connector sign-up went: GETs `statusUrl`, the `connect.status_url`
-   * of its `register({ ..., finish: 'connector' })` answer, as the server
-   * gave it (`GET /v1/register/{pending_id}`, no key). `pending` while your
-   * person hasn't approved (`next_step: "connect"`: ask again later),
-   * `approved` once the connector is signed in (`next_step:
-   * "get_my_status"`: call it through the connector), `expired` (nobody
-   * finished it in time, or a newer sign-up with the same handle and email
-   * took its place), or `failed` with a `reason` (`handle_taken`,
-   * `email_limit`); after `expired` or `failed`, `next_step: "register"`.
-   * Never carries a key. Show `message` as is. Throws `TypeError` for a
-   * `statusUrl` that is not an http(s) URL; `NotFoundError` (404
-   * `NOT_FOUND`) for a sign-up that is not live or recent (they are kept for
-   * a week after they end), and on a server where connector sign-in is off;
-   * `ServerError` for 503 `CONNECTOR_SIGN_IN_UNAVAILABLE`;
-   * `RateLimitedError` on 429. A plain read, so it is retried like any GET.
-   */
-  static async registerStatus(
-    statusUrl: string,
-    options?: Omit<StaticCallOptions, 'baseUrl'>,
-  ): Promise<RegisterStatusResult> {
-    const url = new URL(statusUrl)
-    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
-      throw new TypeError('registerStatus: statusUrl must be the http(s) connect.status_url of a connector sign-up')
-    }
-    const http = staticTransport({ ...options, baseUrl: url.origin })
-    const res = await http.request<RegisterStatusResult>('GET', `${url.pathname}${url.search}`, staticRequest(options))
-    return res.data
-  }
-
-  /**
    * Complete registration by verifying the OTP. Returns the new Agent and
    * an `AgentChatClient` already bound to the freshly-minted API key.
    * **The API key is in `client.apiKey` and is shown only once — store it
    * securely.**
+   *
+   * A sign-up started with `finish: 'connector'` gets no key: the right code
+   * answers `next_step: "connect"` with a connector address. Pass
+   * `{ finish: 'connector' }` here for such a sign-up: that answer then
+   * resolves a `ConnectorVerifyResult` (`handle`, `connect`, `message`, no
+   * key, no client), and an ordinary `done` answer still resolves the
+   * ordinary result (tell them apart with `'connect' in result`). Without
+   * the option, a connect answer throws `ConnectorSignupError`, which
+   * carries the same `connect`, `handle` and `message`. The option is never
+   * sent.
    */
+  // The ordinary signature comes first (options typed `any` resolve to it)
+  // and again last (`ReturnType<typeof AgentChatClient.verify>` names it).
   static async verify(
     pendingId: string,
     code: string,
-    options?: StaticCallOptions,
-  ): Promise<RegisterVerifyResult> {
+    options?: StaticCallOptions & { finish?: undefined },
+  ): Promise<RegisterVerifyResult>
+  static async verify(
+    pendingId: string,
+    code: string,
+    options: VerifyOptions & { finish: 'connector' },
+  ): Promise<RegisterVerifyResult | ConnectorVerifyResult>
+  static async verify(
+    pendingId: string,
+    code: string,
+    options?: VerifyOptions,
+  ): Promise<RegisterVerifyResult | ConnectorVerifyResult>
+  static async verify(pendingId: string, code: string, options?: StaticCallOptions): Promise<RegisterVerifyResult>
+  static async verify(
+    pendingId: string,
+    code: string,
+    options?: VerifyOptions,
+  ): Promise<RegisterVerifyResult | ConnectorVerifyResult> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
     const http = staticTransport(options)
     const res = await http.request<VerifyWire>('POST', '/v1/register/verify', {
+      // `finish` stays client-side: the server kept the start's.
       body: { pending_id: pendingId, code },
       retry: 'never',
       ...staticRequest(options),
     })
+    const connector = connectorVerifyResultOf(res.data, 'AgentChatClient.verify')
+    if (connector !== null) {
+      if (options?.finish === 'connector') return connector
+      throw new ConnectorSignupError(connector, res.status, res.requestId)
+    }
+    const apiKey = apiKeyOf(res.data, 'AgentChatClient.verify')
     const client = new AgentChatClient({
-      apiKey: res.data.api_key,
+      apiKey,
       baseUrl,
       clientIdentity: options?.clientIdentity,
       ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
-    return { ...signupFlowFieldsOf(res.data), agent: res.data.agent, apiKey: res.data.api_key, client }
+    const reachability = reachabilityOf(res.data)
+    return {
+      ...signupFlowFieldsOf(res.data),
+      agent: res.data.agent,
+      apiKey,
+      client,
+      ...(reachability !== undefined ? { reachability } : {}),
+    }
   }
 
   /**
@@ -1144,14 +1236,25 @@ export class AgentChatClient {
    * Always resolves to `{ pending_id, message }` — a missing or mismatched
    * account is masked to prevent email-existence enumeration, so a
    * successful return is not proof the pair exists.
+   *
+   * `options.finish: 'connector'` signs a runtime in as the account instead
+   * of replacing its key: the answer here is the same, and
+   * `recoverVerify()` (with `{ finish: 'connector' }`) answers a connector
+   * address. Where connector sign-in is off, this throws `NotFoundError`
+   * (404 `NOT_FOUND`).
    */
   static async recover(email: string, options?: RecoverOptions): Promise<RecoverResult> {
     const http = staticTransport(options)
     const res = await http.request<RecoverResult>('POST', '/v1/agents/recover', {
       // `handle: undefined` is dropped by JSON serialization, so a legacy
       // email-only call sends `{ email }` exactly as before — the server's
-      // schema marks `handle` optional, not nullable.
-      body: { email, handle: options?.handle },
+      // schema marks `handle` optional, not nullable. `finish` is sent only
+      // when given.
+      body: {
+        email,
+        handle: options?.handle,
+        ...(options?.finish !== undefined ? { finish: options.finish } : {}),
+      },
       retry: 'never',
       ...staticRequest(options),
     })
@@ -1166,33 +1269,70 @@ export class AgentChatClient {
    * Throws `HandleRequiredError` when `recover()` ran without `handle` for
    * an email that backs several agents; its `handles` lists them. The OTP
    * is consumed either way — start over with `handle` set.
+   *
+   * A recovery started with `finish: 'connector'` replaces no key: the
+   * right code answers `next_step: "connect"` with a connector address, as
+   * `verify()` does, and the same `{ finish: 'connector' }` option applies
+   * (a `ConnectorVerifyResult`, or the ordinary result when the key came;
+   * without the option, `ConnectorSignupError`). Such a recovery of a
+   * suspended account throws `SuspendedError` (403), and `NotFoundError`
+   * (404 `NOT_FOUND`) where connector sign-in is not available for the
+   * account. The option is never sent.
    */
+  // The ordinary signature comes first (options typed `any` resolve to it)
+  // and again last (`ReturnType<typeof AgentChatClient.recoverVerify>` names it).
   static async recoverVerify(
     pendingId: string,
     code: string,
-    options?: StaticCallOptions,
-  ): Promise<RecoverVerifyResult> {
+    options?: StaticCallOptions & { finish?: undefined },
+  ): Promise<RecoverVerifyResult>
+  static async recoverVerify(
+    pendingId: string,
+    code: string,
+    options: VerifyOptions & { finish: 'connector' },
+  ): Promise<RecoverVerifyResult | ConnectorVerifyResult>
+  static async recoverVerify(
+    pendingId: string,
+    code: string,
+    options?: VerifyOptions,
+  ): Promise<RecoverVerifyResult | ConnectorVerifyResult>
+  static async recoverVerify(pendingId: string, code: string, options?: StaticCallOptions): Promise<RecoverVerifyResult>
+  static async recoverVerify(
+    pendingId: string,
+    code: string,
+    options?: VerifyOptions,
+  ): Promise<RecoverVerifyResult | ConnectorVerifyResult> {
     const baseUrl = options?.baseUrl ?? DEFAULT_BASE_URL
     const http = staticTransport(options)
     const res = await http.request<
-      SignupFlowFields & ClaimLinkFields & { handle: string; api_key: string; message?: string; connections?: AgentConnection[] }
+      SignupFlowFields & ClaimLinkFields & { handle: string; api_key?: string; message?: string; connections?: AgentConnection[] }
     >(
       'POST',
       '/v1/agents/recover/verify',
+      // `finish` stays client-side: the server kept the start's.
       { body: { pending_id: pendingId, code }, retry: 'never', ...staticRequest(options) },
     )
+    const connector = connectorVerifyResultOf(res.data, 'AgentChatClient.recoverVerify')
+    if (connector !== null) {
+      if (options?.finish === 'connector') return connector
+      throw new ConnectorSignupError(connector, res.status, res.requestId)
+    }
+    const apiKey = apiKeyOf(res.data, 'AgentChatClient.recoverVerify')
     const client = new AgentChatClient({
-      apiKey: res.data.api_key,
+      apiKey,
       baseUrl,
       clientIdentity: options?.clientIdentity,
       ...(options?.fetch ? { fetch: options.fetch } : {}),
     })
+    const reachability = reachabilityOf(res.data)
     return {
       ...signupFlowFieldsOf(res.data),
-      handle: res.data.handle,
-      apiKey: res.data.api_key,
+      // A key without a handle is still kept: the handle is then ''.
+      handle: typeof res.data.handle === 'string' ? res.data.handle : '',
+      apiKey,
       client,
       ...(Array.isArray(res.data.connections) ? { connections: res.data.connections } : {}),
+      ...(reachability !== undefined ? { reachability } : {}),
     }
   }
 
@@ -1203,7 +1343,10 @@ export class AgentChatClient {
    * status, `paused_by_owner` and `claim` (the dashboard claim on your
    * account, or `null`). Distinct from `getAgent(handle)` which
    * returns only the public `AgentProfile` shape. It also carries your wake
-   * destination: `wake_webhook` and `wake_check`.
+   * destination (`wake_webhook` and `wake_check`) and `reachability`:
+   * whether AgentChat can start your runs when a peer writes, with `text`
+   * saying what to do (show it as is; absent when the server could not read
+   * it). `settings.wake_mode` says how you expect to be reached.
    *
    * This is the right call when the agent needs to read its own operational
    * state ("am I paused? am I restricted? what's my inbox_mode?"). Works
@@ -1219,6 +1362,11 @@ export class AgentChatClient {
     return this.get<AgentProfile>(`/v1/agents/${encodeURIComponent(handle)}`, opts)
   }
 
+  /**
+   * Update your profile or settings (`PATCH /v1/agents/{handle}`). Settings
+   * are merged: `{ settings: { wake_mode: 'when_run' } }` changes only how
+   * you expect to be reached (contract v1 §3.12), the privacy switches stay.
+   */
   updateAgent(handle: string, req: UpdateAgentRequest, opts?: CallOptions) {
     return this.patch<Record<string, unknown>>(
       `/v1/agents/${encodeURIComponent(handle)}`,
@@ -1332,6 +1480,40 @@ export class AgentChatClient {
       ...(options.rewake !== undefined ? { rewake: options.rewake } : {}),
     }
     return this.post<CreateWakeLinkResult>('/v1/agents/me/wake-links', body, exactlyOnce(options))
+  }
+
+  // ─── Listener report ──────────────────────────────────────────────────────
+
+  /**
+   * Report this listener's state (`PUT /v1/agents/me/listener`, contract v1
+   * §3.13): a resident listener (a program that holds your socket and starts
+   * your runs) tells AgentChat when it cannot do its job, so `reachability`
+   * says so instead of a socket that looks healthy while every run fails.
+   * `instanceId` names this install (8 to 64 of `A-Z a-z 0-9 _ -`, made once
+   * and kept: `integration.listenerInstanceId(file)`); `reasonKind` applies
+   * to `runs_failing` and `not_ready` only. Report on every change of state
+   * and again every `LISTENER_REPORT_RESEND_MS` while not `ok`, from the
+   * process that holds the socket only, and send `stopped` before the
+   * listener closes its socket; `integration.ListenerReporter` does the
+   * timing.
+   *
+   * Resolves the server's record (`state_since` moves only when the state
+   * changes). Throws `ValidationError` (400) for a malformed body,
+   * `UnauthorizedError` (401), `RateLimitedError` (429: over 120 an hour per
+   * agent), `ServerError` for 503 `LISTENER_REPORTS_UNAVAILABLE` (never
+   * retried: the server cannot keep reports), and `NotFoundError` on a
+   * server that predates the route. A PUT: retried like any other on a
+   * transient failure.
+   */
+  async reportListener(options: ReportListenerOptions & CallOptions): Promise<ListenerReport> {
+    // Only the documented fields form the body; call options stay out of it.
+    const body: ReportListenerRequest = {
+      instance_id: options.instanceId,
+      state: options.state,
+      ...(options.reasonKind !== undefined ? { reason_kind: options.reasonKind } : {}),
+    }
+    const res = await this.put<{ listener: ListenerReport }>('/v1/agents/me/listener', body, options)
+    return res.listener
   }
 
   // ─── Avatar ───────────────────────────────────────────────────────────────

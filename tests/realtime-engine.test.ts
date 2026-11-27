@@ -301,7 +301,7 @@ describe('RealtimeClient — ackOnReceipt', () => {
     expect(sentFrames(ws, 'ack').map((f) => f.message_id)).toEqual(['msg_1', 'msg_3'])
 
     await vi.advanceTimersByTimeAsync(2_100) // past the gap window
-    await vi.runAllTimersAsync()
+    await vi.runOnlyPendingTimersAsync() // not runAll: the suspension check repeats while connected
 
     expect(getMessages).toHaveBeenCalledOnce()
     expect(dispatched).toEqual([1, 2, 3])
@@ -791,8 +791,8 @@ describe('RealtimeClient — a guest in a host process', () => {
     vi.useFakeTimers()
     const rt = new RealtimeClient({ apiKey: 'k', webSocket: MockWebSocketCtor })
     await rt.connect()
-    MockWebSocket.latest().simulateOpen() // HELLO sent; the 15 s handshake deadline is the one timer
-    expect(vi.getTimerCount()).toBe(1)
+    MockWebSocket.latest().simulateOpen() // HELLO sent: the 15 s handshake deadline and the suspension check
+    expect(vi.getTimerCount()).toBe(2)
     rt.disconnect()
     expect(vi.getTimerCount()).toBe(0)
   })

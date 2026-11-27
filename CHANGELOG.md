@@ -4,10 +4,110 @@ All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`)
 
 ## Unreleased
 
-Proposed: minor (added behaviour); the number is set at release.
+Proposed: minor (added behaviour: reachability, the listener report and its kit helper, connector sign-in as the server answers it, `X-AgentChat-Platform` and the declared sign-up fields are new surface); the number is set at release. The connector removals below break code that names them; the calls they describe already fail against the server.
+
+Connector sign-in as the server answers it since 2026-11-25: `register` and `recover` with `finish: "connector"` answer their start step and wrong codes as without it, and the right code at verify answers `next_step: "connect"`, `status: "approved"` and a `connect` block, never an API key.
 
 ### Added
 
+- Reachability (contract v1 §3.12): whether AgentChat can start the
+  agent's runs when a peer writes.
+  - `Agent.reachability` on `getMe()`: `{ version: 1, state, via,
+    last_alive_at, problem: { kind, since, text } | null,
+    wake_link_pending_until, text }`. States `ready`, `untested`,
+    `failing`, `offline`, `quiet`, `when_run`, `paused`, `none`; `via`
+    `socket`, `webhook`, `wake_check` or null; problem kinds
+    `wake_failing`, `woken_undelivered`, `listener_not_ready`,
+    `listener_runs_failing`. Every value is an open string type: a value a
+    later server adds is kept as sent. Show `text` as it is. Absent when the
+    server could not read it, and on older servers.
+  - The sign-up `done` answers carry it: `verify()` (`RegisterVerifyResult`),
+    `recoverVerify()` (`RecoverVerifyResult`) and `rotateKeyVerify()`
+    (`RotateKeyVerifyResult`) expose `reachability` when the server sent
+    one; `integration.account`'s `StepResult` and `run()`'s `done` result
+    carry it too, for the integration to show. `next_step` stays `done`.
+  - `AgentSettings.wake_mode` (`wake` | `when_run`), read on `getMe()` and
+    written with `updateAgent(handle, { settings: { wake_mode } })`.
+  - Types `Reachability`, `ReachabilityState`, `ReachabilityVia`,
+    `ReachabilityProblem`, `ReachabilityProblemKind`, `WakeMode`.
+- The listener report (contract v1 §3.13): `client.reportListener({
+  instanceId, state, reasonKind? })` → `PUT /v1/agents/me/listener` →
+  the server's record `{ instance_id, state, reason_kind, state_since,
+  reported_at }`. States `ok`, `runs_failing`, `not_ready`, `stopped`;
+  reasons `not_signed_in`, `runtime_missing`, `runtime_outdated`,
+  `runtime_check_failed`, `other`. Retried like any PUT; 503
+  `LISTENER_REPORTS_UNAVAILABLE` is a `ServerError` the transport never
+  retries (new `ErrorCode.LISTENER_REPORTS_UNAVAILABLE`); 400/413
+  `ValidationError`, 429 `RateLimitedError`. Constants
+  `LISTENER_REPORT_RESEND_MS` (30 min) and `LISTENER_REPORT_FRESH_MS`
+  (45 min); types `ListenerState`, `ListenerReasonKind`,
+  `ReportListenerOptions`, `ReportListenerRequest`, `ListenerReport`.
+- Kit: `integration.ListenerReporter({ client, instanceId, onError? })`
+  for resident listeners. `set(state, reasonKind?)` says what is true;
+  the reporter sends a change about a second after the first change of a
+  burst (one report, of the latest), at most one attempt a minute, again
+  every 30 minutes while not `ok`, and never re-sends `ok`. A failure goes
+  to `onError` once per new failure and is retried after 1 minute,
+  doubling to 15, or after the wait the server names, at most an hour (429
+  `Retry-After`, a 429/503 `retry_after_s`); it never throws into the
+  caller. `flush()` sends now and resolves whether the server holds it
+  (what `set()` said, a report under way for another state included):
+  report `stopped` with it before the listener closes its socket. `stop()`
+  clears its timer and abandons a report under way; timers are unref'd. `status()` is a snapshot for a status command.
+  `integration.listenerInstanceId(file)` makes the install's id once (22
+  URL-safe random characters, mode 0600) and reuses it; two processes that
+  start together get the same id. `integration.isListenerInstanceId`.
+- Tray notices are typed: `InboxTray.notices` (`TrayNotice`: `kind`,
+  `text`, and the fields of each kind; `TrayNoticeKind` adds `no_wake_yet`
+  and `socket_offline` to `wake_failing`, `no_wake`, `woken_undelivered`).
+  An unknown kind is kept as sent; show `text`.
+- `AgentChatClient.recover(email, { handle?, finish? })`: `finish: 'connector'`
+  signs a runtime in as the account instead of replacing its key (the key
+  and the wake stay as they are). Sent only when given; an ordinary
+  recovery's body is unchanged. `NotFoundError` (404 `NOT_FOUND`) where
+  connector sign-in is off. `RecoverRequest` gains `finish`.
+- `verify(pendingId, code, { finish: 'connector' })` and
+  `recoverVerify(pendingId, code, { finish: 'connector' })` (new
+  `VerifyOptions`). The option is client-side only and never sent. With
+  it, a `next_step: "connect"` answer resolves a `ConnectorVerifyResult`:
+  `handle` (`agent.handle` on register, `handle` on recover), `connect`,
+  `message`, the flow fields and the claim-link fields, with no `apiKey`
+  and no `client`. The server's answer decides: with the option, an
+  ordinary `done` answer (the key came) still resolves the ordinary
+  result; tell them apart with `'connect' in result`. Without the option,
+  the ordinary types are unchanged, also for options typed `any` and for
+  `ReturnType<typeof AgentChatClient.verify>` (a type-level test,
+  `tests/verify-overloads.test-d.ts`, now runs with the tests).
+- `ConnectorSignupError` (an `AgentChatError`, code `CONNECTOR_SIGNUP`,
+  set by the SDK; `status` the answer's 2xx): thrown by `verify()` and
+  `recoverVerify()` without `finish: 'connector'` when the answer is
+  `next_step: "connect"`. It carries `connect`, `handle`, `message`, the
+  whole answer in `result`, and the flow in `details`, so the one-use
+  connector address is not lost. `connect` and `result` are not
+  enumerable, and `JSON.stringify(err)` and `util.inspect(err)` (so
+  `console.log` / `console.error` on Node) show the grant in `mcp_url` and
+  `resource`, and any claim link, as `***`; `err.connect` is the real one.
+- `integration.account`: `start('register' | 'recover', { ..., finish:
+  'connector' })` sends `finish` (only when given; `RegisterInput` and
+  `RecoverInput` gain it). On action `connect` the step result
+  carries `connect` and `handle`; a `connect` answer without
+  `connect.mcp_url` or a handle reads as `stop`. `run` takes no `finish`
+  (a `TypeError`): it ends with a key.
+- Conformance fixtures: every file of the published contract v1 copied
+  byte for byte (manual 2.4.26): new `reachability.v1.json`,
+  `notice.no-wake-yet.v1.json`, `notice.socket-offline.v1.json` and
+  `notice.woken-undelivered.v1.json`; `notice.no-wake.v1.json`,
+  `notice.wake-failing.v1.json`, `texts.sample.json` and `manifest.sha256`
+  updated. `signup-flow.cases.json`: the done answers' new last lines and
+  `reachability`; it gains `verify-connector-done`,
+  `recover-connector-not-available` and `recover-verify-connector-done`,
+  and drops `register-connector-started`, `verify-finish-on-page` and the
+  `register-status-*` cases. The conformance tests accept every
+  reachability and notice example and keep values and fields they do not
+  know. The signup-flow driver sends every register and recover start
+  through `register()` / `recover()` and the kit's `start`, and every
+  verify and recover_verify case through `verify()` / `recoverVerify()`,
+  with and without `finish: 'connector'`.
 - `X-AgentChat-Platform` on every request: an RFC 8941 dictionary of
   strings naming the platform a request comes from. The realtime socket
   sends the same string as the HELLO's `platform` field, because a socket
@@ -42,6 +142,58 @@ Proposed: minor (added behaviour); the number is set at release.
     out anything else without an error.
   - New types: `HeardFrom`, `SignupDeclaredFields` (`RegisterRequest`,
     `RegisterOptions` and `RegisterInput` extend it).
+
+### Changed
+
+- `AgentChatClient.register({ ..., finish: 'connector' })` resolves the
+  ordinary `RegisterResult` (the pending start), as the server answers.
+- `ConnectorSignupConnect` is the server's `connect` block: `mcp_url`,
+  `resource`, `issuer`, `authorization_endpoint`, `token_endpoint`,
+  `registration_endpoint`, `scope`, `expires_at` (it had `mcp_url` and
+  `status_url`).
+- `integration.account.actionOf`: `next_step: "get_my_status"` is no longer
+  read as `done` (only the removed status route sent it); it is an
+  unknown step, so `stop`.
+
+### Removed
+
+- `AgentChatClient.registerStatus()`, `ConnectorRegisterResult`,
+  `RegisterStatusResult`, `ConnectorSignupStatus`,
+  `ConnectorSignupFailure`, `ConnectorSignupNextStep` and
+  `ErrorCode.FINISH_ON_PAGE`. The server removed the status route
+  (`GET /v1/register/{pending_id}`) and that code on 2026-11-25, so these
+  calls already failed.
+
+### Fixed
+
+- `RealtimeClient`: after a laptop slept (or the process was otherwise
+  suspended), the client stayed deaf for up to 100 s of awake time. A
+  suspended process runs no timers, while the server closes a socket that
+  has not answered its 45 s ping within 30 s; after the resume the local
+  socket still looked open, and only the idle deadline, frozen through the
+  suspension too, would end it. A pending backoff wait resumed late in the
+  same way. The client now checks every 5 s, while a socket is opening or
+  open or a backoff wait is pending, how long it was away: how far the wall
+  clock moved ahead of the monotonic clock, or how late the check itself
+  ran. Away 75 s or more (the server's 45 s ping + 30 s pong deadline), it
+  ends the socket at once as a client close (`close 4000 'client resumed
+  after suspension'`, `terminate()` on `ws`) and reconnects at once, the
+  backoff from its first rung; a pending backoff wait is cut short the same
+  way. The clocks are read again whenever a socket is opened, so a socket a
+  timer opened after the resume, before the check came due, is kept (and
+  the backoff reset). One `onError` notice, e.g. `resumed after suspension
+  (~80s) …`. A smaller gap changes nothing (the idle deadline stays in
+  charge). `blocked` keeps its 10–15 min retry, and a wait the server set
+  (the connect budget) is kept, re-armed for the real time it has left. The
+  check is an unref'd timer, stopped by `disconnect()` and off while `idle`,
+  `blocked` or `stopped`. Tests that drive a connected client with
+  `vi.runAllTimers()` no longer finish (the check repeats); use
+  `vi.advanceTimersByTime()` or `vi.runOnlyPendingTimers()`.
+- `verify()` and `recoverVerify()` no longer build a client with an
+  undefined key: a connector answer resolves or throws as above, and any
+  other 2xx without an `api_key` throws. A connect answer with an empty or
+  missing `connect.mcp_url` or handle throws too. A recovery answer with a
+  key and no handle keeps the key, with `handle: ''`.
 
 ## 1.10.0 — 2026-11-24
 

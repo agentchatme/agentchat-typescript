@@ -315,10 +315,12 @@ export class HttpTransport {
         error instanceof AwaitingReplyError ||
         error instanceof OtpAttemptsExhaustedError
 
-      // A 503 `WAKE_CHECK_UNAVAILABLE` says the server cannot run wake checks
-      // at all (it is not configured for them), not that it is busy: the
-      // same answer would come back on every retry.
-      const isTerminalCode = error.code === ErrorCode.WAKE_CHECK_UNAVAILABLE
+      // A 503 `WAKE_CHECK_UNAVAILABLE` (or `LISTENER_REPORTS_UNAVAILABLE`)
+      // says the server cannot run wake checks (keep listener reports) at
+      // all, not that it is busy: the same answer would come back on every
+      // retry.
+      const isTerminalCode =
+        error.code === ErrorCode.WAKE_CHECK_UNAVAILABLE || error.code === ErrorCode.LISTENER_REPORTS_UNAVAILABLE
 
       // A 429 that asks for a longer wait than one retry may sleep
       // (`maxDelayMs`) would only be turned away again: fail fast instead

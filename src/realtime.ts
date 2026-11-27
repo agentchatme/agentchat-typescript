@@ -323,13 +323,13 @@ const SERVER_HEARTBEAT_DEADLINE_MS = SERVER_PING_INTERVAL_MS + SERVER_PONG_TIMEO
 /**
  * Cadence of the suspension check. A suspended process (a laptop asleep, a
  * paused VM or container, a stopped process) runs no timers, but the wall
- * clock keeps moving; the first check after the resume finds it far past the
- * check's schedule. Late by at least SERVER_HEARTBEAT_DEADLINE_MS, the socket
- * is certainly dead and is replaced at once — without it, the liveness
- * deadline, itself frozen through the suspension, would notice only up to
- * 100 s of awake time later. Late by less (a GC pause, a busy event loop, a
- * hidden browser tab whose timers run once a minute) changes nothing: the
- * liveness deadline stays in charge.
+ * clock keeps moving; the first reading after the resume (this check, or a
+ * socket opening) finds it far ahead (see `timeAway`). Away at least
+ * SERVER_HEARTBEAT_DEADLINE_MS, the socket is certainly dead and is replaced
+ * at once — without it, the liveness deadline, itself frozen through the
+ * suspension, would notice only up to 100 s of awake time later. Less (a GC
+ * pause, a busy event loop, a hidden browser tab whose timers run once a
+ * minute) changes nothing: the liveness deadline stays in charge.
  */
 const SUSPENSION_CHECK_INTERVAL_MS = 5_000
 
@@ -422,6 +422,13 @@ function isPingCapable(ws: WebSocket): ws is PingCapableSocket {
 // a daemon alive.
 function unref(timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>): void {
   ;(timer as { unref?: () => void }).unref?.()
+}
+
+// The runtime's monotonic clock, the one timers run on; the wall clock where
+// there is none (the suspension check then relies on its schedule alone).
+function monotonicNow(): number {
+  const perf = (globalThis as { performance?: { now?: () => number } }).performance
+  return typeof perf?.now === 'function' ? perf.now() : Date.now()
 }
 
 /**
@@ -607,13 +614,15 @@ export class RealtimeClient {
   /**
    * Wall-clock end of the pending backoff when the server set its length
    * (the connect budget); null for an ordinary backoff step. A suspension
-   * never cuts a wait the server asked for short of this.
+   * never cuts a wait the server asked for short of this; it re-arms it for
+   * the real time left.
    */
   private reconnectNotBefore: number | null = null
   /** The suspension check: runs while `connecting`, `ready` or `backoff`. */
   private suspensionTimer: ReturnType<typeof setInterval> | null = null
-  /** Wall clock at the previous suspension check (or its start). */
-  private lastSuspensionCheckAt = 0
+  /** Both clocks at the previous suspension reading (see `timeAway`). */
+  private lastWallReading = 0
+  private lastMonoReading = 0
   /** Handshake deadline: armed by connect(), cleared by hello.ok or close. */
   private handshakeTimer: ReturnType<typeof setTimeout> | null = null
   /** Idle deadline: armed by hello.ok; inbound frames and pings refresh it. */
@@ -803,6 +812,8 @@ export class RealtimeClient {
     this.livenessMs =
       this.options.livenessTimeoutMs ?? (isPingCapable(ws) ? DEFAULT_LIVENESS_TIMEOUT_MS : 0)
     this.armHandshakeDeadline()
+    // After `this.ws` is set: an onError observer's connect() is a no-op here.
+    this.checkAtNewSocket()
 
     // Every handler checks that it still speaks for the current socket. A
     // socket the watchdog abandoned (or disconnect() closed) was dealt with
@@ -1398,6 +1409,10 @@ export class RealtimeClient {
     const delay = serverDelayMs ?? this.computeReconnectDelay(attempt)
     this.reconnectNotBefore = serverDelayMs !== undefined ? Date.now() + delay : null
     this.setState('backoff')
+    this.armReconnectTimer(delay)
+  }
+
+  private armReconnectTimer(delay: number): void {
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null
       this.retryNow()
@@ -1561,7 +1576,7 @@ export class RealtimeClient {
       return
     }
     if (this.suspensionTimer !== null) return
-    this.lastSuspensionCheckAt = Date.now()
+    this.timeAway() // the first reading
     this.suspensionTimer = setInterval(() => this.checkForSuspension(), SUSPENSION_CHECK_INTERVAL_MS)
     unref(this.suspensionTimer)
   }
@@ -1573,37 +1588,69 @@ export class RealtimeClient {
     }
   }
 
-  /** How late this check is by the wall clock is how long the process was away. */
+  /**
+   * How long the process was away since the previous reading; takes a new
+   * one. Through a suspension the monotonic clock (timers run on it) stands
+   * still on most systems while the wall clock moves on: the wall clock's
+   * lead is the time away, wherever the reading falls. Where the monotonic
+   * clock runs on (a stopped process, some VMs) or the event loop was
+   * starved, the overdue check fires late instead: its lateness past the
+   * check's schedule.
+   */
+  private timeAway(): number {
+    const wall = Date.now()
+    const mono = monotonicNow()
+    const wallMs = wall - this.lastWallReading
+    const monoMs = mono - this.lastMonoReading
+    this.lastWallReading = wall
+    this.lastMonoReading = mono
+    return Math.max(wallMs - monoMs, wallMs - SUSPENSION_CHECK_INTERVAL_MS)
+  }
+
   private checkForSuspension(): void {
-    const now = Date.now()
-    const suspendedMs = now - this.lastSuspensionCheckAt - SUSPENSION_CHECK_INTERVAL_MS
-    this.lastSuspensionCheckAt = now
-    if (suspendedMs >= SERVER_HEARTBEAT_DEADLINE_MS) this.resumeAfterSuspension(suspendedMs)
+    const awayMs = this.timeAway()
+    if (awayMs >= SERVER_HEARTBEAT_DEADLINE_MS) this.resumeAfterSuspension(awayMs)
+  }
+
+  /**
+   * A socket was just created. After a resume, a timer due before the check
+   * (a backoff step, the liveness deadline's reconnect) may open it first:
+   * reading the clocks here keeps the check from taking it for one that
+   * lived through the suspension, and the suspension is handled here.
+   */
+  private checkAtNewSocket(): void {
+    const awayMs = this.timeAway()
+    if (awayMs < SERVER_HEARTBEAT_DEADLINE_MS) return
+    this.reconnectAttempts = 0
+    this.announceResume(awayMs)
   }
 
   /**
    * The process was away for at least SERVER_HEARTBEAT_DEADLINE_MS: the
    * server has closed the socket by now, though nothing arrived here to say
-   * so. End it at once as a client close and reconnect now, the backoff from
-   * its first rung (the network is often back seconds after a wake). A
-   * pending backoff wait is cut short the same way, except one the server
-   * set that has not yet run out in real time (see `backoffWaitSkippable`).
-   * With `reconnect: false` the socket is still ended, and the client goes
-   * `idle` as after any close.
+   * so. Whatever comes next starts the backoff from its first rung (the
+   * network is often back seconds after a wake). The socket is ended at once
+   * as a client close and the client reconnects now; a pending backoff wait
+   * is cut short the same way. A wait the server set (the connect budget) is
+   * kept, re-armed for the real time it has left. With `reconnect: false`
+   * the socket is still ended, and the client goes `idle` as after any close.
    */
-  private resumeAfterSuspension(suspendedMs: number): void {
-    const ws = this.ws
-    if (this.disposed || (ws === null && !this.backoffWaitSkippable())) return
-    this.emitError(
-      new ConnectionError(
-        `resumed after suspension (~${Math.round(suspendedMs / 1000)}s): the server has closed ` +
-          `the connection by now (it closes one that answers no ping for ` +
-          `${SERVER_HEARTBEAT_DEADLINE_MS / 1000}s); ` +
-          (this.options.reconnect ? 'reconnecting now' : 'reconnect is off, so call connect() to reopen'),
-      ),
-    )
+  private resumeAfterSuspension(awayMs: number): void {
     if (this.disposed) return
     this.reconnectAttempts = 0
+    const ws = this.ws
+    if (ws === null) {
+      // No socket and no wait: an attempt is starting, with a fresh socket.
+      if (this._state !== 'backoff' || this.reconnectTimer === null) return
+      const serverWaitLeftMs = this.reconnectNotBefore === null ? 0 : this.reconnectNotBefore - Date.now()
+      if (serverWaitLeftMs > 0) {
+        this.clearReconnectTimer()
+        this.armReconnectTimer(serverWaitLeftMs)
+        return
+      }
+    }
+    this.announceResume(awayMs)
+    if (this.disposed) return
     // An onError observer may have replaced the socket itself (connect()).
     if (ws !== null && this.ws === ws) {
       this.abandonSocket(CLIENT_CLOSE_CODE, 'client resumed after suspension')
@@ -1613,19 +1660,20 @@ export class RealtimeClient {
     this.skipBackoffWait()
   }
 
-  /**
-   * A pending backoff wait that a suspension may cut short: never the
-   * blocked retry, and never a wait the server set (the connect budget)
-   * before its end in real time — the server asked for that delay.
-   */
-  private backoffWaitSkippable(): boolean {
-    if (this.disposed || this._state !== 'backoff' || this.reconnectTimer === null) return false
-    return this.reconnectNotBefore === null || Date.now() >= this.reconnectNotBefore
+  private announceResume(awayMs: number): void {
+    this.emitError(
+      new ConnectionError(
+        `resumed after suspension (~${Math.round(awayMs / 1000)}s): the server has closed ` +
+          `the connection by now (it closes one that answers no ping for ` +
+          `${SERVER_HEARTBEAT_DEADLINE_MS / 1000}s); ` +
+          (this.options.reconnect ? 'reconnecting now' : 'reconnect is off, so call connect() to reopen'),
+      ),
+    )
   }
 
-  /** Make the attempt the pending backoff wait holds now, the backoff from its first rung. */
+  /** Make the attempt a pending backoff wait holds now, the backoff from its first rung. Never the blocked retry. */
   private skipBackoffWait(): void {
-    if (!this.backoffWaitSkippable()) return
+    if (this.disposed || this._state !== 'backoff' || this.reconnectTimer === null) return
     this.reconnectAttempts = 0
     // connect() cancels the pending timer before it opens the socket.
     this.retryNow()

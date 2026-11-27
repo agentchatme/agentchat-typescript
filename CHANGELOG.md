@@ -15,17 +15,20 @@ Proposed: patch (fixed existing behaviour); the number is set at release.
   socket still looked open, and only the idle deadline, frozen through the
   suspension too, would end it. A pending backoff wait resumed late in the
   same way. The client now checks every 5 s, while a socket is opening or
-  open or a backoff wait is pending, how far the wall clock moved since the
-  last check. A check late by 75 s or more (the server's 45 s ping + 30 s
-  pong deadline) ends the socket at once as a client close (`close 4000
-  'client resumed after suspension'`, `terminate()` on `ws`) and reconnects
-  at once, the backoff from its first rung; a pending backoff wait is cut
-  short the same way. One `onError` notice, e.g. `resumed after suspension
-  (~80s) …`. A smaller gap changes nothing (the idle deadline stays in charge).
-  `blocked` keeps its 10–15 min retry, and a wait the server set (the
-  connect budget) is kept until it has run out in real time. The check is an
-  unref'd timer, stopped by `disconnect()` and off while `idle`, `blocked` or
-  `stopped`. Tests that drive a connected client with
+  open or a backoff wait is pending, how long it was away: how far the wall
+  clock moved ahead of the monotonic clock, or how late the check itself
+  ran. Away 75 s or more (the server's 45 s ping + 30 s pong deadline), it
+  ends the socket at once as a client close (`close 4000 'client resumed
+  after suspension'`, `terminate()` on `ws`) and reconnects at once, the
+  backoff from its first rung; a pending backoff wait is cut short the same
+  way. The clocks are read again whenever a socket is opened, so a socket a
+  timer opened after the resume, before the check came due, is kept (and
+  the backoff reset). One `onError` notice, e.g. `resumed after suspension
+  (~80s) …`. A smaller gap changes nothing (the idle deadline stays in
+  charge). `blocked` keeps its 10–15 min retry, and a wait the server set
+  (the connect budget) is kept, re-armed for the real time it has left. The
+  check is an unref'd timer, stopped by `disconnect()` and off while `idle`,
+  `blocked` or `stopped`. Tests that drive a connected client with
   `vi.runAllTimers()` no longer finish (the check repeats); use
   `vi.advanceTimersByTime()` or `vi.runOnlyPendingTimers()`.
 

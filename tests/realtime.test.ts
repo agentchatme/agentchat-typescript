@@ -1599,6 +1599,75 @@ describe('RealtimeClient — resumed after a suspension', () => {
     rt.disconnect()
   })
 
+  it('a wait the server set is re-armed for the real time it has left, not stretched by the sleep', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    const rt = makeClient()
+    await rt.connect()
+    const ws = MockWebSocket.latest()
+    ws.simulateOpen()
+    ws.simulateClose(1013, 'rate_limited; retry_after=600', false)
+
+    await suspend(300_000) // 300 s of the 600 s pass asleep
+    // 600 s after the close in real time: 300 s of awake timer time, not 600 s.
+    await vi.advanceTimersByTimeAsync(294_999)
+    expect(MockWebSocket.instances).toHaveLength(1)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(MockWebSocket.instances).toHaveLength(2)
+    rt.disconnect()
+  })
+
+  it('a backoff timer that fires before the check after a resume: its fresh socket is kept', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    const rt = makeClient({ reconnectInterval: 1_000, maxReconnectInterval: 60_000 })
+    const p = probe(rt)
+    await rt.connect() // t = 0: checks at 5, 10, …
+    await failAttempts(4, 1_000) // t = 15
+    MockWebSocket.latest().simulateClose(1006, 'refused', false) // attempt 5: due at t = 31
+    await vi.advanceTimersByTimeAsync(15_500) // t = 30.5, just past a check
+    vi.setSystemTime(Date.now() + 80_000) // asleep for 80 s
+    await vi.advanceTimersByTimeAsync(500) // t = 31: the backoff timer comes first
+    expect(MockWebSocket.instances).toHaveLength(6)
+    const fresh = MockWebSocket.latest()
+    expect(count(p.errors, /^resumed after suspension \(~80s\)/)).toBe(1)
+
+    await vi.advanceTimersByTimeAsync(10_000) // two checks
+    expect(fresh.closed).toBeNull()
+    expect(MockWebSocket.instances).toHaveLength(6)
+    expect(count(p.errors, /suspension/)).toBe(1)
+
+    // The suspension reset the backoff: this socket failing waits the first rung.
+    fresh.simulateClose(1006, 'refused', false)
+    await vi.advanceTimersByTimeAsync(999)
+    expect(MockWebSocket.instances).toHaveLength(6)
+    await vi.advanceTimersByTimeAsync(1)
+    expect(MockWebSocket.instances).toHaveLength(7)
+    rt.disconnect()
+  })
+
+  it('the liveness deadline and its reconnect before the check: the fresh socket is kept', async () => {
+    vi.useFakeTimers()
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    const rt = makeClient({ reconnectInterval: 1_000, livenessTimeoutMs: 100_000 })
+    const p = probe(rt)
+    await rt.connect() // t = 0: checks at 5, 10, …
+    await vi.advanceTimersByTimeAsync(1_000)
+    const first = handshake(MockWebSocket.latest(), []) // t = 1: idle deadline due at t = 101
+    await vi.advanceTimersByTimeAsync(99_500) // t = 100.5, just past a check
+    vi.setSystemTime(Date.now() + 80_000)
+    await vi.advanceTimersByTimeAsync(1_600) // t = 102.1: deadline at 101, its 1 s step at 102
+    expect(first.closed).toEqual({ code: 4000, reason: 'client liveness timeout' })
+    expect(MockWebSocket.instances).toHaveLength(2)
+    const fresh = MockWebSocket.latest()
+
+    await vi.advanceTimersByTimeAsync(10_000) // two checks
+    expect(fresh.closed).toBeNull()
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(count(p.errors, /suspension/)).toBe(1)
+    rt.disconnect()
+  })
+
   it('reconnect: false: the dead socket is still ended, and the client goes idle', async () => {
     vi.useFakeTimers()
     const rt = makeClient({ reconnect: false })

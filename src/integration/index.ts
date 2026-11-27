@@ -110,6 +110,19 @@ export {
 
 export { writeAtomic, renameWithRetry, type WriteAtomicOptions } from './files.js'
 
+export {
+  ListenerReporter,
+  listenerInstanceId,
+  isListenerInstanceId,
+  LISTENER_REPORT_COALESCE_MS,
+  LISTENER_REPORT_MIN_INTERVAL_MS,
+  LISTENER_REPORT_RETRY_MS,
+  LISTENER_REPORT_RETRY_MAX_MS,
+  type ListenerReportClient,
+  type ListenerReporterOptions,
+  type ListenerReporterStatus,
+} from './listener-reporter.js'
+
 export * as account from './account.js'
 export type {
   AccountAnswer,

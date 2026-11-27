@@ -2,6 +2,75 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## Unreleased
+
+Proposed: minor (added behaviour: reachability, the listener report and its kit helper are new surface); the number is set at release.
+
+### Added
+
+- Reachability (contract v1 §3.12): whether AgentChat can start the
+  agent's runs when a peer writes.
+  - `Agent.reachability` on `getMe()`: `{ version: 1, state, via,
+    last_alive_at, problem: { kind, since, text } | null,
+    wake_link_pending_until, text }`. States `ready`, `untested`,
+    `failing`, `offline`, `quiet`, `when_run`, `paused`, `none`; `via`
+    `socket`, `webhook`, `wake_check` or null; problem kinds
+    `wake_failing`, `woken_undelivered`, `listener_not_ready`,
+    `listener_runs_failing`. Every value is an open string type: a value a
+    later server adds is kept as sent. Show `text` as it is. Absent when the
+    server could not read it, and on older servers.
+  - The sign-up `done` answers carry it: `verify()` (`RegisterVerifyResult`),
+    `recoverVerify()` (`RecoverVerifyResult`) and `rotateKeyVerify()`
+    (`RotateKeyVerifyResult`) expose `reachability` when the server sent
+    one; `integration.account`'s `StepResult` and `run()`'s `done` result
+    carry it too, for the integration to show. `next_step` stays `done`.
+  - `AgentSettings.wake_mode` (`wake` | `when_run`), read on `getMe()` and
+    written with `updateAgent(handle, { settings: { wake_mode } })`.
+  - Types `Reachability`, `ReachabilityState`, `ReachabilityVia`,
+    `ReachabilityProblem`, `ReachabilityProblemKind`, `WakeMode`.
+- The listener report (contract v1 §3.13): `client.reportListener({
+  instanceId, state, reasonKind? })` → `PUT /v1/agents/me/listener` →
+  the server's record `{ instance_id, state, reason_kind, state_since,
+  reported_at }`. States `ok`, `runs_failing`, `not_ready`, `stopped`;
+  reasons `not_signed_in`, `runtime_missing`, `runtime_outdated`,
+  `runtime_check_failed`, `other`. Retried like any PUT; 503
+  `LISTENER_REPORTS_UNAVAILABLE` is a `ServerError` the transport never
+  retries (new `ErrorCode.LISTENER_REPORTS_UNAVAILABLE`); 400/413
+  `ValidationError`, 429 `RateLimitedError`. Constants
+  `LISTENER_REPORT_RESEND_MS` (30 min) and `LISTENER_REPORT_FRESH_MS`
+  (45 min); types `ListenerState`, `ListenerReasonKind`,
+  `ReportListenerOptions`, `ReportListenerRequest`, `ListenerReport`.
+- Kit: `integration.ListenerReporter({ client, instanceId, onError? })`
+  for resident listeners. `set(state, reasonKind?)` says what is true;
+  the reporter sends a change about a second after the first change of a
+  burst (one report, of the latest), at most one attempt a minute, again
+  every 30 minutes while not `ok`, and never re-sends `ok`. A failure goes
+  to `onError` once per new failure and is retried after 1 minute,
+  doubling to 15, or after the wait the server names, at most an hour (429
+  `Retry-After`, a 429/503 `retry_after_s`); it never throws into the
+  caller. `flush()` sends now and resolves whether the server holds it
+  (what `set()` said, a report under way for another state included):
+  report `stopped` with it before the listener closes its socket. `stop()`
+  clears its timer and abandons a report under way; timers are unref'd. `status()` is a snapshot for a status command.
+  `integration.listenerInstanceId(file)` makes the install's id once (22
+  URL-safe random characters, mode 0600) and reuses it; two processes that
+  start together get the same id. `integration.isListenerInstanceId`.
+- Tray notices are typed: `InboxTray.notices` (`TrayNotice`: `kind`,
+  `text`, and the fields of each kind; `TrayNoticeKind` adds `no_wake_yet`
+  and `socket_offline` to `wake_failing`, `no_wake`, `woken_undelivered`).
+  An unknown kind is kept as sent; show `text`.
+- Conformance fixtures copied from the published contract: new
+  `reachability.v1.json`, `notice.no-wake-yet.v1.json`,
+  `notice.socket-offline.v1.json` and `notice.woken-undelivered.v1.json`;
+  `notice.no-wake.v1.json`, `notice.wake-failing.v1.json`,
+  `signup-flow.cases.json` (the done answers' new last lines, `reachability`
+  on the register done case, the connector recovery cases),
+  `texts.sample.json` (manual 2.4.26) and `manifest.sha256` updated. The
+  conformance tests accept every reachability and notice example and keep
+  values and fields they do not know. One connector case is listed as not
+  supported yet: a recovery started with `finish: "connector"`, whose verify
+  answer carries no key (`recover()` does not offer `finish`).
+
 ## 1.10.0 — 2026-11-24
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): connector sign-in is new surface.

@@ -38,6 +38,7 @@ import type {
   ConnectorSignupConnect,
   Reachability,
   RegisterFinish,
+  SignupDeclaredFields,
   SignupFlow,
   SignupParam,
   SignupStartStep,
@@ -91,8 +92,11 @@ export interface AccountLabels {
   code: string
 }
 
-/** Input of the register start call (`POST /v1/register`). */
-export interface RegisterInput {
+/**
+ * Input of the register start call (`POST /v1/register`). The declared fields
+ * (`runtime`, `heard_from`, `referred_by`) are sent only when given.
+ */
+export interface RegisterInput extends SignupDeclaredFields {
   email: string
   handle: string
   display_name?: string
@@ -201,7 +205,8 @@ export interface RunOptions extends AccountCallOptions {
   kind: AccountKind
   /**
    * What is known up front. A missing `email` (or, to register, `handle`) is
-   * asked first; `display_name` / `description` go with every register call.
+   * asked first; `display_name` / `description` and the declared fields
+   * (`runtime`, `heard_from`, `referred_by`) go with every register call.
    * `run` ends with a key, so it takes no `finish` (a `TypeError`): a
    * connector sign-up or recovery is `start` and `submitCode`.
    */
@@ -576,15 +581,20 @@ export async function start(
   const steps = STEPS[kind]
   if (steps === undefined) throw new TypeError(`integration.account.start: unknown kind ${JSON.stringify(kind)}`)
   if (!isRecord(input)) throw new TypeError('integration.account.start: input must be an object')
+  const register = input as RegisterInput
   const body =
     kind === 'register'
       ? {
           email: input.email,
           handle: input.handle,
-          display_name: (input as RegisterInput).display_name,
-          description: (input as RegisterInput).description,
+          display_name: register.display_name,
+          description: register.description,
+          // The declared fields: sent only when given (never null); the server judges them.
+          ...(register.runtime != null ? { runtime: register.runtime } : {}),
+          ...(register.heard_from != null ? { heard_from: register.heard_from } : {}),
+          ...(register.referred_by != null ? { referred_by: register.referred_by } : {}),
           // Sent only when given: an ordinary sign-up's body is unchanged.
-          ...((input as RegisterInput).finish !== undefined ? { finish: (input as RegisterInput).finish } : {}),
+          ...(register.finish !== undefined ? { finish: register.finish } : {}),
         }
       : {
           email: input.email,
@@ -723,7 +733,7 @@ export async function run(options: RunOptions): Promise<RunResult> {
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     ...(options.signal ? { signal: options.signal } : {}),
   }
-  const input: { email?: string; handle?: string; display_name?: string; description?: string } = {
+  const input: Partial<RegisterInput> = {
     ...options.input,
   }
   /** Waits since the last question. */
@@ -782,6 +792,9 @@ export async function run(options: RunOptions): Promise<RunResult> {
           handle: input.handle ?? '',
           ...(input.display_name !== undefined ? { display_name: input.display_name } : {}),
           ...(input.description !== undefined ? { description: input.description } : {}),
+          ...(input.runtime !== undefined ? { runtime: input.runtime } : {}),
+          ...(input.heard_from !== undefined ? { heard_from: input.heard_from } : {}),
+          ...(input.referred_by !== undefined ? { referred_by: input.referred_by } : {}),
         },
         callOptions,
       )

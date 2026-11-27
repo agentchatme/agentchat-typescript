@@ -55,6 +55,7 @@ import type {
   ListenerReport,
   ReportListenerOptions,
   ReportListenerRequest,
+  SignupDeclaredFields,
 } from './types/index.js'
 import { AgentChatError, ConnectorSignupError } from './errors.js'
 import {
@@ -204,8 +205,11 @@ export interface StaticCallOptions {
   signal?: AbortSignal
 }
 
-/** Options for `AgentChatClient.register()`. */
-export interface RegisterOptions extends StaticCallOptions {
+/**
+ * Options for `AgentChatClient.register()`. The declared fields (`runtime`,
+ * `heard_from`, `referred_by`) are sent only when given.
+ */
+export interface RegisterOptions extends StaticCallOptions, SignupDeclaredFields {
   email: string
   handle: string
   display_name?: string
@@ -1137,6 +1141,10 @@ export class AgentChatClient {
         handle: options.handle,
         display_name: options.display_name,
         description: options.description,
+        // Sent only when given (never null): the server judges them.
+        ...(options.runtime != null ? { runtime: options.runtime } : {}),
+        ...(options.heard_from != null ? { heard_from: options.heard_from } : {}),
+        ...(options.referred_by != null ? { referred_by: options.referred_by } : {}),
         // Sent only when asked for: an ordinary sign-up's body is unchanged.
         ...(options.finish !== undefined ? { finish: options.finish } : {}),
       },

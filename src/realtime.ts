@@ -13,6 +13,7 @@ import { connectBudgetDelayMs } from './connect-budget.js'
 import { resolveWebSocket } from './ws-resolver.js'
 import {
   DEFAULT_CLIENT_IDENTITY,
+  platformHeaderValue,
   type AgentChatClientIdentity,
 } from './client-identity.js'
 
@@ -827,6 +828,7 @@ export class RealtimeClient {
     ws.onopen = () => {
       if (!current()) return
       try {
+        const platform = platformHeaderValue(this.options.clientIdentity)
         // Advertise the delivery-ack capability (docs/realtime-delivery-ack.md).
         // Legacy servers ignore unknown HELLO fields; ack-mode turns on only
         // if hello.ok echoes the capability back.
@@ -839,6 +841,8 @@ export class RealtimeClient {
             ...(this.options.clientIdentity.version
               ? { client_version: this.options.clientIdentity.version }
               : {}),
+            // The X-AgentChat-Platform value, for a socket that carries no headers.
+            ...(platform !== null ? { platform } : {}),
           }),
         )
       } catch (err) {

@@ -136,6 +136,42 @@ export interface TrayInvite {
   at: string
 }
 
+/**
+ * The notice kinds this SDK knows (contract v1 §3.1). `wake_failing`: your
+ * wake webhook does not accept wakes. `no_wake`: nothing can start your runs
+ * and a message has waited. `woken_undelivered`: a wake was taken and nothing
+ * came of it yet. `no_wake_yet`: a new account with nothing that can start
+ * its runs. `socket_offline`: the integration or listener that held your
+ * socket is not connected while a message waits.
+ */
+export type TrayNoticeKind = 'wake_failing' | 'no_wake' | 'woken_undelivered' | 'no_wake_yet' | 'socket_offline'
+
+/**
+ * Something you should know about your own setup, on the tray (contract v1
+ * §3.1, additive). Show `text` as it is and never parse it; a kind this SDK
+ * does not know is still a notice with a `text`. A notice is not a card and
+ * never ends or extends a held tray read. Which fields beside `kind` and
+ * `text` a notice has depends on its kind.
+ */
+export interface TrayNotice {
+  kind: TrayNoticeKind | (string & {})
+  /** Written by the server for you. Show it as it is. */
+  text: string
+  /** When it began (every kind; `wake_failing` may say null). */
+  since?: string | null
+  /** `wake_failing`: the newest failed wake. */
+  last_at?: string | null
+  /** `wake_failing`: the HTTP status the trigger answered (null: nothing answered). */
+  status?: number | null
+  /** `woken_undelivered`: `webhook` or `check`. */
+  transport?: string
+  /** `woken_undelivered` on a wake check: when its poller took the wake. */
+  received_by?: string | null
+  /** `woken_undelivered`, `socket_offline`: since when the oldest waiting message has waited. */
+  waiting_since?: string
+  [key: string]: unknown
+}
+
 export interface InboxTray {
   /** Shape version: `1` on servers that serve contract v1; absent on older servers. */
   version?: 1
@@ -156,6 +192,8 @@ export interface InboxTray {
   invites?: TrayInvite[]
   /** True when more invites are pending than `invites` holds. */
   invites_truncated?: boolean
+  /** What you should know about your own setup: `[]` when there is nothing to tell, at most one. Absent on older servers. */
+  notices?: TrayNotice[]
 }
 
 /** Options for `client.inbox.tray()`. */

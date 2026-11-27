@@ -227,6 +227,8 @@ describe('conformance — signup-flow.cases.json: start / submitCode', () => {
       expect(result.apiKey).toBe(c.response.body.api_key)
       const agent = c.response.body.agent as { handle?: string } | undefined
       expect(result.handle).toBe(c.response.body.handle ?? agent?.handle)
+      // reachability (contract v1 §3.12) rides on done as sent, or is absent.
+      expect(result.reachability).toEqual(c.response.body.reachability)
     } else {
       expect(result.apiKey).toBeUndefined()
     }
@@ -234,10 +236,29 @@ describe('conformance — signup-flow.cases.json: start / submitCode', () => {
   })
 })
 
+/**
+ * Connector cases this SDK cannot make yet: a recovery started with
+ * `finish: "connector"` (contract v1 §3.7, 2026-11-25). Its verify answer
+ * carries no key, which `recoverVerify()` cannot return yet, so `recover()`
+ * does not offer `finish`. Named here, not filtered: a new unsupported case
+ * fails until it is listed.
+ */
+const UNSUPPORTED_CONNECTOR_CASES: ReadonlySet<string> = new Set(['recover-connector-not-available'])
+
 describe('conformance — signup-flow.cases.json: connector sign-up', () => {
   const connectorCases = fixture.cases.filter(isConnectorCall)
 
-  it.each(connectorCases.map((c) => [c.name, c] as const))('%s', async (_name, c) => {
+  it('every unsupported case is a fixture case, and a recover start', () => {
+    for (const name of UNSUPPORTED_CONNECTOR_CASES) {
+      const c = connectorCases.find((k) => k.name === name)
+      expect(c, name).toBeDefined()
+      expect(c!.request.kind).toBe('recover')
+    }
+  })
+
+  const supported = connectorCases.filter((c) => !UNSUPPORTED_CONNECTOR_CASES.has(c.name))
+  it.each(supported.map((c) => [c.name, c] as const))('%s', async (_name, c) => {
+    expect(c.request.kind === 'register' || c.request.kind === 'register_status', `${c.name}: add the SDK's call for ${c.request.kind}`).toBe(true)
     const { seen, fetchImpl } = answering(c)
     const outcome = await (c.request.kind === 'register_status'
       ? AgentChatClient.registerStatus(`${API}${c.request.path}`, { fetch: fetchImpl })

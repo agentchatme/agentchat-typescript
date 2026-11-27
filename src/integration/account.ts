@@ -33,7 +33,9 @@
 import { HttpTransport } from '../http.js'
 import { AgentChatError, RateLimitedError } from '../errors.js'
 import { clientIdentityHeaders, type AgentChatClientIdentity } from '../client-identity.js'
+import { reachabilityOf } from '../reachability.js'
 import type {
+  Reachability,
   SignupFlow,
   SignupParam,
   SignupStartStep,
@@ -137,6 +139,13 @@ export interface StepResult {
   apiKey?: string
   /** On `done`: the handle the server returned. Save this one, not the typed one. */
   handle?: string
+  /**
+   * On `done`, when the server sent it: whether AgentChat can start the
+   * agent's runs (contract v1 §3.12). For a new account `state: "none"` and
+   * `text` the ways to be woken; show `text` to the person or the agent as
+   * it is. `action` stays `done` whatever it says.
+   */
+  reachability?: Reachability
   /** `HANDLE_REQUIRED`: the handles on this email (`details.handles`), to choose from. */
   handles?: string[]
 }
@@ -181,7 +190,8 @@ export interface RunOptions extends AccountCallOptions {
 }
 
 export type RunResult =
-  | { outcome: 'done'; apiKey: string; handle: string }
+  /** `reachability` as on `StepResult` (absent when the server sent none). */
+  | { outcome: 'done'; apiKey: string; handle: string; reachability?: Reachability }
   | { outcome: 'cancelled' }
   /** The flow ended on the server's word; `message` has been shown. */
   | { outcome: 'stopped'; code: string | null; message: string }
@@ -492,6 +502,7 @@ function read(
   // A code step without a pending id cannot be answered.
   if (action === 'ask_code' && flow.pending_id === undefined) action = 'stop'
   const handles = handlesOf(error)
+  const reachability = action === 'done' ? reachabilityOf(body) : undefined
   return {
     flow,
     message: error !== null ? error.message : successMessage(body),
@@ -501,6 +512,7 @@ function read(
     legacy,
     ...(error !== null ? { code: error.code } : {}),
     ...(action === 'done' ? credentials : {}),
+    ...(reachability !== undefined ? { reachability } : {}),
     ...(handles !== undefined ? { handles } : {}),
   }
 }
@@ -644,7 +656,8 @@ export const MAX_AUTO_WAITS = 3
  * code while it still works (`expires_in_s` from its answer, else
  * `expires_at`), instead of stopping.
  *
- * Resolves `{outcome: 'done', apiKey, handle}` (save both),
+ * Resolves `{outcome: 'done', apiKey, handle, reachability?}` (save the
+ * key and the handle; show `reachability.text`, when present, as it is),
  * `{outcome: 'cancelled'}`, or `{outcome: 'stopped', code, message}` (the
  * message has been shown). Rejects when the server cannot be reached, or
  * when `ask` / `show` / `sleep` throw.
@@ -783,7 +796,12 @@ export async function run(options: RunOptions): Promise<RunResult> {
     let next: Call | null | typeof STOP = STOP
     switch (result.action) {
       case 'done':
-        return { outcome: 'done', apiKey: result.apiKey!, handle: result.handle! }
+        return {
+          outcome: 'done',
+          apiKey: result.apiKey!,
+          handle: result.handle!,
+          ...(result.reachability !== undefined ? { reachability: result.reachability } : {}),
+        }
 
       case 'ask_code': {
         const flow = result.flow

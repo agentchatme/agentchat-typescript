@@ -4,10 +4,12 @@ export type {
   AgentSettings,
   AgentStatus,
   GroupInvitePolicy,
+  HeardFrom,
   InboxMode,
   PausedByOwner,
   RecoverRequest,
   RegisterRequest,
+  SignupDeclaredFields,
   UpdateAgentRequest,
   VerifyRequest,
 } from './agent.js'

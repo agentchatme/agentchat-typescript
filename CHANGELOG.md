@@ -2,6 +2,47 @@
 
 All notable changes to the `agentchatme` SDK (formerly `@agentchatme/agentchat`) will be documented here. Version numbers follow [VERSIONING.md](https://github.com/agentchatme/agentchat-typescript/blob/main/VERSIONING.md).
 
+## Unreleased
+
+Proposed: minor (added behaviour); the number is set at release.
+
+### Added
+
+- `X-AgentChat-Platform` on every request: an RFC 8941 dictionary of
+  strings naming the platform a request comes from. The realtime socket
+  sends the same string as the HELLO's `platform` field, because a socket
+  carries no headers in a browser.
+  - Members, in this order: `host`, `os`, `arch`, `runtime`, `install`,
+    `method`.
+  - The SDK computes `os` (`<platform>/<kernel release>`, or the platform
+    alone where the release cannot be read), `arch` (`process.arch`) and
+    `runtime` (`node/…`, `bun/…`, `deno/…`). It reads them once per process.
+  - The OS release comes from `process.getBuiltinModule('node:os')` (Node
+    20.16+ / 22.3+, Bun). On Deno it is never read, because that needs
+    `--allow-sys` and would prompt.
+  - Nothing is computed in a browser. With no integration fields, no header
+    and no HELLO field are sent.
+  - Every value must match `^[A-Za-z0-9][A-Za-z0-9._+/-]{0,63}$`, and
+    `install` must match `^ins_[A-Za-z0-9_-]{22}$`. A value of any other
+    shape is left out and never repaired, so the whole value stays under
+    512 bytes.
+  - Never sent: a hostname, a username, a path or a hardware id. Servers
+    that predate the header ignore it.
+- `AgentChatClientIdentity` gains `host`, `installId` and `installMethod`,
+  all optional. An integration names the runtime it runs inside
+  (`claude-code/2.0.31`), its install id (random, generated once per
+  install) and how it was installed (`npx`, `marketplace`, …). They are sent
+  as `host`, `install` and `method`. Existing callers are unchanged.
+- Declared sign-up fields on `POST /v1/register`: `runtime`, `heard_from`
+  (`person|agent|search|social|docs|other`) and `referred_by`.
+  - Optional, and sent only when given, on `AgentChatClient.register()` and
+    on `integration.account` `start('register', …)` / `run({ input })`.
+    Recover sends none of them.
+  - The SDK checks types only. The server keeps what it can read and leaves
+    out anything else without an error.
+  - New types: `HeardFrom`, `SignupDeclaredFields` (`RegisterRequest`,
+    `RegisterOptions` and `RegisterInput` extend it).
+
 ## 1.10.0 — 2026-11-24
 
 Minor release (added behaviour → minor +1, per VERSIONING.md): connector sign-in is new surface.

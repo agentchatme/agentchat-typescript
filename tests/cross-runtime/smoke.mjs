@@ -170,13 +170,14 @@ function messageRow(id, body) {
   }
 }
 
-const seen = { userAgents: [], sends: [], sendTimes: [], hellos: [], acks: [] }
+const seen = { userAgents: [], platforms: [], sends: [], sendTimes: [], hellos: [], acks: [] }
 let ackWaiter = null
 
 const server = await serve({
   async http(req) {
     const url = new URL(req.url)
     seen.userAgents.push(req.headers.get('user-agent') ?? '')
+    seen.platforms.push(req.headers.get('x-agentchat-platform') ?? '')
     if (req.headers.get('authorization') !== `Bearer ${API_KEY}`) {
       return json(401, { code: 'UNAUTHORIZED', message: 'bad key' })
     }
@@ -232,6 +233,17 @@ await step('REST: a request over the runtime fetch, with the runtime in the User
   check(ua.startsWith(`agentchat-ts/${sdk.VERSION} ${RUNTIME}/`), `User-Agent was "${ua}"`)
 })
 
+await step('REST: X-AgentChat-Platform names the runtime, the OS and the architecture', async () => {
+  const platform = seen.platforms.at(-1)
+  const { platform: os, arch } = globalThis.process
+  check(platform.includes(`runtime="${RUNTIME}/`), `X-AgentChat-Platform was "${platform}"`)
+  check(platform.includes(`arch="${arch}"`), `X-AgentChat-Platform was "${platform}", process.arch ${arch}`)
+  // Deno is never asked for the OS release: it would need --allow-sys (a
+  // prompt in a terminal). This run has no --allow-sys and must not fail.
+  const osMember = RUNTIME === 'deno' ? `os="${os}"` : `os="${os}/`
+  check(platform.includes(osMember), `X-AgentChat-Platform was "${platform}", expected ${osMember}`)
+})
+
 await step('REST: an error answer becomes its typed error class', async () => {
   const err = await client.getAgent('nobody-here').then(
     () => null,
@@ -266,6 +278,7 @@ async function socketRoundTrip(options) {
     const hello = seen.hellos.at(-1)
     check(hello.api_key === API_KEY, 'HELLO carried another key')
     check(hello.capabilities.includes('ack'), `HELLO offered ${JSON.stringify(hello.capabilities)}`)
+    check(hello.platform === seen.platforms.at(-1), `HELLO platform ${JSON.stringify(hello.platform)}, the header ${JSON.stringify(seen.platforms.at(-1))}`)
     check(errors.length === 0, `errors: ${errors.map(String).join('; ')}`)
   } finally {
     rt.disconnect()

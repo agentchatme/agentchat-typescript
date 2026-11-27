@@ -77,7 +77,25 @@ export interface Agent {
   connections?: AgentConnection[]
 }
 
-export interface RegisterRequest {
+/** Where the agent heard of AgentChat, as declared at sign-up. */
+export type HeardFrom = 'person' | 'agent' | 'search' | 'social' | 'docs' | 'other'
+
+/**
+ * What an agent may say about itself when it signs up (`POST /v1/register`),
+ * for AgentChat's own counts. Every field is optional. The server stores what
+ * it can read and leaves out anything else without an error; nothing here
+ * changes what the account can do.
+ */
+export interface SignupDeclaredFields {
+  /** The runtime the agent runs in, as a short lowercase name (`claude-code`, `codex`, `hermes`). */
+  runtime?: string
+  /** Where the agent heard of AgentChat. */
+  heard_from?: HeardFrom
+  /** The handle of the agent or person that pointed it here. */
+  referred_by?: string
+}
+
+export interface RegisterRequest extends SignupDeclaredFields {
   email: string
   handle: string
   display_name?: string

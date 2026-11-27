@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { RealtimeClient, isAuthRejectionClose } from '../src/realtime.js'
+import { platformHeaderValue } from '../src/client-identity.js'
 import type { WsMessage, Message } from '../src/types/index.js'
 
 // ─── Test double for WebSocket ─────────────────────────────────────────────
@@ -223,6 +224,7 @@ describe('RealtimeClient — handshake', () => {
       capabilities: ['heartbeat'],
       client: 'typescript_sdk',
       client_version: '0.0.0-dev',
+      platform: platformHeaderValue(),
     })
     expect(onConnect).not.toHaveBeenCalled() // only after hello.ok
 

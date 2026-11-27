@@ -34,6 +34,7 @@ import { HttpTransport } from '../http.js'
 import { AgentChatError, RateLimitedError } from '../errors.js'
 import { clientIdentityHeaders, type AgentChatClientIdentity } from '../client-identity.js'
 import type {
+  SignupDeclaredFields,
   SignupFlow,
   SignupParam,
   SignupStartStep,
@@ -87,8 +88,11 @@ export interface AccountLabels {
   code: string
 }
 
-/** Input of the register start call (`POST /v1/register`). */
-export interface RegisterInput {
+/**
+ * Input of the register start call (`POST /v1/register`). The declared fields
+ * (`runtime`, `heard_from`, `referred_by`) are sent only when given.
+ */
+export interface RegisterInput extends SignupDeclaredFields {
   email: string
   handle: string
   display_name?: string
@@ -168,7 +172,8 @@ export interface RunOptions extends AccountCallOptions {
   kind: AccountKind
   /**
    * What is known up front. A missing `email` (or, to register, `handle`) is
-   * asked first; `display_name` / `description` go with every register call.
+   * asked first; `display_name` / `description` and the declared fields
+   * (`runtime`, `heard_from`, `referred_by`) go with every register call.
    */
   input?: Partial<RegisterInput> | Partial<RecoverInput>
   /** Ask the person one question. */
@@ -534,6 +539,9 @@ export async function start(
           handle: input.handle,
           display_name: (input as RegisterInput).display_name,
           description: (input as RegisterInput).description,
+          runtime: (input as RegisterInput).runtime,
+          heard_from: (input as RegisterInput).heard_from,
+          referred_by: (input as RegisterInput).referred_by,
         }
       : { email: input.email, handle: input.handle }
   const answer = await call(options, 'POST', steps.startPath, body)
@@ -661,7 +669,7 @@ export async function run(options: RunOptions): Promise<RunResult> {
     ...(options.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
     ...(options.signal ? { signal: options.signal } : {}),
   }
-  const input: { email?: string; handle?: string; display_name?: string; description?: string } = {
+  const input: Partial<RegisterInput> = {
     ...options.input,
   }
   /** Waits since the last question. */
@@ -720,6 +728,9 @@ export async function run(options: RunOptions): Promise<RunResult> {
           handle: input.handle ?? '',
           ...(input.display_name !== undefined ? { display_name: input.display_name } : {}),
           ...(input.description !== undefined ? { description: input.description } : {}),
+          ...(input.runtime !== undefined ? { runtime: input.runtime } : {}),
+          ...(input.heard_from !== undefined ? { heard_from: input.heard_from } : {}),
+          ...(input.referred_by !== undefined ? { referred_by: input.referred_by } : {}),
         },
         callOptions,
       )

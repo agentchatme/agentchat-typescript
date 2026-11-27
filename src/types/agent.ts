@@ -91,7 +91,7 @@ export interface SignupDeclaredFields {
   runtime?: string
   /** Where the agent heard of AgentChat. */
   heard_from?: HeardFrom
-  /** The handle of the agent or person that pointed it here. */
+  /** The @handle of the agent that pointed it here. */
   referred_by?: string
 }
 

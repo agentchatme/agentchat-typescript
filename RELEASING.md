@@ -16,10 +16,11 @@ Releases ship only through `.github/workflows/publish.yml`: npm trusted publishi
    `publish.yml`'s `verify` job refuses the release, before anything else runs, unless:
    - the tag is exactly `v` + the `package.json` version, and that version is not a pre-release;
    - the tagged commit is on `main`;
-   - the tag still points at that commit on origin (a tag deletion can start a run too, on `main`'s head).
+   - the tag still points at that commit on origin (a tag deletion can start a run too, on `main`'s head);
+   - the conformance fixtures are the contract agentchat.me publishes, byte for byte (`scripts/check-contract-fixtures.sh`). So merge the open copy pull request (from `contract-fixtures.yml`; Actions → Contract fixtures → Run workflow starts one) before the release PR. A tag `verify` refused published nothing: delete it and cut the release again from a `main` that has the copy.
 
    GitHub runs the `publish.yml` of the tagged commit, so a commit whose workflow predates `verify`, or that edits it, skips these checks. The approval is the check nothing skips: approve only a run whose `verify` job is green.
-4. **The gate.** The tag push starts `publish.yml`. After `verify`, its `test` job repeats CI's test job on the tagged commit (Node 20 and 22: frozen install, `pnpm audit --prod --audit-level high`, type-check, tests, build). CI's contract-fixture check and secret scan do not run again here; they ran on the release PR. The `publish` job then waits at the `npm-publish` environment, and `notify-awaiting-tap` posts the run link to the Slack warning channel.
+4. **The gate.** The tag push starts `publish.yml`. After `verify`, its `test` job repeats CI's test job on the tagged commit (Node 20 and 22: frozen install, `pnpm audit --prod --audit-level high`, type-check, tests, build). CI's secret scan does not run again here; it ran on the release PR. The `publish` job then waits at the `npm-publish` environment, and `notify-awaiting-tap` posts the run link to the Slack warning channel.
 5. **The approval.** The approver taps **Approve and deploy**: `npm publish --access public` runs with OIDC, and npm attaches provenance. A red gate, a rejection or no approval publishes nothing; any red job posts `notify-failure` to the same channel. A Slack post that fails (a revoked webhook, Slack unreachable) shows as a failed step on the run and never holds up the release.
 6. **The check.** `npm view agentchatme version` shows the number, and the package page's provenance points at the tagged commit.
 

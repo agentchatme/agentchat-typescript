@@ -97,6 +97,14 @@ jobs:
           fi
           exit "$problems"
 
+      # No release against a stale contract: the conformance fixtures must be
+      # the contract agentchat.me publishes, byte for byte. CI checks them
+      # only against their own manifest; contract-fixtures.yml copies a new
+      # contract in. Not for stage-proof, which is never public.
+      - name: Conformance fixtures match the published contract
+        if: ${{ github.event_name == 'push' || github.event.inputs.target != 'stage-proof' }}
+        run: bash scripts/check-contract-fixtures.sh
+
   # Re-run the full test suite on the tagged commit. Don't trust prior
   # CI status — someone could tag a feature branch directly and skip the
   # main-branch sweep.
